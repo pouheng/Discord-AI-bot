@@ -36,6 +36,7 @@ def is_running() -> bool:
 def start_bot():
     global bot_proc
     if is_running():
+        log("Bot already running.")
         return
     try:
         bot_proc = subprocess.Popen(
@@ -234,15 +235,21 @@ class BotManagerGUI:
         btn_frame.pack(fill=tk.X, pady=(0, 8))
 
         btn_style = dict(width=12)
-        ttk.Button(btn_frame, text="Start", command=start_bot, **btn_style).pack(
-            side=tk.LEFT, padx=2
+        self.start_btn = ttk.Button(
+            btn_frame, text="Start",
+            command=lambda: self._thread_action("start"), **btn_style
         )
-        ttk.Button(btn_frame, text="Stop", command=stop_bot, **btn_style).pack(
-            side=tk.LEFT, padx=2
+        self.start_btn.pack(side=tk.LEFT, padx=2)
+        self.stop_btn = ttk.Button(
+            btn_frame, text="Stop",
+            command=lambda: self._thread_action("stop"), **btn_style
         )
-        ttk.Button(btn_frame, text="Restart", command=restart_bot, **btn_style).pack(
-            side=tk.LEFT, padx=2
+        self.stop_btn.pack(side=tk.LEFT, padx=2)
+        self.restart_btn = ttk.Button(
+            btn_frame, text="Restart",
+            command=lambda: self._thread_action("restart"), **btn_style
         )
+        self.restart_btn.pack(side=tk.LEFT, padx=2)
 
         # Autopilot row
         ap_frame = ttk.Frame(main)
@@ -310,6 +317,31 @@ class BotManagerGUI:
         update_status()
         update_autopilot_status()
         log("Bot Manager ready.")
+
+    def _thread_action(self, action: str):
+        """Run action in thread with instant button feedback."""
+        btn_map = {
+            "start": (self.start_btn, "Starting...", "Start"),
+            "stop": (self.stop_btn, "Stopping...", "Stop"),
+            "restart": (self.restart_btn, "Restarting...", "Restart"),
+        }
+        btn, busy_text, idle_text = btn_map[action]
+        btn.config(text=busy_text, state=tk.DISABLED)
+
+        def _do():
+            try:
+                if action == "start":
+                    start_bot()
+                elif action == "stop":
+                    stop_bot()
+                elif action == "restart":
+                    stop_bot()
+                    time.sleep(2)
+                    start_bot()
+            finally:
+                console.after(0, lambda: btn.config(text=idle_text, state=tk.NORMAL))
+
+        threading.Thread(target=_do, daemon=True).start()
 
     def on_close(self):
         global monitor_running

@@ -2,6 +2,28 @@
 
 import discord, json, re, os, datetime
 
+SAY_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "say_log.jsonl")
+
+
+def _log_say_usage(interaction: discord.Interaction, reply: str):
+    """Append a /say usage record to the persistent log."""
+    try:
+        record = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "user_id": interaction.user.id,
+            "user_name": interaction.user.display_name,
+            "user_global_name": interaction.user.name,
+            "channel_id": interaction.channel.id if interaction.channel else None,
+            "channel_name": interaction.channel.name if interaction.channel else None,
+            "guild_id": interaction.guild.id if interaction.guild else None,
+            "guild_name": interaction.guild.name if interaction.guild else None,
+            "reply_preview": reply[:200],
+        }
+        with open(SAY_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[/say] 記錄使用紀錄失敗: {e}")
+
 
 def register_say(bot):
     @bot.tree.command(name="say", description="讓角色主動加入對話（完整三階段流程）")
@@ -182,6 +204,7 @@ def register_say(bot):
                 reply = f"（{char_name}看了看周圍，沒說什麼）"
             await interaction.delete_original_response()
             await channel.send(reply)
+            _log_say_usage(interaction, reply)
             user_content = last_user_msg.content if last_user_msg else "say指令"
             excerpt = re.sub(r'[\\/:*?"<>|]', "", user_content[:20]) or "say"
             session_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

@@ -12,6 +12,7 @@ import sqlite3
 import os
 import aiofiles
 import autopilot
+import tarot
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +25,22 @@ DB_FILE = os.path.join(SCRIPT_DIR, "rp_memory.db")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 STATE_FILE = os.path.join(SCRIPT_DIR, "last_state.json")
 PROMPT_LOG_DIR = os.path.join(SCRIPT_DIR, "prompt_logs")
+ERROR_LOG_DIR = os.path.join(SCRIPT_DIR, "error_logs")
+
+
+async def _log_error(event: str, detail: str, **extra):
+    """將錯誤紀錄寫入 error_logs/{date}.txt（與既有日誌系統一致）"""
+    try:
+        os.makedirs(ERROR_LOG_DIR, exist_ok=True)
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        log_path = os.path.join(ERROR_LOG_DIR, f"{today}.txt")
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        extra_str = " ".join(f"{k}={v}" for k, v in extra.items())
+        line = f"[{now_str}] [{event}] {detail[:500]} {extra_str}".rstrip()
+        async with aiofiles.open(log_path, "a", encoding="utf-8") as f:
+            await f.write(line + "\n")
+    except Exception:
+        pass
 
 
 from contextlib import asynccontextmanager
@@ -1381,6 +1398,7 @@ async def phase3_process(
         break
     else:
         log_lines.append(f"  [檢測失敗] 4 次重試後仍為空白，跳過")
+        await _log_error("phase3_timeout", "4 次重試後仍為空白/API 無回應")
         if message:
             try:
                 await message.channel.send(
@@ -2416,6 +2434,8 @@ async def on_ready():
     except Exception as e:
         print(f"[啟動] 斜線指令同步失敗: {e}")
 
+    await tarot.ensure_images()
+
 
 async def run_phase1(
     recall_candidates: list,
@@ -2868,6 +2888,35 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # --- 塔羅牌關鍵詞偵測（已確認是被找的狀態） ---
+    tarot_drawn = None
+    if tarot.check_tarot_trigger(message.content):
+        clean_for_tarot = re.sub(r"<@&?\d+>", "", message.content).strip()
+        who_for = ""
+        m = re.search(r"幫(.+?)抽", clean_for_tarot)
+        if m:
+            who_for = m.group(1).strip()
+        if "三張" in clean_for_tarot or "抽三" in clean_for_tarot:
+            cards = tarot.draw_cards(3)
+            spread = "三張"
+        else:
+            cards = tarot.draw_cards(1)
+            spread = "單張"
+        tarot_files = []
+        for c in cards:
+            if c.has_image():
+                tarot_files.append(
+                    discord.File(c.image_path, filename=f"{c.card_id}.png")
+                )
+        tarot.last_tarot = {
+            "cards": cards,
+            "who_for": who_for,
+            "spread": spread,
+            "timestamp": datetime.datetime.now().timestamp(),
+            "files": tarot_files,
+        }
+        tarot_drawn = tarot.last_tarot
+
     async with message.channel.typing():
         try:
             # --- 清洗輸入 ---
@@ -3287,6 +3336,18 @@ async def on_message(message: discord.Message):
                 if auto_injection:
                     phase2_system += auto_injection
 
+            # Inject tarot context for casual in-character response
+            if tarot_drawn:
+                cards_str = "、".join(
+                    f"{c.get_display_name()}" for c in tarot_drawn["cards"]
+                )
+                who = tarot_drawn["who_for"] or "你"
+                phase2_system += (
+                    f"\n\n【塔羅牌】\n"
+                    f"你剛剛為了 {who} 抽了{tarot_drawn['spread']}牌：{cards_str}。\n"
+                    f"在回覆中自然地提起這張牌即可，不用嚴肅解讀。"
+                )
+
             phase2_messages = [{"role": "system", "content": phase2_system}]
             phase2_messages.extend(all_context)
             current_user_name = message.author.display_name
@@ -3313,7 +3374,11 @@ async def on_message(message: discord.Message):
                         "若你需要同時回覆不同的人，請在每段訊息前加上 [TO:該人的名稱]\n"
                         "例：[TO:頭皮慶]\n你的回覆...\n[TO:吳神月]\n你的回覆...\n"
                         "⚠️ [TO:] 僅限用於確定有在找你說話的人（回覆過你的訊息、@你、或直接提到你的角色名），"
-                        "不要對歷史記錄中每個出現的人都一一回覆。"
+                        "不要對歷史記錄中每個出現的人都一一回覆。\n"
+                        "【回覆專注原則】\n"
+                        f"你正在回覆的是 {current_user_name}。專注於他/她的訊息即可。\n"
+                        "如果歷史中其他人在對話但沒有明確找你（沒有@你、沒有回覆你、沒有提到你的角色名），"
+                        "不需要回應他們，也不需要為他們加上 [TO:]。"
                     ),
                 }
             )
@@ -3450,7 +3515,6 @@ async def on_message(message: discord.Message):
                         if text:
                             segments.append((name, text))
                     for idx, (seg_name, seg_text) in enumerate(segments):
-                        # 每個 [TO:] 都去找對應的人，用 startswith 比對（因顯示名稱可能含括號註記）
                         target_msg = message
                         async for m in message.channel.history(limit=30):
                             if (
@@ -3459,11 +3523,14 @@ async def on_message(message: discord.Message):
                             ):
                                 target_msg = m
                                 break
-                        await target_msg.reply(seg_text)
+                        tf = tarot_drawn.get("files", []) if idx == 0 else []
+                        await target_msg.reply(seg_text, files=tf)
                 else:
-                    await message.reply(bot_reply)
+                    tf = tarot_drawn.get("files", []) if tarot_drawn else []
+                    await message.reply(bot_reply, files=tf)
             else:
-                await message.reply(bot_reply)
+                tf = tarot_drawn.get("files", []) if tarot_drawn else []
+                await message.reply(bot_reply, files=tf)
 
             # --- 將 prompt log 快照到本次對話資料夾 ---
             excerpt = re.sub(r'[\\/:*?"<>|]', "", clean_input[:20]) or "unknown"
@@ -3492,6 +3559,7 @@ async def on_message(message: discord.Message):
         except Exception as e:
             print(f"[錯誤] 處理訊息時發生未預期錯誤!")
             print(traceback.format_exc())
+            await _log_error("on_message_crash", str(e), traceback=traceback.format_exc()[:500])
             err_char_name = await get_character_name() or "角色"
             await message.reply(f"（{err_char_name}似乎陷入了短暫的沉思...）")
 
@@ -3714,6 +3782,7 @@ import gods_eye
 say_cmd.register_say(bot)
 autopilot.register_commands(bot)
 gods_eye.register_commands(bot)
+tarot.register_tarot(bot)
 
 if __name__ == "__main__":
     # 啟動機器人
