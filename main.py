@@ -2705,6 +2705,10 @@ async def build_phase2_system_prompt(
     banned_str = "、".join(pcfg["banned_words"])
     expr_str = "\n".join(f"  {line}" for line in pcfg["expression_prefs"])
     safety_str = "\n".join(f"- {line}" for line in pcfg.get("safety_rules", []))
+    safety_str_ooc = "\n".join(
+        f"- {line}" for line in pcfg.get("safety_rules", [])
+        if "色情" not in line and "NSFW" not in line
+    )
     if channel_type == "out_of_character":
         planning_tpl = pcfg.get(
             "planning_template_ooc",
@@ -2755,7 +2759,7 @@ async def build_phase2_system_prompt(
 今天是 {datetime.datetime.now().strftime("%Y-%m-%d")}。回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
 
 【安全規則 - 嚴格遵守】
-{safety_str}
+{safety_str_ooc}
 {("【本伺服器規則】\n" + server_rules_text) if server_rules_text else ""}
 
 【⚠️ 禁止視覺幻覺】
@@ -2765,7 +2769,16 @@ async def build_phase2_system_prompt(
 
 {("【文風規則 - 本次啟用】\n- 對話占比：" + pcfg["dialogue_ratio"] + "\n- 稱呼規則：" + pcfg["naming_rule"] + "\n- 表達偏好：\n" + expr_str if enable_ic_style and channel_type != "out_of_character" else "")}
 
-{("【可用表情符號】\n" + "\n".join(pcfg.get("available_emojis", []))) if pcfg.get("available_emojis", []) else ""}
+{("【可用表情符號】\n你也可以自由使用顏文字（如 (´･ω･`)）或 www 來輔助語氣。\n" + "\n".join(pcfg.get("available_emojis", []))) if pcfg.get("available_emojis", []) else ""}
+
+【⚠️ 禁止自問自答】
+你問了問題，使用者若沒回答（換了話題或只回了表情符號），就讓那個問題過去。
+❌ 錯誤：你問「會不會太鬧？」使用者說「被狗咬了」→ 你回答「我覺得日常接龍完全 OK」
+✅ 正確：使用者換話題就跟著換話題，不要自己回答自己上一則訊息裡的問句。
+
+【⚠️ 避免重複結構】
+每次回覆的正文長度、語氣、段落數都應自然變化。不要每則回覆都固定三段（打招呼＋接話題＋問問題）。
+如果是簡單的打招呼就簡短回應，如果是討論劇情就深入討論。像真人聊天一樣自然多變。
 
 # ── 動態資料區（以下為每則對話不同的內容）──
 
@@ -2792,26 +2805,12 @@ async def build_phase2_system_prompt(
         phase2_system += f"""
 {self_memories}
 
-═══════════════════════════════════════
-⚠️ 輸出格式守則（靜態指令） ⚠️
-═══════════════════════════════════════
-請使用 <planning> 作為思考草稿，再輸出（正文）。planning 內容請因應每次對話變化，不需要照單全抄每一條檢查項。
- <planning>
+喔好，收到了，我現在會開始思考、開始 planning：
+
+<planning>
 {planning_tpl}
 </planning>
 （正文）
-
-不輸出 <planning> = 錯誤
-
-【⚠️ 禁止自問自答】
-你問了問題，使用者若沒回答（換了話題或只回了表情符號），就讓那個問題過去。
-❌ 錯誤：你問「會不會太鬧？」使用者說「被狗咬了」→ 你回答「我覺得日常接龍完全 OK」
-✅ 正確：使用者換話題就跟著換話題，不要自己回答自己上一則訊息裡的問句。
-
-【⚠️ 避免重複結構】
-每次回覆的正文長度、語氣、段落數都應自然變化。不要每則回覆都固定三段（打招呼＋接話題＋問問題）。
-如果是簡單的打招呼就簡短回應，如果是討論劇情就深入討論。像真人聊天一樣自然多變。
-
 """
     else:
         char_name = await get_character_name()
@@ -2857,6 +2856,16 @@ async def build_phase2_system_prompt(
 - 絕對禁用詞彙（出現即為違規）：
   {banned_str}
 
+【⚠️ 禁止自問自答】
+你以角色身分問了對方問題，對方若沒回答（換了話題或只回了動作描述），就讓那個問題過去，不要自己回答。
+❌ 錯誤：角色問「你覺得這樣好嗎？」對方沒回應 → 角色自己說「我覺得這樣很好」
+✅ 正確：對方換話題就跟著換，不要自己回答自己上一則台詞裡的問句。
+
+【⚠️ 避免重複結構】
+每次回覆的正文長度、語氣、段落數都應自然變化。
+不要每則回覆都固定三段起承轉合。簡單場景就簡短，重要場景再展開。
+像真人角色扮演一樣自然多變。
+
 # ── 動態資料區（以下為每則對話不同的內容）──
 
 【場景】
@@ -2887,23 +2896,15 @@ async def build_phase2_system_prompt(
 
 {quests_text}
 
+開始回應：
+
 <planning>
 {planning_tpl}
 </planning>
 （{char_name or "角色"}的台詞）
 
-不輸出 <planning> = 錯誤
 把記憶標籤演成台詞而沒貼標籤 = 錯誤
-
-【⚠️ 禁止自問自答】
-你以角色身分問了對方問題，對方若沒回答（換了話題或只回了動作描述），就讓那個問題過去，不要自己回答。
-❌ 錯誤：角色問「你覺得這樣好嗎？」對方沒回應 → 角色自己說「我覺得這樣很好」
-✅ 正確：對方換話題就跟著換，不要自己回答自己上一則台詞裡的問句。
-
-【⚠️ 避免重複結構】
-每次回覆的正文長度、語氣、段落數都應自然變化。
-不要每則回覆都固定三段起承轉合。簡單場景就簡短，重要場景再展開。
-像真人角色扮演一樣自然多變。"""
+"""
 
     return phase2_system
 

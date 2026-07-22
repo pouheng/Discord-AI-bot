@@ -73,5 +73,39 @@ print(f"[Test 8] 格式化後 supplement ({len(formatted)} chars):")
 print(formatted)
 print("PASS\n")
 
-print("=" * 60)
+# ── Test 9: 回覆起始引導（priming trick）存在 ──
+has_ooc_prime = "喔好，收到了，我現在會開始思考" in content
+has_ic_prime = "開始回應：" in content
+print(f"[Test 9] 回覆起始引導")
+print(f"  OOC: {'PASS' if has_ooc_prime else 'FAIL'}")
+print(f"  IC:  {'PASS' if has_ic_prime else 'FAIL'}")
+assert has_ooc_prime and has_ic_prime, "FAIL: 回覆起始引導缺失"
+
+# ── Test 10: 禁止自問自答 / 避免重複結構 在動態資料之前 ──
+dyn_marker_pos = content.find("# ── 動態資料區")
+ban_pos = content.find("【⚠️ 禁止自問自答】")
+avd_pos = content.find("【⚠️ 避免重複結構】")
+print(f"[Test 10] 禁止自問自答 / 避免重複結構 在動態資料之前")
+print(f"  禁止自問自答在動態資料之前: {'PASS' if ban_pos < dyn_marker_pos else 'FAIL'}")
+print(f"  避免重複結構在動態資料之前: {'PASS' if avd_pos < dyn_marker_pos else 'FAIL'}")
+assert ban_pos < dyn_marker_pos, "FAIL: 禁止自問自答仍在動態資料之後"
+assert avd_pos < dyn_marker_pos, "FAIL: 避免重複結構仍在動態資料之後"
+
+# ── Test 11: OOC safety 不含 NSFW 規則 ──
+safety_ooc_start = content.find("【安全規則 - 嚴格遵守】\n")
+safety_ooc_end = content.find("【本伺服器規則】", safety_ooc_start)
+safety_ooc_block = content[safety_ooc_start:safety_ooc_end] if safety_ooc_end > 0 else content[safety_ooc_start:safety_ooc_start+500]
+has_nsfw_ooc = "色情" in safety_ooc_block
+print(f"[Test 11] OOC safety 不含 NSFW 規則: {'PASS' if not has_nsfw_ooc else 'FAIL'}")
+assert not has_nsfw_ooc, "FAIL: OOC 仍包含 NSFW 規則"
+
+# ── Test 12: OOC 表情符號含顏文字說明 ──
+emoji_block_start = content.find("【可用表情符號】")
+if emoji_block_start > 0:
+    emoji_clarification = "顏文字" in content[emoji_block_start:emoji_block_start+200]
+    print(f"[Test 12] OOC 表情符號含顏文字說明: {'PASS' if emoji_clarification else 'FAIL (無自訂表情)'}")
+else:
+    print("[Test 12] OOC 表情符號: 無自訂表情 (skip)")
+
+print("\n" + "=" * 60)
 print("ALL TESTS PASSED")
