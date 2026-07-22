@@ -2713,6 +2713,11 @@ async def build_phase2_system_prompt(
 {safety_str}
 {("【本伺服器規則】\n" + server_rules_text) if server_rules_text else ""}
 
+【⚠️ 禁止視覺幻覺】
+- 如果用戶訊息中沒有附帶圖片、截圖、檔案等媒體附件，絕對不要假裝看到圖片或描述不存在的視覺內容。
+- 不要編造「點開圖片」「看到示意圖」「你這張圖」等回應。
+- 用戶的文字訊息就是純文字，除非訊息中明確包含附件（Discord 附件格式），否則回覆中不應提及任何視覺元素。
+
 {("【文風規則 - 本次啟用】\n- 對話占比：" + pcfg["dialogue_ratio"] + "\n- 稱呼規則：" + pcfg["naming_rule"] + "\n- 表達偏好：\n" + expr_str if enable_ic_style and channel_type != "out_of_character" else "")}
 
 {("【可用表情符號】\n" + "\n".join(pcfg.get("available_emojis", []))) if pcfg.get("available_emojis", []) else ""}
@@ -2789,6 +2794,11 @@ async def build_phase2_system_prompt(
 {safety_str}
 {("【本伺服器規則】\n" + server_rules_text) if server_rules_text else ""}
 {("【人際互動原則】\n" + pcfg.get("social_awareness", "")) if pcfg.get("social_awareness", "") else ""}
+
+【⚠️ 禁止視覺幻覺】
+- 如果用戶訊息中沒有附帶圖片、截圖、檔案等媒體附件，絕對不要假裝看到圖片或描述不存在的視覺內容。
+- 不要編造「點開圖片」「看到示意圖」「你這張圖」等回應。
+- 用戶的文字訊息就是純文字，除非訊息中明確包含附件（Discord 附件格式），否則回覆中不應提及任何視覺元素。
 {("【可用表情符號】\n" + "\n".join(pcfg.get("available_emojis", []))) if pcfg.get("available_emojis", []) else ""}
 
 【文風規則】
