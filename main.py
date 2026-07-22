@@ -3523,7 +3523,11 @@ async def on_message(message: discord.Message):
                             ):
                                 target_msg = m
                                 break
-                        tf = tarot_drawn.get("files", []) if idx == 0 else []
+                        tf = (
+                            tarot_drawn.get("files", [])
+                            if tarot_drawn and idx == 0
+                            else []
+                        )
                         await target_msg.reply(seg_text, files=tf)
                 else:
                     tf = tarot_drawn.get("files", []) if tarot_drawn else []
@@ -3559,7 +3563,9 @@ async def on_message(message: discord.Message):
         except Exception as e:
             print(f"[錯誤] 處理訊息時發生未預期錯誤!")
             print(traceback.format_exc())
-            await _log_error("on_message_crash", str(e), traceback=traceback.format_exc()[:500])
+            await _log_error(
+                "on_message_crash", str(e), traceback=traceback.format_exc()[:500]
+            )
             err_char_name = await get_character_name() or "角色"
             await message.reply(f"（{err_char_name}似乎陷入了短暫的沉思...）")
 
