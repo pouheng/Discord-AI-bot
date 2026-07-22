@@ -2457,6 +2457,8 @@ def format_supplement(supplement) -> str:
             topic = entry.get("topic", "")
             content = entry.get("content", "")
             note = entry.get("note", "")
+            if not content:
+                continue
             prefix = f"- [{cat}] {topic}" if cat else f"- {topic}"
             lines.append(f"{prefix}：{content}")
             if note:
@@ -2470,6 +2472,9 @@ def format_supplement(supplement) -> str:
         import re
 
         text = re.sub(r"</?supplement>", "", text).strip()
+        # 移除 [條目] / [註釋] 區段標記
+        text = re.sub(r"\[條目\]\n?", "", text)
+        text = re.sub(r"\[註釋\]\n?", "", text)
         return text
 
     return ""
