@@ -3773,7 +3773,7 @@ class DBPageView(discord.ui.View):
             )
             type_tag = f" 【{mtype}】" if mtype else ""
             val += f" | {uname} | {topic or '（無主題）'}{type_tag}"
-            val += f"\n{content[:200]}{'...' if len(content) > 200 else ''}"
+            val += f"\n{content[:400]}{'...' if len(content) > 400 else ''}"
             embed.add_field(name=f"#{id_}", value=val or "（空）", inline=False)
         footer_text = f"第 {self.page + 1}/{self.total_pages} 頁"
         footer_text += "  |  ⚠️ 標記為【玩笑】的記憶可能在整理時被清除"
