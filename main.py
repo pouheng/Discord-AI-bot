@@ -2437,6 +2437,44 @@ async def on_ready():
     await tarot.ensure_images()
 
 
+def format_supplement(supplement) -> str:
+    """將 Phase 1 輸出的 supplement 轉為可讀文字，注入 Phase 2/3 prompt。
+
+    支援兩種格式：
+    - 新格式：JSON array [{"category","topic","content","note"?}, ...]
+    - 舊格式：XML 字串 "<supplement>...</supplement>"（向後相容）
+    """
+    if not supplement:
+        return ""
+
+    # --- 新格式：JSON array ---
+    if isinstance(supplement, list):
+        lines = []
+        for entry in supplement:
+            if not isinstance(entry, dict):
+                continue
+            cat = entry.get("category", "")
+            topic = entry.get("topic", "")
+            content = entry.get("content", "")
+            note = entry.get("note", "")
+            prefix = f"- [{cat}] {topic}" if cat else f"- {topic}"
+            lines.append(f"{prefix}：{content}")
+            if note:
+                lines.append(f"  ※{note}")
+        return "\n".join(lines)
+
+    # --- 舊格式：XML 字串（向後相容）---
+    if isinstance(supplement, str) and supplement.strip():
+        text = supplement.strip()
+        # 移除 <supplement> / </supplement> 標籤
+        import re
+
+        text = re.sub(r"</?supplement>", "", text).strip()
+        return text
+
+    return ""
+
+
 async def run_phase1(
     recall_candidates: list,
     chain_text: str,
@@ -2502,24 +2540,18 @@ async def run_phase1(
   - 關聯到某個 topic 的註釋：{"topic":"條目名稱","note":"註釋內容"}
   - 或自由註釋（無 topic）：{"note":"自由註釋內容"}
   - 對角色記憶的備註也用自由註釋，在內容中指名角色
-- supplement：字串，格式為以下 supplement 區塊，**至少 6 條（建議 6-8 條）**，從資料庫中選出與對話最相關的條目。
-  格式：
-  <supplement>
-  [條目]
-  - [分類] topic：content（從世界觀/記憶中挑選的相關條目）
-  - [分類] topic：content
-  ...
-  [註釋]
-  # 對上述條目的運用備註
-  # 或自由註釋
-  </supplement>
+- supplement：JSON 陣列，每個元素是一個物件，**至少 6 條（建議 6-8 條）**，從資料庫中選出與對話最相關的條目。
+  每個物件格式：
+  {"category": "分類標籤", "topic": "主題名稱", "content": "條目完整內容", "note": "運用備註（可選）"}
+  分類標籤必須與資料庫原文一致，例如：世界觀、角色能力、角色背景、事件、人物、場景與人物、劇情摘要、勢力、數值體系。
+  note 為可選欄位，說明為什麼相關、Phase 2 該如何運用。
 
    supplement 中的條目可以來自世界觀、角色記憶、參與者資訊等。
    寧可多選，不可少選。至少 6 條。
    若同一 topic 有多條相關條目，優先選取時間最新或內容最完整的，同 topic 最多選 2 條。
 
 正確範例：
-{"recall":[{"id":"1083341557677183036"}],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_topics":[],"lore_notes":[{"note":"自由註釋"}],"supplement":"<supplement>\\n[條目]\\n- [世界觀] 魔法：...\\n- [角色背景] 入學經歷：...\\n...\\n[註釋]\\n# 第一條可與當前對話呼應\\n# 第二條可用來延伸話題\\n</supplement>"}"""
+{"recall":[{"id":"1083341557677183036"}],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_topics":[],"lore_notes":[{"note":"自由註釋"}],"supplement":[{"category":"世界觀","topic":"魔法","content":"這世界的人都會覺醒1種個人魔法...","note":"與當前對話直接相關"},{"category":"角色能力","topic":"機械義手","content":"澪的右手為機械義手..."}]}"""
 
     # ──────────────────────────────────────────────
     # 動態資料區（底部）：完整資料庫內容
@@ -2709,6 +2741,9 @@ async def build_phase2_system_prompt(
 在討論劇情時，請盡量直接以中之人（玩家本尊）的視角聊天。可以使用動作括號（如：笑出聲 或（歪頭））來「模擬角色反應」，但避免頻繁切換角色扮演模式，以免造成其他玩家混淆。
 
 {ooc_identity}{ooc_persona_block}{ooc_examples_block}
+【⚠️ 時間感知 — 必須遵守】
+今天是 {datetime.datetime.now().strftime("%Y-%m-%d")}。回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
+
 【安全規則 - 嚴格遵守】
 {safety_str}
 {("【本伺服器規則】\n" + server_rules_text) if server_rules_text else ""}
@@ -2799,6 +2834,9 @@ async def build_phase2_system_prompt(
 - 如果用戶訊息中沒有附帶圖片、截圖、檔案等媒體附件，絕對不要假裝看到圖片或描述不存在的視覺內容。
 - 不要編造「點開圖片」「看到示意圖」「你這張圖」等回應。
 - 用戶的文字訊息就是純文字，除非訊息中明確包含附件（Discord 附件格式），否則回覆中不應提及任何視覺元素。
+
+【⚠️ 時間感知 — 必須遵守】
+今天是 {datetime.datetime.now().strftime("%Y-%m-%d")}。回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
 {("【可用表情符號】\n" + "\n".join(pcfg.get("available_emojis", []))) if pcfg.get("available_emojis", []) else ""}
 
 【文風規則】
