@@ -633,17 +633,18 @@ def _build_npc_memory_embed(
     batch = memories[start : start + _PER_PAGE]
     for m in batch:
         tag = f"[{m['table']}]"
-        if m["type"]:
-            tag += f" ({m['type']})"
+        type_tag = f"【{m['type']}】" if m["type"] else ""
         val = m["content"][:400]
         if len(m["content"]) > 400:
             val += "…"
         embed.add_field(
-            name=f"{tag} {m['topic']}  ({m['ts']})",
+            name=f"{tag} {m['topic']}{type_tag}  ({m['ts']})",
             value=val or "（空）",
             inline=False,
         )
-    embed.set_footer(text=f"共 {len(memories)} 條  |  第 {page + 1}/{total_pages} 頁")
+    footer_text = f"共 {len(memories)} 條  |  第 {page + 1}/{total_pages} 頁"
+    footer_text += "  |  ⚠️ 標記為【玩笑】的記憶可能在整理時被清除"
+    embed.set_footer(text=footer_text)
     return embed
 
 

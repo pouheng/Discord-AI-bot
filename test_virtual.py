@@ -107,5 +107,19 @@ if emoji_block_start > 0:
 else:
     print("[Test 12] OOC 表情符號: 無自訂表情 (skip)")
 
+# ── Test 13: /db embed 顯示 type 標籤 ──
+has_type_tag = 'type_tag = f" 【{mtype}】" if mtype else ""' in content
+print(f"[Test 13] /db 顯示 type 標籤: {'PASS' if has_type_tag else 'FAIL'}")
+assert has_type_tag, "FAIL: type 標籤格式缺失"
+
+# ── Test 14: /db footer 警告 ──
+footer_warning = "標記為【玩笑】的記憶可能在整理時被清除"
+has_warning_main = footer_warning in content
+has_warning_auto = footer_warning in open("autopilot.py", encoding="utf-8").read()
+print(f"[Test 14] /db + /dbnpc footer 警告")
+print(f"  main.py:      {'PASS' if has_warning_main else 'FAIL'}")
+print(f"  autopilot.py: {'PASS' if has_warning_auto else 'FAIL'}")
+assert has_warning_main and has_warning_auto, "FAIL: footer 警告缺失"
+
 print("\n" + "=" * 60)
 print("ALL TESTS PASSED")
