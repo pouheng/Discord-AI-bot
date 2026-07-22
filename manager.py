@@ -125,7 +125,7 @@ def run_review():
                 text=True,
                 timeout=300,
             )
-            out = (result.stdout + result.stderr).strip()
+            out = ((result.stdout or "") + (result.stderr or "")).strip()
             phases = out.count("[Phase")
             log(f"Review done ({phases} phases). See last_review_log.txt")
         except subprocess.TimeoutExpired:
@@ -236,18 +236,24 @@ class BotManagerGUI:
 
         btn_style = dict(width=12)
         self.start_btn = ttk.Button(
-            btn_frame, text="Start",
-            command=lambda: self._thread_action("start"), **btn_style
+            btn_frame,
+            text="Start",
+            command=lambda: self._thread_action("start"),
+            **btn_style,
         )
         self.start_btn.pack(side=tk.LEFT, padx=2)
         self.stop_btn = ttk.Button(
-            btn_frame, text="Stop",
-            command=lambda: self._thread_action("stop"), **btn_style
+            btn_frame,
+            text="Stop",
+            command=lambda: self._thread_action("stop"),
+            **btn_style,
         )
         self.stop_btn.pack(side=tk.LEFT, padx=2)
         self.restart_btn = ttk.Button(
-            btn_frame, text="Restart",
-            command=lambda: self._thread_action("restart"), **btn_style
+            btn_frame,
+            text="Restart",
+            command=lambda: self._thread_action("restart"),
+            **btn_style,
         )
         self.restart_btn.pack(side=tk.LEFT, padx=2)
 
