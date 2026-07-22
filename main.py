@@ -2486,8 +2486,9 @@ async def run_phase1(
 - 當不確定時 → load_plot: false
 
 【文風切換判斷 - enable_ic_style】
-- 若使用者指派了寫故事/寫場景/寫劇情/描述角色等「創作任務」→ enable_ic_style: true（讓 Phase 2 啟用 IC 文風規則）
-- 若只是討論設定、問問題、閒聊 → enable_ic_style: false
+- 若使用者明確要求你「寫」某些內容（如：幫澪寫一段、描述角色反應、寫個場景、讓澪做某動作）→ enable_ic_style: true
+- 若使用者只是在討論設定、回應角色能力、閒聊、提問 → enable_ic_style: false
+- ⚠️ 單純提到角色能力或設定細節（如「你的能力可以做到」「這把武器很強」）不算創作任務
 - 不確定時 → enable_ic_style: false
 
 【輸出格式】
@@ -2702,7 +2703,7 @@ async def build_phase2_system_prompt(
 
         phase2_system = f"""【身分】
 你是這個角色的中之人（扮演者），不是角色本人。用自然的現代人語氣與其他玩家討論劇情規劃。
-{"⚠️ 但本次對話中你被指派了創作任務（寫故事/寫場景）。請在回覆正文時切換為 IC 角色扮演文風，用角色台詞與行動描述來完成。" if enable_ic_style else ""}
+{"⚠️ 但本次對話中你被指派了創作任務（寫故事/寫場景）。請在回覆正文時切換為 IC 角色扮演文風，用角色台詞與行動描述來完成。" if enable_ic_style and channel_type != "out_of_character" else ""}
 
 【中之人聊天守則 — #中之討論串 適用】
 在討論劇情時，請盡量直接以中之人（玩家本尊）的視角聊天。可以使用動作括號（如：笑出聲 或（歪頭））來「模擬角色反應」，但避免頻繁切換角色扮演模式，以免造成其他玩家混淆。
@@ -2712,7 +2713,7 @@ async def build_phase2_system_prompt(
 {safety_str}
 {("【本伺服器規則】\n" + server_rules_text) if server_rules_text else ""}
 
-{("【文風規則 - 本次啟用】\n- 對話占比：" + pcfg["dialogue_ratio"] + "\n- 稱呼規則：" + pcfg["naming_rule"] + "\n- 表達偏好：\n" + expr_str if enable_ic_style else "")}
+{("【文風規則 - 本次啟用】\n- 對話占比：" + pcfg["dialogue_ratio"] + "\n- 稱呼規則：" + pcfg["naming_rule"] + "\n- 表達偏好：\n" + expr_str if enable_ic_style and channel_type != "out_of_character" else "")}
 
 {("【可用表情符號】\n" + "\n".join(pcfg.get("available_emojis", []))) if pcfg.get("available_emojis", []) else ""}
 
@@ -3433,7 +3434,8 @@ async def on_message(message: discord.Message):
 
             # --- 文風自檢（IC 文風啟用時，檢查並修正違規）---
             if (
-                enable_ic_style or channel_type == "in_character"
+                (enable_ic_style and channel_type != "out_of_character")
+                or channel_type == "in_character"
             ) and raw_content.strip():
                 style_rules = "\n".join(
                     f"- {p}" for p in pcfg.get("expression_prefs", [])
