@@ -3300,7 +3300,13 @@ async def on_message(message: discord.Message):
             combined_memories = "\n\n".join(recalled_memories)
 
             # --- 使用 Phase 1 的 supplement，或降級為舊式組裝 ---
-            if phase1_supplement and phase1_supplement.strip():
+            if isinstance(phase1_supplement, list):
+                lore_text = format_supplement(phase1_supplement)
+                if lore_text:
+                    print(
+                        f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} 條）"
+                    )
+            elif phase1_supplement and phase1_supplement.strip():
                 lore_text = phase1_supplement
                 print(
                     f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} chars）"
