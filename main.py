@@ -3548,6 +3548,33 @@ async def on_message(message: discord.Message):
                 r"<planning>.*?</planning>", "", raw_content, flags=re.DOTALL
             ).strip()
 
+            # --- Skip pattern 偵測：記錄 LLM 決定不回覆的情況 ---
+            _SKIP_PATTERNS = [
+                "不是發言的好時機", "不適合回應", "不適合發言",
+                "不是說話的好時機", "現在不該", "選擇沉默",
+                "不是開口的時機", "不應該回應", "不回應",
+            ]
+            _skip_hit = next((p for p in _SKIP_PATTERNS if p in cleaned_for_send), None)
+            if _skip_hit:
+                _planning_match = re.search(
+                    r"<planning>(.*?)</planning>", raw_content, re.DOTALL
+                )
+                _planning_text = _planning_match.group(1).strip() if _planning_match else "（無 planning）"
+                _skip_dir = os.path.join(SCRIPT_DIR, "skip_logs")
+                os.makedirs(_skip_dir, exist_ok=True)
+                _skip_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                _skip_excerpt = re.sub(r'[\\/:*?"<>|]', "", clean_input[:20]) or "unknown"
+                _skip_path = os.path.join(_skip_dir, f"{_skip_ts}_{_skip_excerpt}.txt")
+                try:
+                    async with aiofiles.open(_skip_path, "w", encoding="utf-8") as _sf:
+                        await _sf.write(f"=== SKIP PATTERN ===\n{_skip_hit}\n\n")
+                        await _sf.write(f"=== USER MESSAGE ===\n{clean_input_reply}\n\n")
+                        await _sf.write(f"=== PLANNING ===\n{_planning_text}\n\n")
+                        await _sf.write(f"=== FULL RESPONSE ===\n{raw_content}\n")
+                    print(f"[SKIP] 偵測到 skip pattern「{_skip_hit}」→ {_skip_path}")
+                except Exception as _se:
+                    print(f"[SKIP] log 寫入失敗: {_se}")
+
             # --- 移除標籤，發送純台詞 ---
             bot_reply = re.sub(
                 r"\s*\[MEM:\{.*?\}\]", "", cleaned_for_send, flags=re.DOTALL
