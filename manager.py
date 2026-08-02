@@ -89,12 +89,29 @@ def open_config():
 
 def open_logs():
     log_dir = os.path.join(SCRIPT_DIR, "prompt_logs")
-    maint_dir = os.path.join(SCRIPT_DIR, "maint_logs")
+    maint_dir = os.path.join(SCRIPT_DIR, "maintenance_logs")
     if os.path.exists(log_dir):
         os.startfile(log_dir)
         log("Opened prompt_logs/")
     if os.path.exists(maint_dir):
         os.startfile(maint_dir)
+        log("Opened maintenance_logs/")
+
+
+def open_maint_logs():
+    maint_dir = os.path.join(SCRIPT_DIR, "maintenance_logs")
+    error_dir = os.path.join(SCRIPT_DIR, "error_logs")
+    count = 0
+    if os.path.exists(maint_dir):
+        os.startfile(maint_dir)
+        count += 1
+    if os.path.exists(error_dir):
+        os.startfile(error_dir)
+        count += 1
+    if count:
+        log(f"Opened maint logs ({count} folder(s))")
+    else:
+        log("No maint/error logs found")
 
 
 def open_db():
@@ -285,16 +302,27 @@ class BotManagerGUI:
         op_btn_frame = ttk.Frame(op_frame)
         op_btn_frame.pack(fill=tk.X, pady=2)
 
-        ops = [
+        ops_row1 = [
             ("Memory Count", show_memory_count),
             ("DB Viewer", open_db_viewer),
             ("Run Review", run_review),
             ("Open Config", open_config),
+        ]
+        ops_row2 = [
             ("Open Logs", open_logs),
+            ("Maint Log", open_maint_logs),
             ("Open DB", open_db),
         ]
-        for text, cmd in ops:
-            ttk.Button(op_btn_frame, text=text, command=cmd, width=14).pack(
+        op_btn_row1 = ttk.Frame(op_frame)
+        op_btn_row1.pack(fill=tk.X, pady=2)
+        op_btn_row2 = ttk.Frame(op_frame)
+        op_btn_row2.pack(fill=tk.X, pady=2)
+        for text, cmd in ops_row1:
+            ttk.Button(op_btn_row1, text=text, command=cmd, width=14).pack(
+                side=tk.LEFT, padx=2
+            )
+        for text, cmd in ops_row2:
+            ttk.Button(op_btn_row2, text=text, command=cmd, width=14).pack(
                 side=tk.LEFT, padx=2
             )
 

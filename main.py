@@ -1,4 +1,5 @@
 import asyncio
+import io
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -14,6 +15,15 @@ import aiofiles
 import autopilot
 import tarot
 from dotenv import load_dotenv
+from db import get_db, init_db as _db_init, DB_FILE
+from parsers import extract_json, parse_learn_tags, parse_mem_tag, strip_planning, strip_mem_learn_tags, strip_html_tags
+from profiles import (
+    PROFILE_FIELDS, PROFILE_LABELS,
+    get_character_profile, update_character_profile,
+    format_character_profile, list_character_names,
+)
+from prompts import build_style_block, build_banned_str, build_expr_str, build_safety_str
+import image_reader
 
 load_dotenv()
 
@@ -43,17 +53,7 @@ async def _log_error(event: str, detail: str, **extra):
         pass
 
 
-from contextlib import asynccontextmanager
 
-
-@asynccontextmanager
-async def get_db():
-    conn = await aiosqlite.connect(DB_FILE, timeout=10)
-    try:
-        yield conn
-        await conn.commit()
-    finally:
-        await conn.close()
 
 
 async def read_last_ic_channel() -> dict:
@@ -211,94 +211,7 @@ async def load_prompt_config() -> dict:
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
 
 
-# --- 資料庫初始化 ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            user_id TEXT,
-            user_name TEXT,
-            topic TEXT,
-            content TEXT,
-            context TEXT DEFAULT 'ic',
-            mem_type TEXT DEFAULT ''
-        )
-    """)
-    # 舊版資料庫相容：補加 context 欄位
-    try:
-        cursor.execute("ALTER TABLE memories ADD COLUMN context TEXT DEFAULT 'ic'")
-    except Exception:
-        pass
-    # 舊版資料庫相容：補加 mem_type 欄位
-    try:
-        cursor.execute("ALTER TABLE memories ADD COLUMN mem_type TEXT DEFAULT ''")
-    except Exception:
-        pass
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS world_lore (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT,
-            topic TEXT,
-            content TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            name TEXT,
-            description TEXT,
-            quantity INTEGER DEFAULT 1,
-            location TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS server_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            server_id TEXT,
-            rule_text TEXT,
-            added_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS quests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            description TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TEXT,
-            updated_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS summaries (
-            channel_id TEXT PRIMARY KEY,
-            channel_name TEXT,
-            summary TEXT,
-            updated_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS character_profiles (
-            char_name TEXT PRIMARY KEY,
-            gender_age TEXT DEFAULT '',
-            intro TEXT DEFAULT '',
-            appearance TEXT DEFAULT '',
-            items TEXT DEFAULT '',
-            experience TEXT DEFAULT '',
-            updated_at TEXT DEFAULT ''
-        )
-    """)
-    conn.commit()
-    conn.close()
-    print(f"[資料庫] SQLite 初始化成功，檔案：{DB_FILE}")
-
-
-init_db()
+_db_init()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -587,18 +500,7 @@ async def _edit_bot_message(
 async def _ai_edit_message(original: str, find_text: str, new_text: str) -> str | None:
     """呼叫 AI 對原文進行部分修改。find_text 為空時視為自由修改（依 new_text 指示修改全文）。"""
     cfg = await load_prompt_config()
-    style_rules = []
-    for k in ("dialogue_ratio", "naming_rule"):
-        v = cfg.get(k, "")
-        if v:
-            style_rules.append(f"• {v}")
-    for pref in cfg.get("expression_prefs", []):
-        if isinstance(pref, str) and pref.strip():
-            style_rules.append(f"• {pref.strip()}")
-    banned = cfg.get("banned_words", [])
-    if banned:
-        style_rules.append(f"• 禁止使用以下詞彙：{'、'.join(banned)}")
-    style_block = "\n".join(style_rules) if style_rules else "（無特殊文風規則）"
+    style_block = build_style_block(cfg)
 
     if find_text:
         instruction = f"找到原文中包含「{find_text}」的部分，將其改為：{new_text}"
@@ -796,89 +698,7 @@ async def get_self_memory_raw(limit: int = 50) -> list[dict]:
     ]
 
 
-# ─── 角色檔案系統（固定式表格，Phase 3 動態更新）───
 
-PROFILE_FIELDS = ["gender_age", "intro", "appearance", "items", "experience"]
-PROFILE_LABELS = {
-    "gender_age": "性別/年齡",
-    "intro": "一句話介紹",
-    "appearance": "外貌特徵",
-    "items": "持有的重要物品",
-    "experience": "過往經歷",
-}
-
-
-async def get_character_profile(char_name: str) -> dict:
-    """取得角色檔案，不存在的欄位回空字串"""
-    conn = await aiosqlite.connect(DB_FILE, timeout=10)
-    cursor = await conn.execute(
-        "SELECT gender_age, intro, appearance, items, experience FROM character_profiles WHERE char_name = ?",
-        (char_name,),
-    )
-    row = await cursor.fetchone()
-    await conn.close()
-    if row:
-        return dict(zip(PROFILE_FIELDS, row))
-    return {f: "" for f in PROFILE_FIELDS}
-
-
-async def update_character_profile(char_name: str, field: str, value: str):
-    """更新角色檔案的單一欄位，若不存在則新增"""
-    if field not in PROFILE_FIELDS:
-        print(f"[角色檔案] 未知欄位: {field}")
-        return
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = await aiosqlite.connect(DB_FILE, timeout=10)
-    # 嘗試 UPDATE
-    cursor = await conn.execute(
-        f"UPDATE character_profiles SET {field} = ?, updated_at = ? WHERE char_name = ?",
-        (value, now_str, char_name),
-    )
-    if cursor.rowcount == 0:
-        # 不存在則 INSERT
-        placeholders = ", ".join(PROFILE_FIELDS)
-        values = {f: "" for f in PROFILE_FIELDS}
-        values[field] = value
-        await conn.execute(
-            f"INSERT INTO character_profiles (char_name, {placeholders}, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                char_name,
-                values["gender_age"],
-                values["intro"],
-                values["appearance"],
-                values["items"],
-                values["experience"],
-                now_str,
-            ),
-        )
-    await conn.commit()
-    await conn.close()
-    print(f"[角色檔案] {char_name}.{field} -> {value[:80]}")
-
-
-async def format_character_profile(char_name: str) -> str:
-    """格式化角色檔案為可讀字串，供 Phase 2 注入"""
-    profile = await get_character_profile(char_name)
-    lines = [f"📋 {char_name} 的角色檔案"]
-    for f in PROFILE_FIELDS:
-        label = PROFILE_LABELS.get(f, f)
-        val = profile.get(f, "")
-        if val:
-            lines.append(f"  {label}：{val}")
-    if len(lines) == 1:
-        return ""  # 完全空白
-    return "\n".join(lines)
-
-
-async def list_character_names() -> list[str]:
-    """回傳所有角色檔案的角色名稱列表"""
-    conn = await aiosqlite.connect(DB_FILE, timeout=10)
-    cursor = await conn.execute(
-        "SELECT char_name FROM character_profiles ORDER BY char_name"
-    )
-    rows = await cursor.fetchall()
-    await conn.close()
-    return [r[0] for r in rows]
 
 
 async def maintain_self_memories():
@@ -947,21 +767,11 @@ async def maintain_self_memories():
         maint_log.append(raw)
         maint_log.append("")
 
-        cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-        start = cleaned.find("{")
-        if start == -1:
+        cleaned = extract_json(raw)
+        if cleaned == "{}":
             maint_log.append("結果：未找到 JSON，略過。")
             await _write_maint_log(file_ts, maint_log)
             return
-        depth = 0
-        for i in range(start, len(cleaned)):
-            if cleaned[i] == "{":
-                depth += 1
-            elif cleaned[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    cleaned = cleaned[start : i + 1]
-                    break
 
         plan = json.loads(cleaned)
         actions = plan.get("actions", [])
@@ -2623,23 +2433,6 @@ async def run_phase1(
         await f.write(phase1_raw)
     print(f"[DEBUG] Phase 1 response 已寫入 {PROMPT_LOG_DIR}\\last_phase1_response.txt")
 
-    # --- 強固 JSON 擷取：巢狀括號計數，容忍 markdown 與前言 ---
-    def extract_json(text: str) -> str:
-        text = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
-        start = text.find("{")
-        if start == -1:
-            return "{}"
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-        return "{}"
-
     # 解析 Phase 1 回傳
     recall_user_ids = [str(recall_candidates[0]["id"])]
     lore_topics = []
@@ -2702,13 +2495,10 @@ async def build_phase2_system_prompt(
     注意：靜態規則（身份、文風、planning）在上方組裝，
     動態資料（記憶、世界觀、場景）在下方注入。
     """
-    banned_str = "、".join(pcfg["banned_words"])
-    expr_str = "\n".join(f"  {line}" for line in pcfg["expression_prefs"])
-    safety_str = "\n".join(f"- {line}" for line in pcfg.get("safety_rules", []))
-    safety_str_ooc = "\n".join(
-        f"- {line}" for line in pcfg.get("safety_rules", [])
-        if "色情" not in line and "NSFW" not in line
-    )
+    banned_str = build_banned_str(pcfg)
+    expr_str = build_expr_str(pcfg)
+    safety_str = build_safety_str(pcfg)
+    safety_str_ooc = build_safety_str(pcfg, exclude_ooc=True)
     if channel_type == "out_of_character":
         planning_tpl = pcfg.get(
             "planning_template_ooc",
@@ -2912,22 +2702,12 @@ async def build_phase2_system_prompt(
 _processing_messages = set()
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author == bot.user:
-        return
-    if message.id in _processing_messages:
-        return
-    _processing_messages.add(message.id)
+# ============================================================
+#  on_message 拆解後的輔助函數
+# ============================================================
 
-    # 伺服器白名單檢查
-    if message.guild:
-        pcfg = await load_prompt_config()
-        allowed = pcfg.get("allowed_servers", [])
-        if allowed and str(message.guild.id) not in allowed:
-            _processing_messages.discard(message.id)
-            return
-
+def detect_trigger(message: discord.Message) -> tuple[bool, bool, bool]:
+    """判斷訊息是否在「找」bot（@ / role mention / reply-to-bot）。"""
     is_mention = bot.user.mentioned_in(message)
 
     is_role_mention = False
@@ -2943,48 +2723,659 @@ async def on_message(message: discord.Message):
         if message.reference.resolved.author == bot.user:
             is_reply_to_bot = True
 
+    return is_mention, is_role_mention, is_reply_to_bot
+
+
+def detect_tarot(message: discord.Message) -> dict | None:
+    """偵測塔羅牌關鍵詞、抽牌、寫入 tarot.last_tarot，回傳 tarot_drawn dict 或 None。"""
+    if not tarot.check_tarot_trigger(message.content):
+        return None
+    clean_for_tarot = re.sub(r"<@&?\d+>", "", message.content).strip()
+    who_for = ""
+    m = re.search(r"幫(.+?)抽", clean_for_tarot)
+    if m:
+        who_for = m.group(1).strip()
+    if "三張" in clean_for_tarot or "抽三" in clean_for_tarot:
+        cards = tarot.draw_cards(3)
+        spread = "三張"
+    else:
+        cards = tarot.draw_cards(1)
+        spread = "單張"
+    tarot_files = []
+    for c in cards:
+        if c.has_image():
+            tarot_files.append(
+                discord.File(c.image_path, filename=f"{c.card_id}.png")
+            )
+    result = {
+        "cards": cards,
+        "who_for": who_for,
+        "spread": spread,
+        "timestamp": datetime.datetime.now().timestamp(),
+        "files": tarot_files,
+    }
+    tarot.last_tarot = result
+    return result
+
+
+def get_channel_info(message: discord.Message) -> dict:
+    """回傳 {channel_context, channel_type, is_explicit_ic_channel, channel_note}。"""
+    if message.guild:
+        channel = message.channel
+        if isinstance(channel, discord.Thread):
+            channel_name = f"{channel.parent.name if channel.parent else '?'}/{channel.name}"
+            channel_topic = getattr(channel.parent, "topic", "") or ""
+        else:
+            channel_name = channel.name
+            channel_topic = getattr(channel, "topic", "") or ""
+        channel_context = f"伺服器「{message.guild.name}」的頻道「#{channel_name}」"
+        if channel_topic:
+            channel_context += f"，頻道主題：{channel_topic}"
+
+        ooc_keywords = ["討論", "中之", "ooc", "meta", "後台", "幕後", "策劃", "閒聊"]
+        ic_keywords = ["劇情", "扮演", "rp", "角色", "主線", "場景", "冒險"]
+        combined = (channel_name + channel_topic).lower()
+        is_explicit_ic_channel = False
+        if any(kw in combined for kw in ooc_keywords):
+            channel_type = "out_of_character"
+        elif any(kw in combined for kw in ic_keywords):
+            channel_type = "in_character"
+            is_explicit_ic_channel = True
+        else:
+            channel_type = "in_character"
+    else:
+        channel_context = "私人訊息 (DM)"
+        channel_type = "in_character"
+        is_explicit_ic_channel = False
+
+    if channel_type == "out_of_character":
+        channel_note = "（本頻道為中之人討論串／後台頻道，扮演者們在此討論劇情走向，不需完全融入角色）"
+    else:
+        channel_note = "（本頻道為劇情扮演頻道，請完全融入角色進行沉浸式扮演）"
+
+    return {
+        "channel_context": channel_context,
+        "channel_type": channel_type,
+        "is_explicit_ic_channel": is_explicit_ic_channel,
+        "channel_note": channel_note,
+    }
+
+
+async def gather_context(message: discord.Message, channel_type: str, is_explicit_ic_channel: bool) -> dict:
+    """回傳 {reply_chain_messages, recent_messages, all_context, recall_candidates}。"""
+    reply_chain_messages, chain_participants = await fetch_reply_chain(message, limit=5)
+
+    recent_messages = []
+    if message.guild:
+        recent_messages = await fetch_recent_messages(
+            message.channel, message.id, limit=10
+        )
+        print(f"[上下文] 取得 {len(recent_messages)} 條最近訊息")
+        if channel_type == "in_character" and is_explicit_ic_channel:
+            await write_last_ic_channel(message.guild.id, message.channel.id)
+
+    seen_content = set()
+    all_context = []
+    for m in reply_chain_messages + recent_messages:
+        key = m["content"][:150]
+        if key not in seen_content:
+            seen_content.add(key)
+            all_context.append(m)
+    all_context.sort(key=lambda m: m.get("msg_id", 0))
+
+    recall_candidates = [
+        {"id": str(message.author.id), "name": message.author.display_name}
+    ]
+    for p in chain_participants:
+        if p["id"] != str(message.author.id):
+            recall_candidates.append(p)
+
+    return {
+        "reply_chain_messages": reply_chain_messages,
+        "recent_messages": recent_messages,
+        "all_context": all_context,
+        "recall_candidates": recall_candidates,
+    }
+
+
+async def pull_ooc_ic_content(message: discord.Message, channel_type: str, load_plot: bool,
+                              recall_threads: list, channel_note: str) -> tuple[str, str]:
+    """OOC 頻道下依 Phase 1 挑選的討論串補拉 IC 對話內容。回傳 (ic_context_text, channel_note)。"""
+    if channel_type != "out_of_character" or not message.guild or not load_plot:
+        return "", channel_note
+
+    target_thread_ids = []
+    name_to_id = {}
+    for th in message.guild.threads:
+        name_to_id[th.name] = th.id
+    for ch in message.guild.text_channels:
+        if any(kw in (ch.name or "").lower() for kw in ["劇情", "扮演", "rp", "主線", "角色"]):
+            try:
+                async for archived in ch.archived_threads(limit=10):
+                    name_to_id[archived.name] = archived.id
+            except Exception:
+                pass
+
+    if recall_threads:
+        for tname in recall_threads:
+            tid = name_to_id.get(tname)
+            if tid:
+                target_thread_ids.append(tid)
+    else:
+        last_ic = await read_last_ic_channel()
+        ic_channel_id = last_ic.get(str(message.guild.id))
+        if not ic_channel_id and name_to_id:
+            ic_channel_id = next(iter(name_to_id.values()))
+            await write_last_ic_channel(message.guild.id, ic_channel_id)
+        if ic_channel_id:
+            target_thread_ids.append(ic_channel_id)
+
+    all_ic_lines = ["【以下為劇情頻道最近對話 - 供參考】"]
+    fetched_count = 0
+    for tid in target_thread_ids[:3]:
+        ic_ch = message.guild.get_thread(tid) or message.guild.get_channel(tid)
+        if not ic_ch:
+            try:
+                ic_ch = await message.guild.fetch_channel(tid)
+            except Exception:
+                continue
+        if ic_ch:
+            try:
+                ic_msgs = []
+                async for m in ic_ch.history(limit=20):
+                    clean = re.sub(r"<@&?\d+>", "", m.content).strip()
+                    if not clean:
+                        continue
+                    role = "assistant" if m.author == bot.user else "user"
+                    if role == "user":
+                        clean = f"[{m.author.display_name}]: {clean}"
+                    ic_msgs.insert(0, {"role": role, "content": clean, "msg_id": m.id})
+                if ic_msgs:
+                    all_ic_lines.append(f"\n--- [{ic_ch.name}] ---")
+                    ic_char_name = await get_character_name() or "bot"
+                    for m in ic_msgs:
+                        role_label = ic_char_name if m["role"] == "assistant" else "對方"
+                        all_ic_lines.append(f"[{role_label}]: {m['content']}")
+                    fetched_count += len(ic_msgs)
+            except Exception as e:
+                print(f"[上下文] IC #{getattr(ic_ch, 'name', tid)} 補拉失敗: {e}")
+
+    if fetched_count > 0:
+        ic_context_text = "\n".join(all_ic_lines)
+        print(f"[上下文] 從 {len(target_thread_ids[:3])} 個討論串補拉 {fetched_count} 條")
+        if recall_threads:
+            channel_note += f"\n（依討論內容已載入：{', '.join(recall_threads)}）"
+        else:
+            ic_label = getattr(
+                message.guild.get_thread(target_thread_ids[0])
+                or message.guild.get_channel(target_thread_ids[0]),
+                "name", "劇情",
+            )
+            channel_note += f"\n（已載入 #{ic_label} 對話）"
+    else:
+        ic_context_text = ""
+
+    return ic_context_text, channel_note
+
+
+async def resolve_and_fetch_memories(recall_user_ids: list, recall_candidates: list,
+                                     channel_type: str) -> tuple[list, str]:
+    """名稱→ID 解析 + 從 SQLite 撈使用者記憶。回傳 (resolved_ids, combined_memories)。"""
+    resolved_ids = []
+    for raw_id in recall_user_ids[:3]:
+        try:
+            int(raw_id)
+            resolved_ids.append(raw_id)
+        except ValueError:
+            matched = next(
+                (c for c in recall_candidates if c["name"].lower() == raw_id.lower()),
+                None,
+            )
+            if not matched:
+                raw_lower = raw_id.lower()
+                for c in recall_candidates:
+                    c_lower = c["name"].lower()
+                    if raw_lower in c_lower or c_lower in raw_lower:
+                        matched = c
+                        break
+            if matched:
+                resolved_ids.append(matched["id"])
+            else:
+                print(f"[Phase 1] 無法解析 '{raw_id}' 為有效 ID，跳過。")
+
+    recalled_memories = []
+    for uid in resolved_ids:
+        if not uid.isdigit():
+            continue
+        name = next((c["name"] for c in recall_candidates if c["id"] == uid), uid)
+        mem = await get_user_memory(
+            int(uid), limit=8,
+            context_filter="ic" if channel_type == "in_character" else None,
+            user_name=name,
+        )
+        recalled_memories.append(f"【{name}】\n{mem}")
+        print(f"[召回] {name} (id={uid})")
+
+    combined_memories = "\n\n".join(recalled_memories)
+    return resolved_ids, combined_memories
+
+
+async def assemble_lore_text(phase1_supplement, lore_topics: list, lore_notes: list) -> str:
+    """用 Phase 1 的 supplement 或降級為舊式組裝，回傳 lore_text。"""
+    if isinstance(phase1_supplement, list):
+        text = format_supplement(phase1_supplement)
+        if text:
+            print(f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} 條）")
+            return text
+    elif phase1_supplement and phase1_supplement.strip():
+        print(f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} chars）")
+        return phase1_supplement
+
+    lore_entries = await get_lore_by_topics(lore_topics)
+    if lore_entries or lore_notes:
+        supplement_lines = ["<supplement>"]
+        if lore_entries:
+            supplement_lines.append("[條目]")
+            for e in lore_entries:
+                supplement_lines.append(f"- [{e['category']}] {e['topic']}：{e['content']}")
+        all_notes = []
+        for n in lore_notes:
+            if isinstance(n, dict):
+                note_text = n.get("note", "")
+                if note_text:
+                    topic = n.get("topic", "")
+                    if topic:
+                        all_notes.append(f"# [{topic}] {note_text}")
+                    else:
+                        all_notes.append(f"# {note_text}")
+        if all_notes:
+            supplement_lines.append("")
+            supplement_lines.append("[註釋]")
+            supplement_lines.extend(all_notes)
+        supplement_lines.append("</supplement>")
+        print(f"[世界觀] 召回 {len(lore_entries)} 條, 註釋 {len(all_notes)} 條 (topics: {lore_topics})")
+        return "\n".join(supplement_lines)
+    return ""
+
+
+async def log_recalled_data(resolved_ids: list, recall_candidates: list,
+                            combined_memories: str, lore_text: str):
+    """將召回的記憶/世界觀資料寫入 last_recalled_data.txt。"""
+    lines = ["=== 召回的參與者 ==="]
+    for uid in resolved_ids:
+        name = next((c["name"] for c in recall_candidates if c["id"] == uid), uid)
+        lines.append(f"- {name} (id={uid})")
+    lines += ["", "=== 使用者記憶內容 ===", combined_memories or "（無）"]
+    lines += ["", "=== 世界觀補充（lore_text） ===", lore_text or "（無）"]
+    async with aiofiles.open(
+        os.path.join(PROMPT_LOG_DIR, "last_recalled_data.txt"), "w", encoding="utf-8",
+    ) as f:
+        await f.write("\n".join(lines))
+    print(f"[DEBUG] 召回資料已寫入 {PROMPT_LOG_DIR}\\last_recalled_data.txt")
+
+
+async def build_and_call_phase2(message: discord.Message, *, channel_type: str, pcfg: dict,
+                                enable_ic_style: bool, channel_context: str, channel_note: str,
+                                ic_context_text: str, combined_memories: str, lore_text: str,
+                                quests_text: str, all_context: list, clean_input_reply: str,
+                                tarot_drawn: dict | None, image_description: str = "") -> tuple[str, str, str]:
+    """建構 Phase 2 prompt、呼叫 API、寫入 debug log。回傳 (raw_content, phase2_char_name, current_user_name)。"""
+    self_memories = await get_self_memory(limit=15)
+    server_rules_text = ""
+    if message.guild:
+        server_rules_text = await get_server_rules(message.guild.id)
+
+    phase2_system = await build_phase2_system_prompt(
+        channel_type, pcfg, enable_ic_style, channel_context, channel_note,
+        ic_context_text, combined_memories, lore_text, self_memories,
+        server_rules_text, quests_text,
+    )
+
+    if channel_type == "in_character":
+        channel_summary = await get_channel_summary(str(message.channel.id))
+        if channel_summary:
+            phase2_system += f"\n\n【目前故事摘要】\n{channel_summary}"
+        auto_injection = await autopilot.get_autopilot_injection(message, channel_type)
+        if auto_injection:
+            phase2_system += auto_injection
+
+    if tarot_drawn:
+        cards_str = "、".join(f"{c.get_display_name()}" for c in tarot_drawn["cards"])
+        who = tarot_drawn["who_for"] or "你"
+        phase2_system += (
+            f"\n\n【塔羅牌】\n你剛剛為了 {who} 抽了{tarot_drawn['spread']}牌：{cards_str}。\n"
+            f"在回覆中自然地提起這張牌即可，不用嚴肅解讀。"
+        )
+
+    phase2_messages = [{"role": "system", "content": phase2_system}]
+    phase2_messages.extend(all_context)
+    current_user_name = message.author.display_name
+    phase2_char_name = await get_character_name() or "角色"
+
+    if channel_type == "out_of_character":
+        planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
+        fmt_body = "2. 正文（自然對話）\n"
+    else:
+        planning_instruction = "1. <planning>當前情況分析</planning>"
+        fmt_body = f"2. {phase2_char_name}的台詞\n"
+
+    img_block = ""
+    if image_description:
+        img_block = f"\n\n【用戶分享的圖片分析結果】\n{image_description}"
+
+    phase2_messages.append({
+        "role": "user",
+        "content": (
+            f"【你正在回覆 {current_user_name} 的訊息】\n"
+            "【系統格式指令】\n你接下來回覆的順序必須是：\n"
+            f"{planning_instruction}\n{fmt_body}\n"
+            "【分隔回覆】\n若你需要同時回覆不同的人，請在每段訊息前加上 [TO:該人的名稱]\n"
+            "例：[TO:頭皮慶]\n你的回覆...\n[TO:吳神月]\n你的回覆...\n"
+            "⚠️ [TO:] 僅限用於確定有在找你說話的人（回覆過你的訊息、@你、或直接提到你的角色名），"
+            "不要對歷史記錄中每個出現的人都一一回覆。\n"
+            "【回覆專注原則】\n"
+            f"你正在回覆的是 {current_user_name}。專注於他/她的訊息即可。\n"
+            "如果歷史中其他人在對話但沒有明確找你（沒有@你、沒有回覆你、沒有提到你的角色名），"
+            "不需要回應他們，也不需要為他們加上 [TO:]。"
+            f"{img_block}"
+        ),
+    })
+    phase2_messages.append({
+        "role": "user",
+        "content": f"[{current_user_name}]: {clean_input_reply}",
+    })
+
+    print("[LOG] [Phase 2] 生成角色回覆中...")
+    os.makedirs(PROMPT_LOG_DIR, exist_ok=True)
+    async with aiofiles.open(os.path.join(PROMPT_LOG_DIR, "last_prompt.txt"), "w", encoding="utf-8") as f:
+        await f.write("=== SYSTEM ===\n")
+        await f.write(phase2_system)
+        await f.write("\n\n=== CONTEXT ===\n")
+        for m in all_context:
+            role_tag = phase2_char_name if m["role"] == "assistant" else "USER"
+            await f.write(f"\n[{role_tag}] {m['content']}")
+        await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
+        await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
+        await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
+    print(f"[DEBUG] Phase 2 完整提示詞已寫入 {PROMPT_LOG_DIR}\\last_prompt.txt")
+
+    phase2_resp = await client.chat.completions.create(
+        model="deepseek-v4-flash", messages=phase2_messages,
+        temperature=0.8, max_tokens=2048,
+    )
+    raw_content = phase2_resp.choices[0].message.content or ""
+    raw_content = autopilot.strip_japanese_original(raw_content)
+    print(f"[LOG] [Phase 2] 回傳長度={len(raw_content)}")
+    if not raw_content.strip():
+        await _log_error(
+            "phase2_empty_response",
+            f"API 回傳空內容 (user={message.author.display_name}, msg={clean_input_reply[:100]})",
+            traceback="",
+        )
+        print("[WARN] [Phase 2] ⚠️ API 回傳空內容！")
+
+    async with aiofiles.open(os.path.join(PROMPT_LOG_DIR, "last_response.txt"), "w", encoding="utf-8") as f:
+        await f.write(raw_content)
+    print(f"[DEBUG] 完整 AI 輸出已寫入 {PROMPT_LOG_DIR}\\last_response.txt")
+
+    return raw_content, phase2_char_name, current_user_name
+
+
+async def run_phase2_direct(
+    *,
+    channel_type: str,
+    pcfg: dict,
+    enable_ic_style: bool,
+    channel_context: str,
+    channel_note: str,
+    ic_context_text: str,
+    combined_memories: str,
+    lore_text: str,
+    self_memories: str,
+    server_rules_text: str,
+    quests_text: str,
+    all_context: list,
+    clean_input_reply: str,
+    current_user_name: str,
+    image_description: str = "",
+) -> tuple[str, str, str]:
+    """輕量版 Phase 2 呼叫：接受預建好的 context，不需要 discord.Message 物件。
+    供 /readimg 等 slash command 使用。回傳 (raw_content, char_name, user_name)。"""
+    phase2_system = await build_phase2_system_prompt(
+        channel_type, pcfg, enable_ic_style, channel_context, channel_note,
+        ic_context_text, combined_memories, lore_text, self_memories,
+        server_rules_text, quests_text,
+    )
+
+    phase2_messages = [{"role": "system", "content": phase2_system}]
+    phase2_messages.extend(all_context)
+    phase2_char_name = await get_character_name() or "角色"
+
+    if channel_type == "out_of_character":
+        planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
+        fmt_body = "2. 正文（自然對話）\n"
+    else:
+        planning_instruction = "1. <planning>當前情況分析</planning>"
+        fmt_body = f"2. {phase2_char_name}的台詞\n"
+
+    img_block = ""
+    if image_description:
+        img_block = f"\n\n【用戶分享的圖片分析結果】\n{image_description}"
+
+    phase2_messages.append({
+        "role": "user",
+        "content": (
+            f"【你正在回覆 {current_user_name} 的訊息】\n"
+            "【系統格式指令】\n你接下來回覆的順序必須是：\n"
+            f"{planning_instruction}\n{fmt_body}\n"
+            "【分隔回覆】\n若你需要同時回覆不同的人，請在每段訊息前加上 [TO:該人的名稱]\n"
+            "例：[TO:頭皮慶]\n你的回覆...\n[TO:吳神月]\n你的回覆...\n"
+            "⚠️ [TO:] 僅限用於確定有在找你說話的人（回覆過你的訊息、@你、或直接提到你的角色名），"
+            "不要對歷史記錄中每個出現的人都一一回覆。\n"
+            "【回覆專注原則】\n"
+            f"你正在回覆的是 {current_user_name}。專注於他/她的訊息即可。\n"
+            "如果歷史中其他人在對話但沒有明確找你（沒有@你、沒有回覆你、沒有提到你的角色名），"
+            "不需要回應他們，也不需要為他們加上 [TO:]。"
+            f"{img_block}"
+        ),
+    })
+    phase2_messages.append({
+        "role": "user",
+        "content": f"[{current_user_name}]: {clean_input_reply}",
+    })
+
+    print("[LOG] [Phase 2 direct] 生成角色回覆中...")
+    os.makedirs(PROMPT_LOG_DIR, exist_ok=True)
+    async with aiofiles.open(os.path.join(PROMPT_LOG_DIR, "last_prompt.txt"), "w", encoding="utf-8") as f:
+        await f.write("=== SYSTEM ===\n")
+        await f.write(phase2_system)
+        await f.write("\n\n=== CONTEXT ===\n")
+        for m in all_context:
+            role_tag = phase2_char_name if m["role"] == "assistant" else "USER"
+            await f.write(f"\n[{role_tag}] {m['content']}")
+        await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
+        await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
+        await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
+
+    phase2_resp = await client.chat.completions.create(
+        model="deepseek-v4-flash", messages=phase2_messages,
+        temperature=0.8, max_tokens=2048,
+    )
+    raw_content = phase2_resp.choices[0].message.content or ""
+    raw_content = autopilot.strip_japanese_original(raw_content)
+    print(f"[LOG] [Phase 2 direct] 回傳長度={len(raw_content)}")
+    if not raw_content.strip():
+        await _log_error(
+            "phase2_empty_response_direct",
+            f"API 回傳空內容 (user={current_user_name}, msg={clean_input_reply[:100]})",
+            traceback="",
+        )
+        print("[WARN] [Phase 2 direct] ⚠️ API 回傳空內容！")
+
+    async with aiofiles.open(os.path.join(PROMPT_LOG_DIR, "last_response.txt"), "w", encoding="utf-8") as f:
+        await f.write(raw_content)
+
+    return raw_content, phase2_char_name, current_user_name
+
+
+async def style_self_check(raw_content: str, channel_type: str, enable_ic_style: bool,
+                           pcfg: dict) -> str:
+    """IC 文風啟用時，呼叫 LLM 檢查並修正違規。回傳可能修正過的 raw_content。"""
+    if not (
+        ((enable_ic_style and channel_type != "out_of_character") or channel_type == "in_character")
+        and raw_content.strip()
+    ):
+        return raw_content
+
+    style_rules = "\n".join(f"- {p}" for p in pcfg.get("expression_prefs", []))
+    banned = "、".join(pcfg.get("banned_words", []))
+    sr_prompt = f"""請審閱以下角色回覆，檢查是否違反文風規則。若有違反請修正，但務必保留原意、語氣和角色性格。
+
+【文風規則】
+{style_rules}
+
+【禁用詞彙】
+{banned}
+
+【角色回覆】
+{raw_content}
+
+請直接輸出修正後的完整回覆（含 <planning> 區塊），不要加任何解釋。若無需修正則輸出原文。"""
+    try:
+        sr_resp = await client.chat.completions.create(
+            model="deepseek-v4-flash",
+            messages=[
+                {"role": "system", "content": "你只輸出修正後的完整回覆，不加任何解釋。"},
+                {"role": "user", "content": sr_prompt},
+            ],
+            temperature=0.3, max_tokens=2048,
+        )
+        reviewed = sr_resp.choices[0].message.content or ""
+        if reviewed.strip():
+            old_len = len(raw_content)
+            raw_content = reviewed
+            print(f"[文風自檢] 修正 {old_len} → {len(reviewed)} chars")
+    except Exception as e:
+        print(f"[文風自檢] 失敗（保留原文）: {e}")
+    return raw_content
+
+
+_SKIP_PATTERNS = [
+    "不是發言的好時機", "不適合回應", "不適合發言",
+    "不是說話的好時機", "現在不該", "選擇沉默",
+    "不是開口的時機", "不應該回應", "不回應",
+]
+
+
+async def cleanup_response(raw_content: str, blocked_kw: list, phase2_char_name: str,
+                           clean_input: str, clean_input_reply: str) -> str | None:
+    """清理、skip 偵測、安全過濾。若 bot 決定不回覆則回傳 None。"""
+    if not raw_content.strip():
+        return None
+
+    cleaned_for_send = strip_planning(raw_content)
+
+    _skip_hit = next((p for p in _SKIP_PATTERNS if p in cleaned_for_send), None)
+    if _skip_hit:
+        _planning_match = re.search(r"<planning>(.*?)</planning>", raw_content, re.DOTALL)
+        _planning_text = _planning_match.group(1).strip() if _planning_match else "（無 planning）"
+        _skip_dir = os.path.join(SCRIPT_DIR, "skip_logs")
+        os.makedirs(_skip_dir, exist_ok=True)
+        _skip_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        _skip_excerpt = re.sub(r'[\\/:*?"<>|]', "", clean_input[:20]) or "unknown"
+        _skip_path = os.path.join(_skip_dir, f"{_skip_ts}_{_skip_excerpt}.txt")
+        try:
+            async with aiofiles.open(_skip_path, "w", encoding="utf-8") as _sf:
+                await _sf.write(f"=== SKIP PATTERN ===\n{_skip_hit}\n\n")
+                await _sf.write(f"=== USER MESSAGE ===\n{clean_input_reply}\n\n")
+                await _sf.write(f"=== PLANNING ===\n{_planning_text}\n\n")
+                await _sf.write(f"=== FULL RESPONSE ===\n{raw_content}\n")
+            print(f"[SKIP] 偵測到 skip pattern「{_skip_hit}」→ {_skip_path}")
+        except Exception as _se:
+            print(f"[SKIP] log 寫入失敗: {_se}")
+
+    bot_reply = strip_mem_learn_tags(cleaned_for_send)
+    bot_reply = strip_html_tags(bot_reply)
+    if not bot_reply:
+        bot_reply = "……"
+
+    reply_lower = bot_reply.lower()
+    for kw in blocked_kw:
+        if kw in reply_lower:
+            print(f"[安全] 攔截！回覆包含封鎖關鍵字: '{kw}'")
+            print(f"[安全] 原始回覆: {bot_reply[:200]}")
+            bot_reply = f"（{phase2_char_name}輕輕搖頭，沒有回應這個話題。）"
+            break
+
+    return bot_reply
+
+
+async def dispatch_reply(message: discord.Message, bot_reply: str, tarot_drawn: dict | None):
+    """處理分段 [TO:] 回覆並發送（含 tarot 附件）。
+
+    如果有多個 [TO:] 區段，全部合併為單一回覆（回覆到觸發訊息），
+    避免單獨回覆各人時 reply 鏈指錯人。
+    """
+    if "[TO:" in bot_reply:
+        parts = re.split(r"\n?\[TO:(.+?)\]\n?", bot_reply)
+        if len(parts) > 1:
+            segments = []
+            for i in range(1, len(parts), 2):
+                name = parts[i].strip()
+                text = parts[i + 1].strip() if i + 1 < len(parts) else ""
+                if text:
+                    segments.append((name, text))
+
+            if len(segments) >= 2:
+                # 多人回覆 → 合併為一則，用分隔線區分
+                merged_lines = []
+                for seg_name, seg_text in segments:
+                    merged_lines.append(f"**回覆 {seg_name}**\n{seg_text}")
+                merged = "\n\n---\n\n".join(merged_lines)
+                tf = tarot_drawn.get("files", []) if tarot_drawn else []
+                await message.reply(merged, files=tf)
+            elif len(segments) == 1:
+                # 只有一人 → 直接回覆觸發訊息
+                seg_name, seg_text = segments[0]
+                tf = tarot_drawn.get("files", []) if tarot_drawn else []
+                await message.reply(seg_text, files=tf)
+        else:
+            tf = tarot_drawn.get("files", []) if tarot_drawn else []
+            await message.reply(bot_reply, files=tf)
+    else:
+        tf = tarot_drawn.get("files", []) if tarot_drawn else []
+        await message.reply(bot_reply, files=tf)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author == bot.user:
+        return
+    if message.id in _processing_messages:
+        return
+    _processing_messages.add(message.id)
+
+    if message.guild:
+        pcfg = await load_prompt_config()
+        allowed = pcfg.get("allowed_servers", [])
+        if allowed and str(message.guild.id) not in allowed:
+            _processing_messages.discard(message.id)
+            return
+
+    is_mention, is_role_mention, is_reply_to_bot = detect_trigger(message)
     if not (is_mention or is_role_mention or is_reply_to_bot):
         _processing_messages.discard(message.id)
         await bot.process_commands(message)
         return
 
-    # --- 塔羅牌關鍵詞偵測（已確認是被找的狀態） ---
-    tarot_drawn = None
-    if tarot.check_tarot_trigger(message.content):
-        clean_for_tarot = re.sub(r"<@&?\d+>", "", message.content).strip()
-        who_for = ""
-        m = re.search(r"幫(.+?)抽", clean_for_tarot)
-        if m:
-            who_for = m.group(1).strip()
-        if "三張" in clean_for_tarot or "抽三" in clean_for_tarot:
-            cards = tarot.draw_cards(3)
-            spread = "三張"
-        else:
-            cards = tarot.draw_cards(1)
-            spread = "單張"
-        tarot_files = []
-        for c in cards:
-            if c.has_image():
-                tarot_files.append(
-                    discord.File(c.image_path, filename=f"{c.card_id}.png")
-                )
-        tarot.last_tarot = {
-            "cards": cards,
-            "who_for": who_for,
-            "spread": spread,
-            "timestamp": datetime.datetime.now().timestamp(),
-            "files": tarot_files,
-        }
-        tarot_drawn = tarot.last_tarot
+    tarot_drawn = detect_tarot(message)
 
     async with message.channel.typing():
         try:
-            # --- 清洗輸入 ---
             clean_input = re.sub(r"<@&?\d+>", "", message.content).strip()
             if not clean_input:
                 clean_input = "hi"
 
-            # --- 回覆上下文：使用者用 Discord 回覆功能指向了哪句話 ---
             reply_context = ""
             if message.reference and message.reference.resolved:
                 replied = message.reference.resolved
@@ -2995,117 +3386,30 @@ async def on_message(message: discord.Message):
                 f"{clean_input}\n{reply_context}" if reply_context else clean_input
             )
 
-            # --- 頻道資訊 ---
-            if message.guild:
-                channel = message.channel
-                if isinstance(channel, discord.Thread):
-                    channel_name = f"{channel.parent.name if channel.parent else '?'}/{channel.name}"
-                    channel_topic = getattr(channel.parent, "topic", "") or ""
-                else:
-                    channel_name = channel.name
-                    channel_topic = getattr(channel, "topic", "") or ""
-                channel_context = (
-                    f"伺服器「{message.guild.name}」的頻道「#{channel_name}」"
-                )
-                if channel_topic:
-                    channel_context += f"，頻道主題：{channel_topic}"
+            ch_info = get_channel_info(message)
+            channel_context = ch_info["channel_context"]
+            channel_type = ch_info["channel_type"]
+            channel_note = ch_info["channel_note"]
+            is_explicit_ic_channel = ch_info["is_explicit_ic_channel"]
 
-                # 判斷頻道類型
-                ooc_keywords = [
-                    "討論",
-                    "中之",
-                    "ooc",
-                    "meta",
-                    "後台",
-                    "幕後",
-                    "策劃",
-                    "閒聊",
-                ]
-                ic_keywords = ["劇情", "扮演", "rp", "角色", "主線", "場景", "冒險"]
-                combined = (channel_name + channel_topic).lower()
-                is_explicit_ic_channel = False
-                if any(kw in combined for kw in ooc_keywords):
-                    channel_type = "out_of_character"
-                elif any(kw in combined for kw in ic_keywords):
-                    channel_type = "in_character"
-                    is_explicit_ic_channel = True
-                else:
-                    # 名稱沒命中任何關鍵字時，預設視為 IC 以維持沉浸感，
-                    # 但「不」標記為 explicit，避免之後誤把這種無關頻道
-                    # 寫入「最後活躍 IC 頻道」記錄，污染跨頻道劇情召回。
-                    channel_type = "in_character"
-            else:
-                channel_context = "私人訊息 (DM)"
-                channel_type = "in_character"
+            ctx = await gather_context(message, channel_type, is_explicit_ic_channel)
+            all_context = ctx["all_context"]
+            recall_candidates = ctx["recall_candidates"]
 
-            # 頻道類型說明（提前定義，IC 補拉會用到）
-            if channel_type == "out_of_character":
-                channel_note = "（本頻道為中之人討論串／後台頻道，扮演者們在此討論劇情走向，不需完全融入角色）"
-            else:
-                channel_note = "（本頻道為劇情扮演頻道，請完全融入角色進行沉浸式扮演）"
-            ic_context_text = ""
-
-            # --- 追溯對話鏈 + 參與者 ---
-            reply_chain_messages, chain_participants = await fetch_reply_chain(
-                message, limit=5
-            )
-
-            # 取得頻道最近 N 條訊息（上下文）---
-            recent_messages = []
-            if message.guild:
-                recent_messages = await fetch_recent_messages(
-                    message.channel, message.id, limit=10
-                )
-                print(f"[上下文] 取得 {len(recent_messages)} 條最近訊息")
-
-                # 記錄 IC 頻道（供 OOC 跨頻道召回）
-                # 只有「明確命中 IC 關鍵字」的頻道/討論串才會更新記錄，
-                # 避免無關頻道（沒命中任何關鍵字、靠 fallback 判成 IC 的）
-                # 在被 @ 一次後覆蓋掉真正的劇情討論串位置。
-                if channel_type == "in_character" and is_explicit_ic_channel:
-                    await write_last_ic_channel(message.guild.id, message.channel.id)
-
-            # --- 合併對話上下文（最近訊息 + 回覆鏈，去重後按時間排序）---
-            seen_content = set()
-            all_context = []
-            for m in reply_chain_messages + recent_messages:
-                # 去重 key：保留 [name]: 前綴，避免不同人說同一句話被誤判重複
-                key = m["content"][:150]
-                if key not in seen_content:
-                    seen_content.add(key)
-                    all_context.append(m)
-            # 依 Discord 訊息 ID 排序（snowflake 含時間戳，id 越大越新）
-            all_context.sort(key=lambda m: m.get("msg_id", 0))
-
-            # --- 建立可查詢參與者清單（觸發者必定在第一個） ---
-            recall_candidates = [
-                {"id": str(message.author.id), "name": message.author.display_name}
-            ]
-            for p in chain_participants:
-                if p["id"] != str(message.author.id):
-                    recall_candidates.append(p)
-
-            # ============================================================
-            #  Phase 1: 記憶召回分析（含完整資料庫讀取）
-            # ============================================================
             char_name_await = await get_character_name() or "角色"
             chain_text = (
                 "\n".join(
                     f"[{char_name_await if m['role'] == 'assistant' else '對方'}]: {m['content'][:200]}"
                     for m in all_context[-12:]
-                )
-                or "（無歷史對話）"
+                ) or "（無歷史對話）"
             )
 
-            # 先撈取完整資料庫內容供 Phase 1 分析
             lore_full = await get_all_lore_full()
             all_self_raw = await get_self_memory_raw(limit=50)
-            self_memories_lines = []
-            for m in all_self_raw:
-                if not m["topic"].startswith("劇情摘要:"):
-                    self_memories_lines.append(
-                        f"- [{m['timestamp'][:19]}] {m['topic']}：{m['content'][:200]}"
-                    )
+            self_memories_lines = [
+                f"- [{m['timestamp'][:19]}] {m['topic']}：{m['content'][:200]}"
+                for m in all_self_raw if not m["topic"].startswith("劇情摘要:")
+            ]
             self_memories_full = "\n".join(self_memories_lines) or "（無自我記憶）"
 
             user_memories_lines = []
@@ -3119,547 +3423,74 @@ async def on_message(message: discord.Message):
                     user_memories_lines.append(f"【{c['name']}】\n{mem}")
             user_memories_full = "\n\n".join(user_memories_lines) or "（無使用者記憶）"
 
-            thread_catalog = "（無）"
-            all_summaries = all_self_raw
-            thread_lines = []
-            for m in all_summaries:
-                if m["topic"].startswith("劇情摘要:"):
-                    thread_name = m["topic"].replace("劇情摘要:", "", 1)
-                    thread_lines.append(f"- {thread_name}：{m['content'][:150]}")
-            if thread_lines:
-                thread_catalog = "\n".join(thread_lines)
+            thread_lines = [
+                f"- {m['topic'].replace('劇情摘要:', '', 1)}：{m['content'][:150]}"
+                for m in all_self_raw if m["topic"].startswith("劇情摘要:")
+            ]
+            thread_catalog = "\n".join(thread_lines) if thread_lines else "（無）"
 
             quests_text = ""
             if channel_type == "in_character":
                 q = await get_active_quests()
                 if q:
-                    quests_text = (
-                        q
-                        + "\n\n（請在劇情中自然地引導角色往任務目標前進。不要突兀地讓角色突然想到任務，而是透過環境或對話自然觸發。）"
-                    )
+                    quests_text = q + "\n\n（請在劇情中自然地引導角色往任務目標前進。不要突兀地讓角色突然想到任務，而是透過環境或對話自然觸發。）"
 
-            (
-                _,
-                recall_user_ids,
-                lore_topics,
-                lore_notes,
-                recall_threads,
-                load_plot,
-                enable_ic_style,
-                phase1_supplement,
-            ) = await run_phase1(
-                recall_candidates,
-                chain_text,
-                thread_catalog,
-                quests_text,
-                clean_input_reply,
-                all_context,
-                self_memories_full,
-                user_memories_full,
-                lore_full,
+            (_, recall_user_ids, lore_topics, lore_notes, recall_threads,
+             load_plot, enable_ic_style, phase1_supplement) = await run_phase1(
+                recall_candidates, chain_text, thread_catalog, quests_text,
+                clean_input_reply, all_context, self_memories_full, user_memories_full, lore_full,
             )
 
-            # --- OOC 模式：依 Phase 1 挑選的討論串補拉內容（移到這裡以使用 recall_threads）---
-            if channel_type == "out_of_character" and message.guild and load_plot:
-                target_thread_ids = []
-                name_to_id = {}
-                for th in message.guild.threads:
-                    name_to_id[th.name] = th.id
-                for ch in message.guild.text_channels:
-                    if any(
-                        kw in (ch.name or "").lower()
-                        for kw in ["劇情", "扮演", "rp", "主線", "角色"]
-                    ):
-                        try:
-                            async for archived in ch.archived_threads(limit=10):
-                                name_to_id[archived.name] = archived.id
-                        except Exception:
-                            pass
+            ic_context_text, channel_note = await pull_ooc_ic_content(
+                message, channel_type, load_plot, recall_threads, channel_note,
+            )
 
-                if recall_threads:
-                    for tname in recall_threads:
-                        tid = name_to_id.get(tname)
-                        if tid:
-                            target_thread_ids.append(tid)
-                else:
-                    last_ic = await read_last_ic_channel()
-                    ic_channel_id = last_ic.get(str(message.guild.id))
-                    if not ic_channel_id and name_to_id:
-                        ic_channel_id = next(iter(name_to_id.values()))
-                        await write_last_ic_channel(message.guild.id, ic_channel_id)
-                    if ic_channel_id:
-                        target_thread_ids.append(ic_channel_id)
+            resolved_ids, combined_memories = await resolve_and_fetch_memories(
+                recall_user_ids, recall_candidates, channel_type,
+            )
 
-                all_ic_lines = ["【以下為劇情頻道最近對話 - 供參考】"]
-                fetched_count = 0
-                for tid in target_thread_ids[:3]:
-                    ic_ch = message.guild.get_thread(tid) or message.guild.get_channel(
-                        tid
-                    )
-                    if not ic_ch:
-                        try:
-                            ic_ch = await message.guild.fetch_channel(tid)
-                        except Exception:
-                            continue
-                    if ic_ch:
-                        try:
-                            ic_msgs = []
-                            async for m in ic_ch.history(limit=20):
-                                clean = re.sub(r"<@&?\d+>", "", m.content).strip()
-                                if not clean:
-                                    continue
-                                role = "assistant" if m.author == bot.user else "user"
-                                if role == "user":
-                                    clean = f"[{m.author.display_name}]: {clean}"
-                                ic_msgs.insert(
-                                    0, {"role": role, "content": clean, "msg_id": m.id}
-                                )
-                            if ic_msgs:
-                                all_ic_lines.append(f"\n--- [{ic_ch.name}] ---")
-                                ic_char_name = await get_character_name() or "bot"
-                                for m in ic_msgs:
-                                    role_label = (
-                                        ic_char_name
-                                        if m["role"] == "assistant"
-                                        else "對方"
-                                    )
-                                    all_ic_lines.append(
-                                        f"[{role_label}]: {m['content']}"
-                                    )
-                                fetched_count += len(ic_msgs)
-                        except Exception as e:
-                            print(
-                                f"[上下文] IC #{getattr(ic_ch, 'name', tid)} 補拉失敗: {e}"
-                            )
+            lore_text = await assemble_lore_text(phase1_supplement, lore_topics, lore_notes)
 
-                if fetched_count > 0:
-                    ic_context_text = "\n".join(all_ic_lines)
-                    print(
-                        f"[上下文] 從 {len(target_thread_ids[:3])} 個討論串補拉 {fetched_count} 條"
-                    )
-                    if recall_threads:
-                        channel_note += (
-                            f"\n（依討論內容已載入：{', '.join(recall_threads)}）"
-                        )
-                    else:
-                        ic_label = getattr(
-                            message.guild.get_thread(target_thread_ids[0])
-                            or message.guild.get_channel(target_thread_ids[0]),
-                            "name",
-                            "劇情",
-                        )
-                        channel_note += f"\n（已載入 #{ic_label} 對話）"
+            await log_recalled_data(resolved_ids, recall_candidates, combined_memories, lore_text)
 
-            # --- 名稱 → ID 查表（Phase 1 有時會給名稱而非 ID）---
-            resolved_ids = []
-            for raw_id in recall_user_ids[:3]:
-                try:
-                    int(raw_id)
-                    resolved_ids.append(raw_id)
-                except ValueError:
-                    # 精確比對
-                    matched = next(
-                        (
-                            c
-                            for c in recall_candidates
-                            if c["name"].lower() == raw_id.lower()
-                        ),
-                        None,
-                    )
-                    # 模糊比對（display_name 可能包含特殊符號）
-                    if not matched:
-                        raw_lower = raw_id.lower()
-                        for c in recall_candidates:
-                            c_lower = c["name"].lower()
-                            if raw_lower in c_lower or c_lower in raw_lower:
-                                matched = c
-                                break
-                    if matched:
-                        resolved_ids.append(matched["id"])
-                    else:
-                        print(f"[Phase 1] 無法解析 '{raw_id}' 為有效 ID，跳過。")
-
-            # --- 從 SQLite 撈取使用者記憶 ---
-            recalled_memories = []
-            for uid in resolved_ids:
-                if not uid.isdigit():
-                    continue
-                name = next(
-                    (c["name"] for c in recall_candidates if c["id"] == uid), uid
-                )
-                mem = await get_user_memory(
-                    int(uid),
-                    limit=8,
-                    context_filter="ic" if channel_type == "in_character" else None,
-                    user_name=name,
-                )
-                recalled_memories.append(f"【{name}】\n{mem}")
-                print(f"[召回] {name} (id={uid})")
-
-            # --- 從 SQLite 撈取使用者記憶（Phase 2 需要「已知資訊」） ---
-            combined_memories = "\n\n".join(recalled_memories)
-
-            # --- 使用 Phase 1 的 supplement，或降級為舊式組裝 ---
-            if isinstance(phase1_supplement, list):
-                lore_text = format_supplement(phase1_supplement)
-                if lore_text:
-                    print(
-                        f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} 條）"
-                    )
-            elif phase1_supplement and phase1_supplement.strip():
-                lore_text = phase1_supplement
-                print(
-                    f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} chars）"
-                )
-            else:
-                lore_entries = await get_lore_by_topics(lore_topics)
-                if lore_entries or lore_notes:
-                    supplement_lines = ["<supplement>"]
-                    if lore_entries:
-                        supplement_lines.append("[條目]")
-                        for e in lore_entries:
-                            supplement_lines.append(
-                                f"- [{e['category']}] {e['topic']}：{e['content']}"
-                            )
-                    all_notes = []
-                    for n in lore_notes:
-                        if isinstance(n, dict):
-                            note_text = n.get("note", "")
-                            if note_text:
-                                topic = n.get("topic", "")
-                                if topic:
-                                    all_notes.append(f"# [{topic}] {note_text}")
-                                else:
-                                    all_notes.append(f"# {note_text}")
-                    if all_notes:
-                        supplement_lines.append("")
-                        supplement_lines.append("[註釋]")
-                        supplement_lines.extend(all_notes)
-                    supplement_lines.append("</supplement>")
-                    lore_text = "\n".join(supplement_lines)
-                    print(
-                        f"[世界觀] 召回 {len(lore_entries)} 條, 註釋 {len(all_notes)} 條 (topics: {lore_topics})"
-                    )
-                else:
-                    lore_text = ""
-
-            # --- Log: 撈取到的記憶/世界觀資料（Phase 1 決策後的實際資料）---
-            recalled_log_lines = ["=== 召回的參與者 ==="]
-            for uid in resolved_ids:
-                name = next(
-                    (c["name"] for c in recall_candidates if c["id"] == uid), uid
-                )
-                recalled_log_lines.append(f"- {name} (id={uid})")
-            recalled_log_lines.append("")
-            recalled_log_lines.append("=== 使用者記憶內容 ===")
-            recalled_log_lines.append(combined_memories or "（無）")
-            recalled_log_lines.append("")
-            recalled_log_lines.append("=== 世界觀補充（lore_text） ===")
-            recalled_log_lines.append(lore_text or "（無）")
-            async with aiofiles.open(
-                os.path.join(PROMPT_LOG_DIR, "last_recalled_data.txt"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                await f.write("\n".join(recalled_log_lines))
-            print(f"[DEBUG] 召回資料已寫入 {PROMPT_LOG_DIR}\\last_recalled_data.txt")
-
-            # ============================================================
-            #  Phase 2: 角色扮演回覆生成
-            # ============================================================
             pcfg = await load_prompt_config()
             blocked_kw = [k.lower() for k in pcfg.get("blocked_keywords", [])]
 
-            self_memories = await get_self_memory(limit=15)
-            self_memories_all = await get_self_memory(limit=200)
-            server_rules_text = ""
-            if message.guild:
-                server_rules_text = await get_server_rules(message.guild.id)
-
-            phase2_system = await build_phase2_system_prompt(
-                channel_type,
-                pcfg,
-                enable_ic_style,
-                channel_context,
-                channel_note,
-                ic_context_text,
-                combined_memories,
-                lore_text,
-                self_memories,
-                server_rules_text,
-                quests_text,
+            raw_content, phase2_char_name, current_user_name = await build_and_call_phase2(
+                message, channel_type=channel_type, pcfg=pcfg,
+                enable_ic_style=enable_ic_style, channel_context=channel_context,
+                channel_note=channel_note, ic_context_text=ic_context_text,
+                combined_memories=combined_memories, lore_text=lore_text,
+                quests_text=quests_text, all_context=all_context,
+                clean_input_reply=clean_input_reply, tarot_drawn=tarot_drawn,
             )
 
-            # Inject channel story summary for IC channels
-            if channel_type == "in_character":
-                channel_summary = await get_channel_summary(str(message.channel.id))
-                if channel_summary:
-                    phase2_system += f"\n\n【目前故事摘要】\n{channel_summary}"
+            raw_content = await style_self_check(raw_content, channel_type, enable_ic_style, pcfg)
 
-                auto_injection = await autopilot.get_autopilot_injection(
-                    message, channel_type
-                )
-                if auto_injection:
-                    phase2_system += auto_injection
+            bot_reply = await cleanup_response(raw_content, blocked_kw, phase2_char_name, clean_input, clean_input_reply)
 
-            # Inject tarot context for casual in-character response
-            if tarot_drawn:
-                cards_str = "、".join(
-                    f"{c.get_display_name()}" for c in tarot_drawn["cards"]
-                )
-                who = tarot_drawn["who_for"] or "你"
-                phase2_system += (
-                    f"\n\n【塔羅牌】\n"
-                    f"你剛剛為了 {who} 抽了{tarot_drawn['spread']}牌：{cards_str}。\n"
-                    f"在回覆中自然地提起這張牌即可，不用嚴肅解讀。"
-                )
-
-            phase2_messages = [{"role": "system", "content": phase2_system}]
-            phase2_messages.extend(all_context)
-            current_user_name = message.author.display_name
-            # 格式指令塞成獨立 user message，利用 recency bias 強制 flash 模型遵守
-            phase2_char_name = await get_character_name() or "角色"
-            if channel_type == "out_of_character":
-                planning_instruction = (
-                    "1. <planning>快速分析對話情境與回應方向</planning>"
-                )
-                fmt_body = "2. 正文（自然對話）\n"
-            else:
-                planning_instruction = "1. <planning>當前情況分析</planning>"
-                fmt_body = f"2. {phase2_char_name}的台詞\n"
-            phase2_messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"【你正在回覆 {current_user_name} 的訊息】\n"
-                        "【系統格式指令】\n"
-                        "你接下來回覆的順序必須是：\n"
-                        f"{planning_instruction}\n"
-                        f"{fmt_body}"
-                        "\n【分隔回覆】\n"
-                        "若你需要同時回覆不同的人，請在每段訊息前加上 [TO:該人的名稱]\n"
-                        "例：[TO:頭皮慶]\n你的回覆...\n[TO:吳神月]\n你的回覆...\n"
-                        "⚠️ [TO:] 僅限用於確定有在找你說話的人（回覆過你的訊息、@你、或直接提到你的角色名），"
-                        "不要對歷史記錄中每個出現的人都一一回覆。\n"
-                        "【回覆專注原則】\n"
-                        f"你正在回覆的是 {current_user_name}。專注於他/她的訊息即可。\n"
-                        "如果歷史中其他人在對話但沒有明確找你（沒有@你、沒有回覆你、沒有提到你的角色名），"
-                        "不需要回應他們，也不需要為他們加上 [TO:]。"
-                    ),
-                }
-            )
-            phase2_messages.append(
-                {
-                    "role": "user",
-                    "content": f"[{current_user_name}]: {clean_input_reply}",
-                }
-            )
-
-            print("[LOG] [Phase 2] 生成角色回覆中...")
-            # DEBUG: 寫入完整提示詞到檔案（含歷史訊息）
-            os.makedirs(PROMPT_LOG_DIR, exist_ok=True)
-            async with aiofiles.open(
-                os.path.join(PROMPT_LOG_DIR, "last_prompt.txt"), "w", encoding="utf-8"
-            ) as f:
-                await f.write("=== SYSTEM ===\n")
-                await f.write(phase2_system)
-                await f.write("\n\n=== CONTEXT ===\n")
-                for m in all_context:
-                    phase2_tag_name = phase2_char_name
-                    role_tag = phase2_tag_name if m["role"] == "assistant" else "USER"
-                    await f.write(f"\n[{role_tag}] {m['content']}")
-                await f.write(
-                    f"\n\n=== CURRENT MESSAGE ===\n[{message.author.display_name}]: {clean_input_reply}"
-                )
-                await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
-                debug_fmt = (
-                    f"【你正在回覆 {message.author.display_name}】\n"
-                    f"{planning_instruction}\n{fmt_body}"
-                )
-                await f.write(debug_fmt)
-            print(f"[DEBUG] Phase 2 完整提示詞已寫入 {PROMPT_LOG_DIR}\\last_prompt.txt")
-            phase2_resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
-                messages=phase2_messages,
-                temperature=0.8,
-                max_tokens=2048,
-            )
-
-            raw_content = phase2_resp.choices[0].message.content or ""
-            # 日文原文隱藏：在文風自檢前處理，讓自檢收到已清理版本
-            raw_content = autopilot.strip_japanese_original(raw_content)
-            print(f"[LOG] [Phase 2] 回傳長度={len(raw_content)}")
-
-            # --- 寫入完整 AI 輸出到檔案 ---
-            async with aiofiles.open(
-                os.path.join(PROMPT_LOG_DIR, "last_response.txt"), "w", encoding="utf-8"
-            ) as f:
-                await f.write(raw_content)
-            print(f"[DEBUG] 完整 AI 輸出已寫入 {PROMPT_LOG_DIR}\\last_response.txt")
-
-            # --- 文風自檢（IC 文風啟用時，檢查並修正違規）---
-            if (
-                (enable_ic_style and channel_type != "out_of_character")
-                or channel_type == "in_character"
-            ) and raw_content.strip():
-                style_rules = "\n".join(
-                    f"- {p}" for p in pcfg.get("expression_prefs", [])
-                )
-                banned = "、".join(pcfg.get("banned_words", []))
-                sr_prompt = f"""請審閱以下角色回覆，檢查是否違反文風規則。若有違反請修正，但務必保留原意、語氣和角色性格。
-
-【文風規則】
-{style_rules}
-
-【禁用詞彙】
-{banned}
-
-【角色回覆】
-{raw_content}
-
-請直接輸出修正後的完整回覆（含 <planning> 區塊），不要加任何解釋。若無需修正則輸出原文。"""
-                try:
-                    sr_resp = await client.chat.completions.create(
-                        model="deepseek-v4-flash",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "你只輸出修正後的完整回覆，不加任何解釋。",
-                            },
-                            {"role": "user", "content": sr_prompt},
-                        ],
-                        temperature=0.3,
-                        max_tokens=2048,
-                    )
-                    reviewed = sr_resp.choices[0].message.content or ""
-                    if reviewed.strip():
-                        old_len = len(raw_content)
-                        raw_content = reviewed
-                        print(f"[文風自檢] 修正 {old_len} → {len(reviewed)} chars")
-                except Exception as e:
-                    print(f"[文風自檢] 失敗（保留原文）: {e}")
-
-            if not raw_content.strip():
-                await message.reply("……")
-                return
-
-            # --- 剝離 <planning> 區塊（不發送給用戶）---
-            cleaned_for_send = re.sub(
-                r"<planning>.*?</planning>", "", raw_content, flags=re.DOTALL
-            ).strip()
-
-            # --- Skip pattern 偵測：記錄 LLM 決定不回覆的情況 ---
-            _SKIP_PATTERNS = [
-                "不是發言的好時機", "不適合回應", "不適合發言",
-                "不是說話的好時機", "現在不該", "選擇沉默",
-                "不是開口的時機", "不應該回應", "不回應",
-            ]
-            _skip_hit = next((p for p in _SKIP_PATTERNS if p in cleaned_for_send), None)
-            if _skip_hit:
-                _planning_match = re.search(
-                    r"<planning>(.*?)</planning>", raw_content, re.DOTALL
-                )
-                _planning_text = _planning_match.group(1).strip() if _planning_match else "（無 planning）"
-                _skip_dir = os.path.join(SCRIPT_DIR, "skip_logs")
-                os.makedirs(_skip_dir, exist_ok=True)
-                _skip_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                _skip_excerpt = re.sub(r'[\\/:*?"<>|]', "", clean_input[:20]) or "unknown"
-                _skip_path = os.path.join(_skip_dir, f"{_skip_ts}_{_skip_excerpt}.txt")
-                try:
-                    async with aiofiles.open(_skip_path, "w", encoding="utf-8") as _sf:
-                        await _sf.write(f"=== SKIP PATTERN ===\n{_skip_hit}\n\n")
-                        await _sf.write(f"=== USER MESSAGE ===\n{clean_input_reply}\n\n")
-                        await _sf.write(f"=== PLANNING ===\n{_planning_text}\n\n")
-                        await _sf.write(f"=== FULL RESPONSE ===\n{raw_content}\n")
-                    print(f"[SKIP] 偵測到 skip pattern「{_skip_hit}」→ {_skip_path}")
-                except Exception as _se:
-                    print(f"[SKIP] log 寫入失敗: {_se}")
-
-            # --- 移除標籤，發送純台詞 ---
-            bot_reply = re.sub(
-                r"\s*\[MEM:\{.*?\}\]", "", cleaned_for_send, flags=re.DOTALL
-            ).strip()
-            bot_reply = re.sub(
-                r"\s*\[LEARN:\{.*?\}\]", "", bot_reply, flags=re.DOTALL
-            ).strip()
-            # --- 移除意外產生的 HTML 標籤（<head> <body> <div> 等）---
-            bot_reply = re.sub(
-                r"</?(\w+)[^>]*>", "", bot_reply, flags=re.DOTALL
-            ).strip()
-            if not bot_reply:
-                bot_reply = "……"
-
-            # --- 安全過濾：若回覆包含封鎖關鍵字，取代為安全回覆 ---
-            reply_lower = bot_reply.lower()
-            for kw in blocked_kw:
-                if kw in reply_lower:
-                    print(f"[安全] 攔截！回覆包含封鎖關鍵字: '{kw}'")
-                    print(f"[安全] 原始回覆: {bot_reply[:200]}")
-                    bot_reply = f"（{phase2_char_name}輕輕搖頭，沒有回應這個話題。）"
-                    break
-
-            # --- 分隔回覆：首段回覆觸發者，其餘 @mention ---
-            if "[TO:" in bot_reply:
-                parts = re.split(r"\n?\[TO:(.+?)\]\n?", bot_reply)
-                if len(parts) > 1:
-                    segments = []
-                    for i in range(1, len(parts), 2):
-                        name = parts[i].strip()
-                        text = parts[i + 1].strip() if i + 1 < len(parts) else ""
-                        if text:
-                            segments.append((name, text))
-                    for idx, (seg_name, seg_text) in enumerate(segments):
-                        target_msg = message
-                        async for m in message.channel.history(limit=30):
-                            if (
-                                m.author.display_name.startswith(seg_name)
-                                and m.author != bot.user
-                            ):
-                                target_msg = m
-                                break
-                        tf = (
-                            tarot_drawn.get("files", [])
-                            if tarot_drawn and idx == 0
-                            else []
-                        )
-                        await target_msg.reply(seg_text, files=tf)
-                else:
-                    tf = tarot_drawn.get("files", []) if tarot_drawn else []
-                    await message.reply(bot_reply, files=tf)
-            else:
-                tf = tarot_drawn.get("files", []) if tarot_drawn else []
-                await message.reply(bot_reply, files=tf)
-
-            # --- 將 prompt log 快照到本次對話資料夾 ---
             excerpt = re.sub(r'[\\/:*?"<>|]', "", clean_input[:20]) or "unknown"
             session_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             session_dir = os.path.join(PROMPT_LOG_DIR, f"{session_ts}_{excerpt}")
             asyncio.create_task(_snapshot_prompt_logs(session_dir, wait=0.5))
 
-            # ============================================================
-            #  Phase 3: 知識寫入 + 記憶維護 + 每日日誌（背景執行，不阻擋 event loop）
-            # ============================================================
-            asyncio.create_task(
-                phase3_process(
-                    message,
-                    raw_content,
-                    channel_type,
-                    lore_text,
-                    self_memories_all,
-                    session_dir,
-                )
-            )
-            asyncio.create_task(
-                autopilot.process_autopilot_memories(message, raw_content)
-            )
+            if bot_reply is None:
+                await message.reply("……")
+                return
+
+            await dispatch_reply(message, bot_reply, tarot_drawn)
+
+            self_memories_all = await get_self_memory(limit=200)
+            asyncio.create_task(phase3_process(
+                message, raw_content, channel_type, lore_text, self_memories_all, session_dir,
+            ))
+            asyncio.create_task(autopilot.process_autopilot_memories(message, raw_content))
             asyncio.create_task(_cleanup_old_sessions())
 
         except Exception as e:
             print(f"[錯誤] 處理訊息時發生未預期錯誤!")
             print(traceback.format_exc())
-            await _log_error(
-                "on_message_crash", str(e), traceback=traceback.format_exc()[:500]
-            )
+            await _log_error("on_message_crash", str(e), traceback=traceback.format_exc()[:500])
             err_char_name = await get_character_name() or "角色"
             await message.reply(f"（{err_char_name}似乎陷入了短暫的沉思...）")
 
@@ -3728,18 +3559,7 @@ async def cmd_modify_context(
 async def _review_edit_suggestion(original: str, suggestion: str) -> dict:
     """AI 審查修改建議的合理性"""
     cfg = await load_prompt_config()
-    style_lines = []
-    for k in ("dialogue_ratio", "naming_rule"):
-        v = cfg.get(k, "")
-        if v:
-            style_lines.append(f"• {v}")
-    for pref in cfg.get("expression_prefs", []):
-        if isinstance(pref, str) and pref.strip():
-            style_lines.append(f"• {pref.strip()}")
-    banned = cfg.get("banned_words", [])
-    if banned:
-        style_lines.append(f"• 禁止使用：{'、'.join(banned)}")
-    style_block = "\n".join(style_lines) if style_lines else "（無）"
+    style_block = build_style_block(cfg)
 
     prompt = (
         "你是一個內容審查員。請判斷以下修改建議是否合理，並輸出 JSON。\n\n"
@@ -3875,6 +3695,154 @@ async def cmd_db(
     await interaction.followup.send(
         embed=view._build_embed(), view=view, ephemeral=True
     )
+
+
+
+@bot.tree.command(name="readimg", description="用 AI 分析圖片並以角色身分回應（本地 Gemma4）")
+async def cmd_readimg(
+    interaction: discord.Interaction,
+    image: discord.Attachment | None = None,
+    message: str | None = None,
+):
+    """分析圖片並以角色身分回應。支援 attachment 或訊息中的圖片連結。"""
+    await interaction.response.defer(ephemeral=False)
+
+    # 取得圖片 bytes
+    image_bytes = None
+    filename = "unknown"
+    if image:
+        image_bytes = await image.read()
+        filename = image.filename
+    elif interaction.channel:
+        # 嘗試從最近訊息找圖片
+        async for msg in interaction.channel.history(limit=10):
+            if msg.attachments:
+                image_bytes = await msg.attachments[0].read()
+                filename = msg.attachments[0].filename
+                break
+
+    if not image_bytes:
+        await interaction.followup.send(
+            "❌ 找不到圖片。請直接附帶圖片，或在有圖片的訊息上使用此指令。",
+            ephemeral=True,
+        )
+        return
+
+    # 檢查 cache
+    user_id = interaction.user.id
+    channel_id = interaction.channel_id or 0
+    cached = image_reader.get_cached_description(image_bytes)
+    if cached:
+        print(f"[LOG] [/readimg] 使用 cache (user={user_id})")
+        gemma_desc = cached
+        elapsed = 0.0
+    else:
+        # 呼叫 Gemma 分析
+        ollama_cfg = (await load_prompt_config()).get("ollama", {})
+        result = await image_reader.read_image(image_bytes, filename, ollama_cfg)
+        gemma_desc = result["description"]
+        elapsed = result.get("elapsed", 0.0)
+
+        if not result["success"]:
+            await interaction.followup.send(
+                f"❌ {result['error']}", ephemeral=True,
+            )
+            return
+
+        # 寫入 cache
+        image_reader.set_cached_description(image_bytes, gemma_desc)
+
+    # 清理過期 cache
+    image_reader.cleanup_expired_cache()
+
+    # 準備 Phase 2 context
+    pcfg = await load_prompt_config()
+    channel = interaction.channel
+    guild = interaction.guild
+
+    channel_context = "私人訊息 (DM)"
+    channel_type = "in_character"
+    channel_note = "（本頻道為劇情扮演頻道，請完全融入角色進行沉浸式扮演）"
+    if guild and hasattr(channel, "name"):
+        ch_name = channel.name
+        ch_topic = getattr(channel, "topic", "") or ""
+        channel_context = f"伺服器「{guild.name}」的頻道「#{ch_name}」"
+        if ch_topic:
+            channel_context += f"，頻道主題：{ch_topic}"
+        ooc_keywords = ["討論", "中之", "ooc", "meta", "後台", "幕後", "策劃", "閒聊"]
+        combined = (ch_name + ch_topic).lower()
+        if any(kw in combined for kw in ooc_keywords):
+            channel_type = "out_of_character"
+            channel_note = "（本頻道為中之人討論串／後台頻道，扮演者們在此討論劇情走向，不需完全融入角色）"
+
+    # 抓最近對話作為 context
+    all_context = []
+    if hasattr(channel, "history"):
+        async for msg in channel.history(limit=15):
+            if msg.author.bot and msg.author != bot.user:
+                continue
+            role = "assistant" if msg.author == bot.user else "user"
+            name = msg.author.display_name
+            all_context.append({"role": role, "content": f"[{name}]: {msg.content}"})
+    all_context.reverse()
+
+    clean_input = message or "（用戶分享了一張圖片）"
+    user_name = interaction.user.display_name
+
+    # 呼叫 Phase 2
+    try:
+        raw_content, char_name, _ = await run_phase2_direct(
+            channel_type=channel_type,
+            pcfg=pcfg,
+            enable_ic_style=False,
+            channel_context=channel_context,
+            channel_note=channel_note,
+            ic_context_text="",
+            combined_memories="",
+            lore_text="",
+            self_memories="",
+            server_rules_text="",
+            quests_text="",
+            all_context=all_context,
+            clean_input_reply=clean_input,
+            current_user_name=user_name,
+            image_description=gemma_desc,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Phase 2 呼叫失敗：{e}", ephemeral=True)
+        return
+
+    # 記錄分析日誌
+    channel_name = getattr(channel, "name", "DM")
+    await image_reader.log_image_analysis(
+        user_name, channel_name, filename,
+        {"description": gemma_desc, "thinking": "", "elapsed": elapsed},
+        raw_content,
+    )
+
+    # 清理 + 回覆
+    cleaned = strip_planning(raw_content)
+    cleaned = strip_mem_learn_tags(cleaned)
+    cleaned = strip_html_tags(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        cleaned = "（...）"
+
+    # 把用戶的 message 顯示在回覆裡（讓其他用戶看到指令內容）
+    user_msg_text = message if message else "分享了一張圖片"
+    cleaned = f"**{user_name}**：{user_msg_text}\n\n{cleaned}"
+
+    # 編碼限制 + 截斷
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) > 1900:
+        cleaned = encoded[:1850].decode("utf-8", errors="ignore") + "..."
+
+    # 重新上傳圖片 + 回覆（讓其他人看到圖片）
+    discord_file = discord.File(io.BytesIO(image_bytes), filename=filename) if image_bytes else None
+    if interaction.message:
+        await interaction.channel.send(cleaned, reference=interaction.message, file=discord_file)
+    else:
+        await interaction.followup.send(cleaned, file=discord_file)
 
 
 # 啟動前註冊外置指令模組

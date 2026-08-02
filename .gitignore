@@ -16,3 +16,15 @@ bot.pid
 db_check_result.txt
 __pycache__/
 *.pyc
+.opencode/
+architecture.html
+bot_errors.jsonl
+bot_stderr.log
+bot_stdout.log
+say_log.jsonl
+error_logs/
+image_logs/
+skip_logs/
+tarot_images/
+db_viewer.py
+start.bat
