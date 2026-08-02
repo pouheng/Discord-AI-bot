@@ -36,6 +36,13 @@ DB_FILE = os.path.join(SCRIPT_DIR, "rp_memory.db")
 AUTOPILOT_MEMORY_DIR = os.path.join(SCRIPT_DIR, "auto_pilot_memories")
 
 from contextlib import asynccontextmanager
+from db import get_db as _shared_get_db
+from profiles import (
+    PROFILE_FIELDS, PROFILE_LABELS,
+    get_character_profile as _shared_get_character_profile,
+    update_character_profile as _shared_update_character_profile,
+    format_character_profile as _shared_format_character_profile,
+)
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 _deepseek_client = (
@@ -43,16 +50,6 @@ _deepseek_client = (
     if DEEPSEEK_API_KEY
     else None
 )
-
-
-@asynccontextmanager
-async def _get_db():
-    conn = await aiosqlite.connect(DB_FILE, timeout=10)
-    try:
-        yield conn
-        await conn.commit()
-    finally:
-        await conn.close()
 
 
 def _init_db():
@@ -93,7 +90,7 @@ _init_db()
 
 
 async def is_autopilot_enabled() -> bool:
-    async with _get_db() as conn:
+    async with _shared_get_db() as conn:
         cursor = await conn.execute(
             "SELECT value FROM autopilot_config WHERE key = 'enabled'"
         )
@@ -102,7 +99,7 @@ async def is_autopilot_enabled() -> bool:
 
 
 async def set_autopilot_enabled(enabled: bool):
-    async with _get_db() as conn:
+    async with _shared_get_db() as conn:
         await conn.execute(
             "INSERT OR REPLACE INTO autopilot_config (key, value) VALUES ('enabled', ?)",
             ("1" if enabled else "0"),
@@ -115,7 +112,7 @@ async def set_autopilot_enabled(enabled: bool):
 async def add_autopilot_char(
     name: str, gender: str, personality: str, description: str, ability: str = ""
 ) -> int:
-    async with _get_db() as conn:
+    async with _shared_get_db() as conn:
         cursor = await conn.execute(
             "INSERT INTO autopilot_chars (name, gender, personality, description, ability) VALUES (?, ?, ?, ?, ?)",
             (name, gender, personality, description, ability),
@@ -126,7 +123,7 @@ async def add_autopilot_char(
 
 
 async def get_autopilot_chars() -> list[dict]:
-    async with _get_db() as conn:
+    async with _shared_get_db() as conn:
         cursor = await conn.execute(
             "SELECT id, name, gender, personality, description, ability, active FROM autopilot_chars ORDER BY id"
         )
@@ -151,7 +148,7 @@ async def get_active_autopilot_chars() -> list[dict]:
 
 
 async def set_autopilot_char_active(char_id: int, active: bool):
-    async with _get_db() as conn:
+    async with _shared_get_db() as conn:
         await conn.execute(
             "UPDATE autopilot_chars SET active = ? WHERE id = ?",
             (1 if active else 0, char_id),
@@ -159,7 +156,7 @@ async def set_autopilot_char_active(char_id: int, active: bool):
 
 
 async def delete_autopilot_char(char_id: int):
-    async with _get_db() as conn:
+    async with _shared_get_db() as conn:
         await conn.execute("DELETE FROM autopilot_chars WHERE id = ?", (char_id,))
 
 
@@ -343,7 +340,7 @@ async def get_autopilot_injection(message: discord.Message, channel_type: str) -
         sm = await get_char_self_memories(char["name"], limit=5)
         if sm:
             lines.append(f"  自我認知：\n{sm}")
-        profile_text = await _format_char_profile(char["name"])
+        profile_text = await _shared_format_character_profile(char["name"])
         if profile_text:
             lines.append(f"  角色檔案：\n{profile_text}")
         lines.append("")
@@ -367,71 +364,7 @@ def strip_japanese_original(text: str) -> str:
     return re.sub(r"「[^」]*?」\s*（([^）]*?)）", r"「\1」", text, flags=re.DOTALL)
 
 
-# ─── 角色檔案（character_profiles 表操作，與 main.py 共用）──
 
-PROFILE_FIELDS = ["gender_age", "intro", "appearance", "items", "experience"]
-PROFILE_LABELS = {
-    "gender_age": "性別/年齡",
-    "intro": "一句話介紹",
-    "appearance": "外貌特徵",
-    "items": "持有的重要物品",
-    "experience": "過往經歷",
-}
-
-
-async def _get_char_profile_db(char_name: str) -> dict:
-    conn = await aiosqlite.connect(DB_FILE, timeout=10)
-    cursor = await conn.execute(
-        "SELECT gender_age, intro, appearance, items, experience FROM character_profiles WHERE char_name = ?",
-        (char_name,),
-    )
-    row = await cursor.fetchone()
-    await conn.close()
-    if row:
-        return dict(zip(PROFILE_FIELDS, row))
-    return {f: "" for f in PROFILE_FIELDS}
-
-
-async def _update_char_profile_db(char_name: str, field: str, value: str):
-    if field not in PROFILE_FIELDS or not value:
-        return
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = await aiosqlite.connect(DB_FILE, timeout=10)
-    cursor = await conn.execute(
-        f"UPDATE character_profiles SET {field} = ?, updated_at = ? WHERE char_name = ?",
-        (value, now_str, char_name),
-    )
-    if cursor.rowcount == 0:
-        values = {f: "" for f in PROFILE_FIELDS}
-        values[field] = value
-        await conn.execute(
-            f"INSERT INTO character_profiles (char_name, gender_age, intro, appearance, items, experience, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                char_name,
-                values["gender_age"],
-                values["intro"],
-                values["appearance"],
-                values["items"],
-                values["experience"],
-                now_str,
-            ),
-        )
-    await conn.commit()
-    await conn.close()
-    print(f"[托管角色檔案] {char_name}.{field} -> {value[:60]}")
-
-
-async def _format_char_profile(char_name: str) -> str:
-    profile = await _get_char_profile_db(char_name)
-    lines = []
-    for f in PROFILE_FIELDS:
-        label = PROFILE_LABELS.get(f, f)
-        val = profile.get(f, "")
-        if val:
-            lines.append(f"  {label}：{val}")
-    if not lines:
-        return ""
-    return "\n".join(lines)
 
 
 # ─── Phase 3 記憶後處理（解析 LEARN_CHAR / MEM_CHAR 標籤）──
@@ -461,7 +394,7 @@ async def process_autopilot_memories(message: discord.Message, raw_response: str
         ),
         (
             r"\[PROFILE_CHAR:(\{.*?\})\]",
-            lambda d: _update_char_profile_db(
+            lambda d: _shared_update_character_profile(
                 d["char"], d.get("field", ""), d.get("value", "")
             ),
             False,
