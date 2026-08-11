@@ -1,0 +1,2027 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>招式對撞模擬器（與正式版同步）</title>
+<style>
+:root{
+  --bg:#12161f; --panel:#1b2130; --panel2:#232b3d; --line:#33405c;
+  --tx:#dce3f0; --mut:#8b96ad; --acc:#5aa7ff; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.55 "Segoe UI","Microsoft JhengHei",sans-serif}
+header{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+header h1{font-size:18px;margin:0}
+header .meta{color:var(--mut);font-size:12px}
+button{background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--acc)}
+button.primary{background:#2b4a75;border-color:#3a5f9e}
+button.danger{border-color:#7a3440;color:#fca5a5}
+nav{display:flex;gap:4px;padding:10px 18px 0;border-bottom:1px solid var(--line)}
+nav button{border-radius:8px 8px 0 0;border-bottom:none;padding:8px 16px}
+nav button.active{background:var(--panel);border-color:var(--line);color:var(--acc)}
+main{max-width:1200px;margin:0 auto;padding:18px}
+section.tab{display:none}
+section.tab.active{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0}
+.card h3{margin:0 0 10px;font-size:15px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+label{display:block;font-size:12px;color:var(--mut);margin:6px 0 3px}
+input,select,textarea{width:100%;background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:13px}
+textarea{font-family:"Consolas","Microsoft JhengHei",monospace}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.spacer{flex:1}
+.mut{color:var(--mut);font-size:12px}
+.ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+pre.prompt{white-space:pre-wrap;word-break:break-word;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:12px;max-height:340px;overflow:auto;font-size:12.5px}
+pre.result{white-space:pre-wrap;word-break:break-word;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:12px;max-height:260px;overflow:auto;font-size:12.5px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid var(--line);padding:5px 8px;text-align:left}
+th{background:var(--panel2);font-size:12px}
+.tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:1px 9px;font-size:12px;margin:1px 2px}
+.step{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:14px 0}
+.step h3{margin:0 0 4px;font-size:15px}
+.step .sub{color:var(--mut);font-size:12px;margin-bottom:10px}
+.mono{font-family:Consolas,monospace}
+details>summary{cursor:pointer;color:var(--acc);font-size:13px}
+.hidden{display:none}
+#selftest{position:fixed;right:14px;bottom:14px;max-width:480px;max-height:60vh;overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:10px;padding:12px;display:none;z-index:50}
+#selftest.show{display:block}
+</style>
+</head>
+<body>
+<header>
+  <h1>招式對撞模擬器</h1>
+  <span class="meta" id="build-meta"></span>
+  <span class="spacer"></span>
+  <button onclick="runSelfTest()">引擎自測</button>
+  <button onclick="exportDB()">匯出資料</button>
+  <button onclick="document.getElementById('file-import').click()">匯入資料</button>
+  <input type="file" id="file-import" accept=".json" class="hidden">
+</header>
+
+<nav>
+  <button class="tab-btn active" data-tab="chars">角色資料</button>
+  <button class="tab-btn" data-tab="sim">對撞模擬</button>
+  <button class="tab-btn" data-tab="prompts">提示詞庫</button>
+  <button class="tab-btn" data-tab="cal">反派校準</button>
+</nav>
+
+<main>
+  <!-- ===================== 角色資料 ===================== -->
+  <section class="tab active" id="tab-chars">
+    <div class="card">
+      <div class="row">
+        <h3 style="margin:0">角色清單（存於本機瀏覽器 localStorage）</h3>
+        <span class="spacer"></span>
+        <button class="primary" onclick="fillExample()">載入範例（澪・凌空・羊君）</button>
+      </div>
+      <div class="grid" id="char-cards"></div>
+    </div>
+
+    <div class="card">
+      <h3 id="char-form-title">新增角色</h3>
+      <div class="grid">
+        <div><label>角色名</label><input id="cf-name" placeholder="例：澪"></div>
+        <div><label>種族</label><input id="cf-race" placeholder="例：神子"></div>
+      </div>
+      <div class="grid" style="grid-template-columns:repeat(3,1fr)">
+        <div><label>種族修正・力量（0.8~1.5）</label><input id="cf-racemod-力量" type="number" step="0.1" min="0.8" max="1.5" value="1.0"></div>
+        <div><label>種族修正・敏捷（0.8~1.5）</label><input id="cf-racemod-敏捷" type="number" step="0.1" min="0.8" max="1.5" value="1.0"></div>
+        <div><label>種族修正・智力（0.8~1.5）</label><input id="cf-racemod-智力" type="number" step="0.1" min="0.8" max="1.5" value="1.0"></div>
+        <div><label>種族修正・體質（0.8~1.5）</label><input id="cf-racemod-體質" type="number" step="0.1" min="0.8" max="1.5" value="1.0"></div>
+        <div><label>種族修正・魅力（0.8~1.5）</label><input id="cf-racemod-魅力" type="number" step="0.1" min="0.8" max="1.5" value="1.0"></div>
+        <div><label>種族修正・幸運（0.8~1.5）</label><input id="cf-racemod-幸運" type="number" step="0.1" min="0.8" max="1.5" value="1.0"></div>
+      </div>
+      <div class="grid">
+        <div><label>力量</label><select id="cf-力量"></select></div>
+        <div><label>敏捷</label><select id="cf-敏捷"></select></div>
+        <div><label>智力</label><select id="cf-智力"></select></div>
+        <div><label>體質</label><select id="cf-體質"></select></div>
+        <div><label>魅力</label><select id="cf-魅力"></select></div>
+        <div><label>幸運</label><select id="cf-幸運"></select></div>
+      </div>
+      <div class="grid">
+        <div><label>exp（0~100）</label><input id="cf-exp" type="number" min="0" max="100" value="0"></div>
+        <div><label>martial 武藝（0~100）</label><input id="cf-martial" type="number" min="0" max="100" value="0"></div>
+        <div><label>max_mp（10~100）</label><input id="cf-maxmp" type="number" min="10" max="100" value="40"></div>
+        <div><label>武器（空=徒手）</label><input id="cf-weapon" placeholder="例：長劍"></div>
+        <div><label>武器基數覆寫（2~5，空=機械判定）</label><input id="cf-wbase" type="number" step="0.5"></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="margin:0"><input type="checkbox" id="cf-villain"> 反派（is_villain）</label>
+        <label style="margin:0"><input type="checkbox" id="cf-teacher"> 教師（is_teacher）</label>
+        <span class="spacer"></span>
+        <button class="primary" onclick="saveChar()">儲存角色</button>
+        <button id="cf-cancel" class="hidden" onclick="cancelEditChar()">取消編輯</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 id="skill-title">招式（先選角色）</h3>
+      <div class="row">
+        <select id="skill-char" onchange="renderSkills()"><option value="">請選擇角色</option></select>
+      </div>
+      <div id="skill-list"></div>
+      <div id="skill-form-box" class="hidden">
+        <div class="grid">
+          <div><label>招式名</label><input id="sf-name"></div>
+          <div><label>所屬能力 ability</label><input id="sf-ability"></div>
+          <div><label>元素</label><select id="sf-element"></select></div>
+          <div><label>威力基數 power_base（1~10）</label><input id="sf-power" type="number" step="0.5" min="1" max="10"></div>
+          <div><label>魔力消耗 mp_cost（1~25）</label><input id="sf-mp" type="number" min="1" max="25"></div>
+          <div><label>計算公式</label><select id="sf-formula">
+            <option value="auto">自動（有元素→魔法）</option>
+            <option value="magic">魔法 Atk_BP</option>
+            <option value="melee">近戰 Melee_BP</option>
+            <option value="manamelee">魔力包裹 ManaMelee_BP</option>
+          </select></div>
+          <div><label>招式類型 skill_type</label><select id="sf-skilltype">
+            <option value="個人魔法">個人魔法</option>
+            <option value="通常魔法">通常魔法</option>
+          </select></div>
+          <div><label>魔法體系 magic_system</label><select id="sf-magicsys">
+            <option value="自然系">自然系</option>
+            <option value="超能系">超能系</option>
+            <option value="療癒系">療癒系</option>
+            <option value="跨系融合">跨系融合</option>
+          </select></div>
+          <div><label>擴展應用分類 application</label><input id="sf-application" list="app-hints" placeholder="依能力分類選用（輔助型→增益/削弱/環境…）">
+            <datalist id="app-hints"></datalist></div>
+          <div><label>附加狀態效果 effect（無則空）</label><input id="sf-effect"></div>
+        </div>
+        <div style="margin-top:8px">
+          <button class="primary" onclick="saveSkill()">儲存招式</button>
+          <button id="sf-cancel" class="hidden" onclick="cancelEditSkill()">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>自然語言寫入（natural language → 表單）</h3>
+      <div class="sub">把描述交給 DeepSeek 解析成結構化 JSON：產生寫入提示詞 → 貼回 AI 的 JSON → 驗證通過後自動填入角色/招式表單。與 Phase A/B/C 流程一致。</div>
+      <div class="row">
+        <span class="mut">要寫入的類型（可多選）：</span>
+        <label class="chk"><input type="checkbox" id="nl-t-skill" checked> 招式</label>
+        <label class="chk"><input type="checkbox" id="nl-t-character"> 角色</label>
+        <label class="chk"><input type="checkbox" id="nl-t-ability"> 能力</label>
+        <label class="chk"><input type="checkbox" id="nl-t-domain"> 結界</label>
+      </div>
+      <div class="row">
+        <button class="primary" onclick="buildNL()">產生寫入提示詞</button>
+        <button onclick="insertNLTemplate()">插入填表模板</button>
+        <button onclick="copyText('nl-prompt')">複製提示詞</button>
+        <span id="nl-status" class="mut"></span>
+      </div>
+      <label>自然語言描述（可先用「插入填表模板」，留空的欄位由 AI 自動補全）</label>
+      <textarea id="nl-raw" rows="4" placeholder="例：火龍彈，火之魔法，威力基數 3.5，消耗 8 MP，對敵放出的火焰彈…"></textarea>
+      <pre class="prompt hidden" id="nl-prompt"></pre>
+      <label>貼上 AI 回覆的 JSON（單筆物件或含 type 的陣列，驗證通過後填入表單）</label>
+      <textarea id="nl-json" rows="4" placeholder='{"type":"skill","name": ...} 或 [{"type":"skill",...},{"type":"character",...}]'></textarea>
+      <div class="row">
+        <button onclick="parseNL()">驗證並填入表單</button>
+        <label class="chk"><input type="checkbox" id="nl-autosave" checked> 自動儲存（批次直接寫入角色/招式/結界，不只填表單）</label>
+        <span id="nl-errors"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 對撞模擬 ===================== -->
+  <section class="tab" id="tab-sim">
+    <div class="card">
+      <h3>對戰設定</h3>
+      <div class="grid">
+        <div>
+          <label>角色 A</label><select id="sim-charA" onchange="syncSkillSelects()"></select>
+          <label>招式</label><select id="sim-skillA"></select>
+          <label>結界狀態</label><select id="sim-domA">
+            <option value="0">不開結界</option>
+            <option value="未覺醒">未覺醒（簡易結界）</option>
+            <option value="初期覺醒">初期覺醒</option>
+            <option value="中期覺醒">中期覺醒</option>
+            <option value="後期覺醒">後期覺醒</option>
+            <option value="完全覺醒">完全覺醒</option>
+          </select>
+        </div>
+        <div>
+          <label>角色 B</label><select id="sim-charB" onchange="syncSkillSelects()"></select>
+          <label>招式</label><select id="sim-skillB"></select>
+          <label>結界狀態</label><select id="sim-domB">
+            <option value="0">不開結界</option>
+            <option value="未覺醒">未覺醒（簡易結界）</option>
+            <option value="初期覺醒">初期覺醒</option>
+            <option value="中期覺醒">中期覺醒</option>
+            <option value="後期覺醒">後期覺醒</option>
+            <option value="完全覺醒">完全覺醒</option>
+          </select>
+        </div>
+        <div>
+          <label>交戰距離</label><select id="sim-range">
+            <option value="近身（5 公尺內）">近身（5 公尺內）</option>
+            <option value="中距（約 30 公尺）">中距（約 30 公尺）</option>
+            <option value="遠距（約 80 公尺）">遠距（約 80 公尺）</option>
+          </select>
+          <label>魔力包裹自動追回</label><select id="sim-mpchase">
+            <option value="1">啟用（ManaMelee 時）</option>
+            <option value="0">停用</option>
+          </select>
+        </div>
+      </div>
+      <label>討論串摘要（要送給 AI 分析的情境描述，<b>不是 AI 回答</b>）</label>
+      <textarea id="sim-thread" rows="5" placeholder="例：澪舉起蒼炎，朝凌空的方向揮出一記火焰彈；凌空拔劍前衝……"></textarea>
+      <div style="margin-top:8px"><button class="primary" onclick="resetPhases()">重置模擬流程</button></div>
+    </div>
+
+    <div class="step">
+      <h3>Phase A — 戰局分析</h3>
+      <div class="sub">產生「與正式上線相同」的 Phase A 提示詞 → 複製到 DeepSeek → 貼回回答 → 可編輯 → 儲存</div>
+      <div class="row">
+        <button class="primary" onclick="buildPhaseA()">產生 Phase A 提示詞</button>
+        <button onclick="copyText('pa-prompt')">複製提示詞</button>
+        <span id="pa-status" class="mut"></span>
+      </div>
+      <pre class="prompt hidden" id="pa-prompt"></pre>
+      <label>貼上 AI 的 Phase A 回答（JSON，含 attacker_candidate）</label>
+      <textarea id="pa-raw" rows="4" placeholder='{"attacker_candidate": ...}'></textarea>
+      <div class="row">
+        <button onclick="parsePhaseA()">解析並儲存 Phase A</button>
+        <span id="pa-errors"></span>
+      </div>
+      <details class="hidden" id="pa-detail"><summary>編輯 Phase A 結果（可修改 AI 回答）</summary>
+        <textarea id="pa-json" rows="10"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button onclick="reparsePhaseA()">重新驗證並儲存</button>
+          <span id="pa-errors2"></span>
+        </div>
+      </details>
+    </div>
+
+    <div class="step">
+      <h3>Phase B — 威力計算</h3>
+      <div class="sub">產生 Phase B 提示詞（含 Phase A 結果與機械參照）→ 貼回計算 JSON → 機械驗算對照</div>
+      <div class="row">
+        <button class="primary" onclick="buildPhaseB()">產生 Phase B 提示詞</button>
+        <button onclick="copyText('pb-prompt')">複製提示詞</button>
+        <button onclick="mechanicalVerify()">機械驗算（JS 引擎）</button>
+        <span id="pb-status" class="mut"></span>
+      </div>
+      <pre class="prompt hidden" id="pb-prompt"></pre>
+      <label>貼上 AI 的 Phase B 計算結果（JSON，含 computation / verdict）</label>
+      <textarea id="pb-raw" rows="4" placeholder='{"computation": ...}'></textarea>
+      <div class="row">
+        <button onclick="parsePhaseB()">解析並儲存 Phase B</button>
+        <span id="pb-errors"></span>
+      </div>
+      <details class="hidden" id="pb-detail"><summary>編輯 Phase B 結果（可修改 AI 回答）</summary>
+        <textarea id="pb-json" rows="10"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button onclick="reparsePhaseB()">重新驗證並儲存</button>
+          <span id="pb-errors2"></span>
+        </div>
+      </details>
+      <div id="pb-verify"></div>
+    </div>
+
+    <div class="step">
+      <h3>Phase C — 文風輸出</h3>
+      <div class="sub">產生 Phase C 提示詞（含已確認判定）→ 貼回文風文本</div>
+      <div class="row">
+        <button class="primary" onclick="buildPhaseC()">產生 Phase C 提示詞</button>
+        <button onclick="copyText('pc-prompt')">複製提示詞</button>
+        <span id="pc-status" class="mut"></span>
+      </div>
+      <pre class="prompt hidden" id="pc-prompt"></pre>
+      <label>文風規則（選填，貼上伺服器文風規則）</label>
+      <textarea id="pc-style" rows="3" placeholder="例：禁止情緒標註、禁止模糊微量描寫、角色自稱用名字…"></textarea>
+      <label>貼上 AI 回答（正文）</label>
+      <textarea id="pc-raw" rows="5"></textarea>
+      <div class="row"><button onclick="savePhaseC()">儲存 Phase C 結果</button><span id="pc-saved" class="ok"></span></div>
+      <pre class="result hidden" id="pc-final"></pre>
+    </div>
+  </section>
+
+  <!-- ===================== 提示詞庫 ===================== -->
+  <section class="tab" id="tab-prompts">
+    <div class="card">
+      <h3>提示詞庫（與正式上線同一來源 collide_rules.py）</h3>
+      <div class="mut">修改正式版規則後重新執行 <span class="mono">python make_simulator_html.py</span> 即可同步。</div>
+      <div id="prompt-list"></div>
+    </div>
+  </section>
+
+  <!-- ===================== 反派校準 ===================== -->
+  <section class="tab" id="tab-cal">
+    <div class="card">
+      <h3>反派動態難度校準</h3>
+      <div class="grid">
+        <div>
+          <label>反派名稱</label><input id="cal-name" placeholder="例：黑龍">
+          <label>反派種族修正（六維各自 0.8~1.5）</label>
+          <div class="grid" style="grid-template-columns:repeat(3,1fr)">
+            <label>力量<input id="cal-racemod-力量" type="number" step="0.1" value="1.0"></label>
+            <label>敏捷<input id="cal-racemod-敏捷" type="number" step="0.1" value="1.0"></label>
+            <label>智力<input id="cal-racemod-智力" type="number" step="0.1" value="1.0"></label>
+            <label>體質<input id="cal-racemod-體質" type="number" step="0.1" value="1.0"></label>
+            <label>魅力<input id="cal-racemod-魅力" type="number" step="0.1" value="1.0"></label>
+            <label>幸運<input id="cal-racemod-幸運" type="number" step="0.1" value="1.0"></label>
+          </div>
+          <label>篇章名 calibrate_arc</label><input id="cal-arc" placeholder="例：第一篇">
+        </div>
+        <div>
+          <label>篇章定位加成 ratio</label><select id="cal-ratio">
+            <option value="0.9">普通反派 0.9</option>
+            <option value="1.0">普通反派 1.0</option>
+            <option value="1.05">篇章 Boss 1.05</option>
+            <option value="1.1" selected>篇章 Boss 1.1</option>
+            <option value="1.15">篇章 Boss 1.15</option>
+            <option value="1.2">最終 Boss 1.2</option>
+          </select>
+          <label>預定上場角色（上場名單）</label>
+          <div id="cal-roster"></div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="primary" onclick="calBaseline()">計算機械基準</button>
+        <button onclick="buildCalPrompt()">產生校準提示詞（CALIBRATE_SYSTEM）</button>
+        <button onclick="copyText('cal-prompt')">複製提示詞</button>
+      </div>
+      <pre class="result hidden" id="cal-baseline"></pre>
+      <pre class="prompt hidden" id="cal-prompt"></pre>
+      <label>貼上 AI 回答（JSON）</label>
+      <textarea id="cal-raw" rows="4" placeholder='{"calibrated": ...}'></textarea>
+      <div class="row"><button onclick="parseCal()">解析並驗證</button><span id="cal-errors"></span></div>
+      <details class="hidden" id="cal-detail"><summary>編輯校準結果</summary>
+        <textarea id="cal-json" rows="10"></textarea>
+        <div class="row" style="margin-top:6px"><button onclick="reparseCal()">重新驗證</button><span id="cal-errors2"></span></div>
+      </details>
+      <pre class="result hidden" id="cal-final"></pre>
+    </div>
+  </section>
+</main>
+
+<div id="selftest"></div>
+
+<script>
+const SIM_DATA = {
+  "_build": {
+    "generated_by": "make_simulator_html.py",
+    "sources": [
+      "collide_rules.py",
+      "collide_engine.py",
+      "simulator_engine.js"
+    ],
+    "timestamp": "2026-08-11T21:00:56",
+    "element_pairs": 51
+  },
+  "RATING_CONST": {
+    "E": 1,
+    "D": 2,
+    "C": 3,
+    "B": 4,
+    "A": 5,
+    "S": 6
+  },
+  "RATING_ORDER": [
+    "E",
+    "D",
+    "C",
+    "B",
+    "A",
+    "S"
+  ],
+  "HIDDEN_SCORE_MAX": 9.0,
+  "STAT_KEYS": [
+    "力量",
+    "敏捷",
+    "智力",
+    "體質",
+    "魅力",
+    "幸運"
+  ],
+  "RATING_REVERSE": {
+    "1": "E",
+    "2": "D",
+    "3": "C",
+    "4": "B",
+    "5": "A",
+    "6": "S"
+  },
+  "WEAPON_BASE_TABLE": {
+    "bare": 1.0,
+    "light": 2.0,
+    "one_hand": 3.0,
+    "heavy": 4.0
+  },
+  "WEAPON_LABELS": {
+    "bare": "徒手",
+    "light": "輕武器",
+    "one_hand": "單手武器",
+    "heavy": "重型武器"
+  },
+  "ELEMENT_GRID": {
+    "光": {
+      "暗": 1.2,
+      "靈魂": 1.2,
+      "夢幻": 1.2,
+      "太空": 0.8,
+      "混沌": 0.8
+    },
+    "暗": {
+      "光": 0.8,
+      "靈魂": 1.2,
+      "夢幻": 1.2,
+      "純粹魔力": 0.8
+    },
+    "火": {
+      "冰": 1.2,
+      "葉": 1.2,
+      "鐵": 1.2,
+      "毒": 1.2,
+      "水": 0.8
+    },
+    "水": {
+      "火": 1.2,
+      "岩": 1.2,
+      "毒": 1.2,
+      "冰": 0.8,
+      "雷": 0.8,
+      "葉": 0.8
+    },
+    "冰": {
+      "火": 0.8,
+      "水": 1.2,
+      "葉": 1.2,
+      "岩": 0.8
+    },
+    "風": {
+      "毒": 1.2,
+      "葉": 1.2,
+      "雷": 0.8,
+      "岩": 0.8
+    },
+    "雷": {
+      "水": 1.2,
+      "鐵": 1.2,
+      "風": 1.2,
+      "岩": 0.8
+    },
+    "岩": {
+      "水": 0.8,
+      "風": 1.2,
+      "雷": 1.2,
+      "冰": 1.2,
+      "葉": 0.8,
+      "鐵": 0.8
+    },
+    "毒": {
+      "火": 0.8,
+      "水": 0.8,
+      "風": 0.8,
+      "葉": 1.2,
+      "花朵": 0.8,
+      "鐵": 1.2,
+      "核": 0.8
+    },
+    "葉": {
+      "火": 0.8,
+      "冰": 0.8,
+      "風": 0.8,
+      "毒": 0.8,
+      "岩": 1.2,
+      "水": 1.2,
+      "鐵": 0.8
+    },
+    "鐵": {
+      "火": 0.8,
+      "雷": 0.8,
+      "毒": 0.8,
+      "葉": 1.2,
+      "岩": 1.2,
+      "核": 0.8
+    },
+    "時間": {
+      "太空": 1.2,
+      "核": 1.2,
+      "無限": 0.8,
+      "靈魂": 0.8,
+      "夢幻": 0.8,
+      "混沌": 0.8
+    },
+    "無限": {
+      "時間": 1.2,
+      "太空": 1.2,
+      "混沌": 0.8
+    },
+    "太空": {
+      "時間": 0.8,
+      "無限": 0.8,
+      "核": 1.2,
+      "光": 1.2,
+      "混沌": 1.2
+    },
+    "核": {
+      "時間": 0.8,
+      "太空": 0.8,
+      "鐵": 1.2,
+      "毒": 1.2,
+      "靈魂": 1.2,
+      "純粹魔力": 1.2
+    },
+    "純粹魔力": {
+      "核": 0.8,
+      "混沌": 1.2,
+      "夢幻": 1.2,
+      "暗": 1.2
+    },
+    "靈魂": {
+      "光": 0.8,
+      "暗": 0.8,
+      "核": 0.8,
+      "夢幻": 1.2,
+      "時間": 1.2
+    },
+    "花朵": {
+      "毒": 1.2,
+      "夢幻": 1.2
+    },
+    "夢幻": {
+      "光": 0.8,
+      "暗": 0.8,
+      "純粹魔力": 0.8,
+      "靈魂": 0.8,
+      "花朵": 0.8,
+      "時間": 1.2
+    },
+    "混沌": {
+      "太空": 0.8,
+      "純粹魔力": 0.8,
+      "光": 1.2,
+      "時間": 1.2,
+      "無限": 1.2
+    }
+  },
+  "ELEMENT_LIST": [
+    "光",
+    "暗",
+    "火",
+    "水",
+    "冰",
+    "風",
+    "雷",
+    "岩",
+    "毒",
+    "葉",
+    "鐵",
+    "時間",
+    "無限",
+    "太空",
+    "核",
+    "純粹魔力",
+    "靈魂",
+    "花朵",
+    "夢幻",
+    "混沌"
+  ],
+  "DOMAIN_MOD_TIERS": {
+    "未覺醒": 1.0,
+    "初期覺醒": 1.1,
+    "中期覺醒": 1.25,
+    "後期覺醒": 1.4,
+    "完全覺醒": 1.5
+  },
+  "EXP_TIERS": [
+    [
+      0,
+      20,
+      1.0,
+      1.04,
+      "學院新星",
+      "準 C 級"
+    ],
+    [
+      21,
+      50,
+      1.04,
+      1.1,
+      "熟練獵魔人",
+      "C~B 級"
+    ],
+    [
+      51,
+      80,
+      1.1,
+      1.16,
+      "戰場老將",
+      "A 級以上"
+    ],
+    [
+      81,
+      100,
+      1.16,
+      1.2,
+      "身經百戰",
+      "戰力天花板"
+    ]
+  ],
+  "BOUNDS": {
+    "max_mp": [
+      10,
+      100
+    ],
+    "martial": [
+      0,
+      100
+    ],
+    "exp": [
+      0,
+      100
+    ],
+    "power_base": [
+      1.0,
+      10.0
+    ],
+    "mp_cost": [
+      1,
+      25
+    ],
+    "precision": [
+      0.0,
+      1.5
+    ],
+    "proficiency": [
+      0,
+      100
+    ]
+  },
+  "ENUMS": {
+    "skill_type": [
+      "個人魔法",
+      "通常魔法",
+      "攻擊技",
+      "防禦技",
+      "輔助技",
+      "結界張開",
+      "術式"
+    ],
+    "magic_system": [
+      "超能系",
+      "自然系",
+      "療癒系",
+      "跨系融合"
+    ],
+    "awakening": [
+      "未覺醒",
+      "初期覺醒",
+      "中期覺醒",
+      "後期覺醒",
+      "完全覺醒"
+    ]
+  },
+  "ABILITY_CATEGORIES": {
+    "攻擊型": [
+      "擴展一：以造成傷害為前提的放出（例：能量彈、斬擊強化、範圍轟擊）",
+      "擴展二：持續傷害／追擊（例：燃燒、電擊蔓延、追蹤彈）",
+      "擴展三：強化攻擊（例：附著武器、蓄力貫穿、多重命中）"
+    ],
+    "輔助型": [
+      "擴展一：增益己方／隊友（例：強化、加速、護盾、回復）",
+      "擴展二：削弱敵方（例：遲緩、弱化、致盲、降抗）",
+      "擴展三：環境操控（例：地形改變、設置陷阱、遮蔽視線）"
+    ],
+    "防禦型": [
+      "擴展一：屏障／護盾防禦（例：能量牆、防禦結界）",
+      "擴展二：反彈／吸收（例：反射攻擊、吸收轉化）",
+      "擴展三：領域防禦（例：範圍結界、保護隊友）"
+    ],
+    "控制型": [
+      "擴展一：束縛／禁錮（例：綑綁、石化、冰封）",
+      "擴展二：位移／拉扯（例：擊退、拉近、瞬移干擾）",
+      "擴展三：感官干擾（例：迷惑、幻覺、沉默）"
+    ],
+    "召喚型": [
+      "擴展一：召喚使魔／分身（例：元素精靈、複製分身）",
+      "擴展二：召喚物協同（例：召喚獸聯手攻擊、指揮炮台）",
+      "擴展三：召喚強化（例：合體、強化召喚物、數量增殖）"
+    ],
+    "移動型": [
+      "擴展一：高速移動／瞬移（例：衝刺、閃現、飛行）",
+      "擴展二：地形穿越（例：穿牆、水上行走、滯空）",
+      "擴展三：位移攻擊（例：以移動帶動衝擊、交換位置）"
+    ],
+    "治癒型": [
+      "擴展一：治療／回復（例：傷口癒合、魔力回復）",
+      "擴展二：淨化／解除異常（例：解毒、驅散負面狀態）",
+      "擴展三：再生／強化回復（例：持續回復、加速復原）"
+    ],
+    "偵查型": [
+      "擴展一：感知／探測（例：範圍偵查、透視、追蹤）",
+      "擴展二：情報收集（例：讀心、影像重現、竊聽）",
+      "擴展三：隱匿／偽裝（例：隱身、消除氣味、變裝）"
+    ],
+    "複合型": [
+      "擴展一：兩類以上的複合應用（例：攻擊＋控制、防禦＋回復）",
+      "擴展二：隨情境切換的應用（例：依距離/目標切換攻守）",
+      "擴展三：自訂擴展（依能力原理自由定義）"
+    ]
+  },
+  "APPLICATION_HINTS": [
+    "擴展一：以造成傷害為前提的能力放出（例：噴火、火焰附著拳頭、火焰巨龍）",
+    "擴展二：不以造成傷害為前提的放出（例：火焰分身、設置會爆炸的火花陷阱）",
+    "擴展三：其他自訂擴展應用（例：火焰照明、淨化、地形製造）"
+  ],
+  "MP_INVESTED_MAX": 3.0,
+  "MP_INVESTED_STEP": 0.5,
+  "PROMPTS": {
+    "phase_a": "你是招式對撞系統的戰局分析器。根據討論串內容判斷對撞情境，輸出結構化 JSON。\n\n任務（依序）：\n1. 判斷誰與誰在對抗、各自出什麼招\n2. 記錄雙方實際使用的招式（玩家自行描述的行動；禁止替玩家選擇招式）\n3. 判斷雙方當前狀態（重傷/瀕死/疲勞/特殊狀態），給出 Status_Mod\n4. 判斷型態與變體：角色是否進入特殊型態（Form_Mod）、出招是否為合理變體（Variant_Mod）\n5. 動作來源：玩家角色只採用其自行描述的動作；**NPC（非玩家角色，含魔物/反派，見下方【登記角色表】）**若無玩家設定，由你預設\n6. 合理性審查：越權操作他人角色？主張對撞結果？（不駁回，記入 claims 供計算判斷）\n7. 標記雙方出招的擴展應用分類（application，如「擴展一：傷害型／擴展二：非傷害型」），\n   供合理性審查（是否符合能力原理與角色設定）；所有招式統一使用一般公式計算，分類不影響數值\n8. **判斷雙方動作型別（action_type）**——這是最重要的一步，務必讀懂討論串：\n   - \"skill\"：使用一般招式（能力擴展應用、魔法、近戰招式）\n   - \"domain\"：**張開/展開結界**（角色展開領域、結界、結界技能、結界壓迫，例如\n     「展開結界」「領域展開」「張開龍王禁地」「以地獄水牢包覆」）——結界張開本身是動作，\n     skill 欄位填結界名稱\n   - \"melee\"：無招式的普通攻擊/近戰\n   判斷依據：討論串描述的是「展開領域/結界」→ domain；是「使出招式」→ skill；\n   「揮拳/斬擊/踢擊」而無招式名 → melee。\n   **特別注意**：當一方張開結界而另一方也張開結界，這是「結界張開對抗（可能融合）」，不是普通招式對撞。\n9. 判斷雙方動作意圖（action_intent）：\n   - \"attack\"（攻擊性：帶攻擊威力的招式/近戰/結界壓迫）\n   - \"evade\"（純迴避：利用敏捷閃躲/拉開距離，無攻擊意圖）\n   - \"guard\"（純防禦：硬擋/格擋/防禦結界接住，無攻擊意圖）\n   非對抗性動作（evade/guard）不計算攻擊威力，改走專屬判定；雙方皆非對抗 → 標記 \"no_clash\": true\n10. 判斷交戰距離（distance）：「近身/中距/遠距」或具體公尺數，依討論串情境推斷，\n    供距離判定器決定距離衰減（Range_Mod）。distance.range_mod 僅為你（Phase A）的初判，\n    最終值由 Phase B 距離判定器以招式自身範圍為準覆寫。\n    兜底：討論串未明確描述距離 → 預設「近身（5 公尺內）」，並於 distance.desc 標註「未描述，預設近身」\n11. 判斷偷襲情境（ambush）：攻擊方是否透過煙霧/煙幕彈/障礙物/視覺遮擋使對方無法察覺而出手？\n    成立 → \"ambush\": {\"active\": true, \"target\": \"被偷襲方角色名\", \"desc\": \"遮蔽方式\"}；\n    未成立 → \"ambush\": {\"active\": false}\n    成立時被偷襲方套用 Ambush_Mod = 0.8（劣勢），正常正面對決為 1.0\n12. 判斷雙方實際手持武器種類（依討論串描述與角色表 weapon），輸出武器分類：\n    \"bare\"（徒手）/ \"light\"（輕：匕首·短刀）/ \"one_hand\"（單手：長劍·魔杖）/\n    \"heavy\"（重型：大劍·巨斧）。只輸出分類，**不輸出數值**——Weapon_Base 由 Phase B 機械判定。\n\n【玩家 vs NPC 判定（依輸入的【登記角色表】）】\n- **玩家角色** = 由中之人（真實玩家）親自操作的角色。只有玩家角色的動作不可被他人預設。\n- **NPC** = 登記角色表中標記為反派者、或該討論串中非玩家操作的角色（學園學生/魔物/路人等）。\n  NPC 的動作可由你（AI）預設，也可由其他角色/玩家宣告，**一律不視為越權代操、不記入 warnings**。\n- **越權代操**僅適用於：某玩家替**另一位玩家角色**設定了動作或意圖。此時記入 warnings，\n  並於該角色 candidate 標註 is_player=true、is_npc=false；NPC 一律 is_npc=true、is_player=false。\n- 無法確認是否為玩家角色時，預設視為 NPC（不記越權警告），避免誤報。\n\n【輸出格式】（只能輸出 JSON）\n{\n  \"attacker_candidate\": {\"char\": \"角色名\", \"skill\": \"招式/結界名\", \"action_type\": \"skill\", \"is_player\": true, \"is_npc\": false},\n  \"defender_candidate\": {\"char\": \"角色名\", \"skill\": \"招式/結界名\", \"action_type\": \"skill\", \"is_player\": true, \"is_npc\": false},\n  \"applications\": {\"attacker\": \"擴展一：傷害型\", \"defender\": \"擴展二：非傷害型\"},\n  \"action_intents\": {\"attacker\": \"attack\", \"defender\": \"evade\"},\n  \"no_clash\": false,\n  \"weapons\": {\"attacker\": \"one_hand\", \"defender\": \"bare\"},\n  \"distance\": {\"desc\": \"中距（約 30 公尺）\", \"range_mod\": {\"attacker\": 1.0, \"defender\": 1.0, \"note\": \"初判：雙方射程內\"}},\n  \"ambush\": {\"active\": false},\n  \"status\": {\n    \"attacker\": {\"desc\": \"狀態描述\", \"status_mod\": 1.0},\n    \"defender\": {\"desc\": \"狀態描述\", \"status_mod\": 1.0}\n  },\n  \"form_mods\": {\"attacker\": 1.0, \"defender\": 1.0, \"forms\": {\"attacker\": \"型態名或null\", \"defender\": \"型態名或null\"}},\n  \"variant_mods\": {\"attacker\": 1.0, \"defender\": 1.0},\n  \"npc_defaults\": {\"attacker\": \"非玩家方預設動作或null\", \"defender\": \"非玩家方預設動作或null\"},\n  \"claims\": [\"雙方主張的結果（陣列，無則 []）\"],\n  \"warnings\": [\"合理性警告（陣列，無則 []）\"]\n}\n\n規則：\n- 玩家角色不可被預設意圖/動作；若玩家替其他玩家設定動作，記入 warnings；NPC 動作由你預設，不記越權警告\n- 攻守最終由威力比較決定，Phase A 的 candidate 僅為初判\n- Status_Mod：重傷/瀕死 0.5~0.8、輕傷/疲勞 0.9~0.95、正常 1.0、強化 1.05~1.3\n- Form_Mod：僅當角色於劇中明確轉變為特殊型態才套用（依角色表 special_forms 倍率）\n- Variant_Mod：合理變體為 1.05，正常出招 1.0；未登記變體的 Skill_Base 依 Phase B 規則取該能力最低 power_base\n- action_type = \"domain\" 時，Phase B 會以該結界的覺醒進度與精度計算 Domain_BP，**不會**當成未登記招式落回徒手\n- 雙方 action_type 皆為 \"domain\" → Phase B 走結界張開對抗（Domain_Mod 差距 < 0.3 融合、≥ 0.3 覆蓋）",
+    "phase_b": "你是招式對撞系統的計算引擎。依照提供的資料與公式精確計算雙方最終威力與判定，輸出 JSON。\n\n【公式】（嚴格套用，不得自行改動）\nAtk_BP = (Skill_Base + Stat_hidden/2) × Exp_Mod × Element_Mod × Domain_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nMelee_BP = (Weapon_Base + STR_hidden/2) × (1 + Martial/200) × Exp_Mod × Range_Mod × Domain_Mod × Status_Mod × Form_Mod × Variant_Mod × Ambush_Mod\nManaMelee_BP = (Weapon_Base + STR_hidden/2 + INT_hidden/2 + MP_Invested) × (1 + Martial/200) × Exp_Mod × Element_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nDomain_BP = (Precision × 3 + Stat_hidden/2) × Exp_Mod × Domain_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nExp_Mod = 1.0 + E/500\n\n【距離衰減（Range_Mod）】\n- 各方的 Range_Mod 由**距離判定器**依交戰距離（distance）與招式自身範圍（skill.range，\n  留空沿用能力 range_limit）給出，已附於下方輸入資料的 range 欄位，直接套用（勿自行重算）\n- 近戰型招式（skill.range 標記「近身/近戰」）與普通攻擊：交戰距離在近戰範圍內 1.0；\n  超出 → Range_Mod 給極低值（0.3~0.5），思維鏈標註「距離不符，無法有效命中」\n- 射程型招式（如水狙擊槍）：射程內中距/遠距不衰減（1.0）\n- 兜底：未描述距離（Phase A 預設近身 5 公尺內）→ 視為近身，近戰與魔法皆不衰減（1.0）\n- 純迴避/純防禦/結界（domain）不套距離衰減（Range_Mod = 1.0）\n\n【武器基數（Weapon_Base）——機械判定，AI 不判數值】\n- 依 Phase A 的 weapons 分類機械對應：bare(徒手)=1.0 / light(輕)=2.0 /\n  one_hand(單手)=3.0 / heavy(重型)=4.0\n- 角色表 weapon_base 有覆寫值（傳說/特製，僅管理員設定）時以覆寫為準\n- 判定結果寫入思維鏈供審查（例：「長劍 → 單手武器 → Weapon_Base 3.0」）\n\n【招式基數（Skill_Base）——未登記招式與合理變體】\n- 玩家使出已登記招式 → 以該招式 power_base 為準\n- 招式未登記、但屬該角色既有能力的「合理變體」（與擴展應用相符）→\n  Skill_Base = 該能力下既有招式「最低 power_base」；1.05 加成由 Variant_Mod 套用\n  （**Variant_Mod 不重複乘算**）\n  **不可取最高值招式套用低威力描述**；基準（min 值）與 Variant_Mod 寫入思維鏈\n- 招式未登記且不屬任何既有能力/擴展應用 → 不套變體，改用普通攻擊（Melee_BP），\n  並於 warnings 回報「該招式未在招式庫登記，請管理員補充」\n\n【結界張開動作（action_type = \"domain\"）——不可落回徒手】\n- 若 Phase A 標記某方 action_type = \"domain\"（張開結界），該方**以結界本身計算 Domain_BP**，\n  絕不因結界名稱不在招式庫而改用普通攻擊。\n- 結界資料：由角色結界（collide_domains）取得該結界的 `awakening`（→ Domain_Mod）與 `precision`（結界術精度 0~1.5）。\n- 若該結界未登記：以 Phase A 判斷的覺醒程度（或角色一般狀態）給定 Domain_Mod，precision 用 1.0 兜底，\n  並於 warnings 回報「結界未登記，請管理員補充」。\n- **雙方 action_type 皆為 \"domain\"** → 這是「結界張開對抗」：\n  比較雙方 Domain_Mod，差距 < 0.3 → 結界交疊（融合）；≥ 0.3 → 被覆蓋（覆蓋方可耗魔力彌補）。\n  輸出 verdict 為「結界交疊/融合」或「結界覆蓋」，不是一般招式四階判定。\n- 結界交疊/融合時，輸入資料附帶 `fusion_effects`（機械判定）：\n  必中中和（雙方結界的必中效果互相中和，皆無必中優勢）、特殊規則融合（雙方規則合併為融合領域規則）、\n  燒除規則（含「燒除/無效化規則與特殊效果」的結界會燒除融合領域內的規則效果與特殊效果，雙方只能以純粹的蠻力對抗）。\n  result.projection / reason 必須忠實反映 fusion_effects，不可忽略或自行增減。\n- 一方 domain、一方 skill/melee → 以 Domain_BP 對 Atk_BP/Melee_BP 比較，正常四階判定。\n\n【魔力包裹投入量（MP_Invested）——AI 自動追回差距】\n- 初始投入：依對抗激烈程度與角色性格給 1.0~2.0\n- 以初始值計算雙方 BP 後，若某方仍落後且差距存在，自動加碼（每次 +0.5）\n  直到追回差距或達上限 3.0；加碼過程逐筆寫入思維鏈\n- 例：「基礎落後 4.2 → 投入 2.0 → 仍差 2.2 → 投入 3.0 → 差距縮至 0.8」\n- 魔力消耗由玩家自行記帳，MP_Invested 僅影響本次計算\n\n【偷襲劣勢（Ambush_Mod）】\n- Phase A 判斷偷襲成立時，被偷襲方（target）套用 Ambush_Mod = 0.8，攻擊方 1.0\n- 無偷襲情境雙方皆 1.0\n- 純迴避/純防禦的被偷襲方，其 Evade_BP/Guard_BP 亦乘 Ambush_Mod\n\n【攻守決定】\n- 雙方皆「攻擊性」：各自計算最終威力，威力較大者為攻擊方（Atk）、較小者為防禦方（Def）。攻守雙方同一公式。\n- 一方「非對抗性」（純迴避/純防禦）：該方**不計算攻擊威力**，改以隱藏分數為基準：\n  純迴避 → Evade_BP = 敏捷隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod\n  純防禦 → Guard_BP = 體質隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod（防禦招式可再 ×0.3 格擋加成）\n  與攻擊方 Atk_BP 比較，對撞結果標註「純迴避/純防禦」。\n- 雙方皆非對抗（no_clash = true）：回報「無對撞發生」，不輸出威力比較。\n\n【四階判定】\n- Atk > Def × 2.0  → 絕對碾壓\n- Atk > Def        → 優勢壓制\n- Atk ≈ Def        → 招式僵持\n- 非對抗性判定：Atk > Def_BP×2.0 → 命中重創；Atk > Def_BP → 部分命中；Atk ≈ Def_BP → 成功迴避/防禦；Atk < Def_BP → 徹底化解\n- 雙方同開結界（皆已覺醒）且 Domain_Mod 差距 < 0.3 → 結界交疊（觸發結界融合）\n  差距 ≥ 0.3 時結界被覆蓋；被覆蓋方可消耗魔力彌補（每 1 點魔力 → 等效 Domain_Mod +0.03），\n  原始差距 ≥ 0.6 無法彌補。需明確列出魔力投入量與彌補後的差距。\n  注意：系統不追蹤當前魔力，魔力消耗由玩家自行記帳；魔力投入量僅作計算與思維鏈記錄。\n- 任一方未開結界（domain_mod ≤ 1.0，未覺醒/未張開）→ **不觸發結界交疊/覆蓋/融合**，\n  直接以威力比較判定：未開方用其未開結界 BP（Domain_Mod=1.0）對抗對方開結界 BP，正常計算。\n  未覺醒只能用簡易結界，簡易結界無法對抗張開的結界。\n\n【輸出格式】（只能輸出 JSON）\n{\n  \"computation\": {\n    \"attacker\": {\"char\": \"...\", \"skill\": \"...\", \"bp\": 0.0, \"breakdown\": {\"skill_base\": 0, \"stat_hidden\": 0, \"exp_mod\": 0, \"element_mod\": 0, \"domain_mod\": 0, \"proficiency_mod\": 0, \"status_mod\": 0, \"form_mod\": 0, \"variant_mod\": 0, \"range_mod\": 1.0}},\n    \"defender\": {\"char\": \"...\", \"skill\": \"...\", \"bp\": 0.0, \"breakdown\": {...}}\n  },\n  \"attacker\": \"攻擊方角色\", \"defender\": \"防禦方角色\",\n  \"verdict\": \"絕對碾壓/優勢壓制/招式僵持/結界交疊\",\n  \"result\": {\n    \"verdict\": \"玩家可讀的判定結果（與 verdict 一致）\",\n    \"summary\": \"結果一句話（玩家可讀，如「神月的火龍彈碾壓甲的防禦」）\",\n    \"projection\": \"預估結果：具體描述雙方接下來會發生什麼（誰被擊退/重創/僵持消耗/結界融合景象），供正文轉寫與玩家檢視\",\n    \"reason\": \"判定理由：引用雙方最終 BP 與關鍵 Mod（元素剋制/狀態/距離衰減等），供玩家判斷計算靠不靠譜\"\n  },\n  \"domain_fusion\": false,\n  \"domain_override\": {\"applied\": false, \"mp_invested\": 0, \"effective_gap\": 0.0, \"result\": \"融合/覆蓋\"},\n  \"remaining_damage\": \"剩餘衝擊傷害描述\",\n  \"chain_of_thought\": \"完整計算過程與思維鏈（供公開審查）\",\n  \"warnings\": []\n}\n\n要求：\n- chain_of_thought 必須逐項列出每個 Mod 的取值理由與計算過程，供所有人檢視\n- result.summary / projection / reason 必須以玩家能看懂的中文撰寫，禁止系統欄位名與公式堆砌\n- 數值需四捨五入到小數第 2 位\n- 若招式未登記：註明「以普通攻擊 Melee_BP 替代」或「以相近能力招式估算」，寫入 warnings\n- 所有招式（含輔助/非傷害型擴展應用）統一使用一般公式計算；對撞指令前提為雙方都決定對撞",
+    "phase_c": "你是文風輸出器。對撞的數字計算已經全部完成（Phase B 已算出雙方威力、四階判定與預估結果），你**不需要再計算、也不需要輸出任何數字**。\n\n你唯一的任務：把【對撞計算結果】的「結果與預估結果」用伺服器文風，寫成一段可以直接發布的對撞正文。\n\n【預估結果為骨架】\n- result.projection（預估結果）就是要轉寫的內容：誰的招式命中/被擋下、擊退重創、僵持消耗或結界融合景象\n- result.summary 與 verdict 是整體走向，正文不得偏離（不可改判、不可讓輸方反敗）\n- result.reason 的關鍵因素（元素剋制、狀態、距離衰減）可融入描寫，但不直接引用數字或欄位名\n\n【描寫邊界——只寫物理事實，不寫內心、不寫台詞、不寫反應】\n- 只描述**物理上可觀察**的碰撞結果與場景：光束/招式如何相撞、誰的攻擊被碾碎/偏折/瓦解、餘波如何衝擊地面與空氣、中招者身體被擊退/震動/受創的可觀察物理反應。\n- **禁止**任何對白/台詞——對撞正文零對話，雙方不開口。\n- **禁止**描寫角色的內在狀態：表情（瞳孔一縮、面色一變、眼神一沉）、情緒（心頭一凜、察覺到不對）、心理活動（心想、試圖、暗自判斷）、未說出口的反應與內心結論（「輸得沒有懸念」）。\n- **禁止**描寫對撞結束後角色「額外的動作或反應」：站定、撐膝、喘息、呼吸平穩、發抖、對視、看向對方、沒有接話等——除非 projection 明文寫出，否則一律不寫。\n- **禁止**替角色預設結果中沒有的動作：除非 projection 明示（如「被擊退」「需立刻應變」「貫穿」），不得擅自讓角色閃避成功、成功反擊、或做出任何追加行動。\n- 表情、情緒、心理、台詞、後續反應一律不寫；只寫對撞本身的物理結果與場景。\n\n【場景】\n- 適度描寫碰撞發生的場景/環境（地面被炸出坑、碎石塵土飛濺、空氣被撕裂、建築受損等），讓對撞有現場感；但場景不得喧賓奪主，也不得發明結果中不存在的意象。\n\n【輸出要求】\n- 輸出只能是正文敘述（對撞實際攻防過程），不要有任何前置說明、不要用引號包 JSON\n- 禁止輸出任何數字、威力、公式、JSON、欄位名、思考過程或條列清單\n- 禁止出現「計算」「結果」「判定」「威力」「勝率」等系統詞彙\n- 勝負與結果必須忠實反映【對撞計算結果】，不可自行改判\n\n【結界融合：verdict=結界交疊 或 domain_fusion=true 時必寫】\n雙方結界交疊融合時，正文除了描寫交疊的過程之外，**必須清楚寫出融合後結界的完整形態**：\n- 外觀描述：融合後的領域長什麼樣子——視覺、色彩、空間的具體樣貌，雙方元素/意象如何交織成一個無法歸屬的新領域\n- 具體效果：這個融合領域實際產生什麼作用——對雙方（魔力滲透、共鳴、連結感）、對環境（異象、波動、地景改變）的具體影響\n這是「結果」而非「過程」——不要只停在「兩人的結界交疊了」，要描寫交疊完成之後的新形態與它帶來的影響\n\n【融合外觀忠實性——不可自行發明意象】\n- 外觀與效果只能取材於【對撞計算結果】的 `domains` 區塊中雙方結界的實際描述（rule_self / rule_enemy / rule_environment），\n  以及 `fusion_effects`（必中中和 / 特殊規則融合 / 燒除規則）\n- 禁止擅自增添結界描述中不存在的意象。例：某結界只是「充滿水的結界」（水牢），\n  就不可寫成海、深淵、珊瑚、龍骨、月光等水的延伸想像；描述沒有的意象一律不得出現\n- fusion_effects 的必中中和、特殊規則融合、燒除規則（→ 純粹的蠻力對抗）應融入正文效果描寫，不可省略\n\n【文風要求】\n- **嚴格套用下方【文風規則】區塊**——這是伺服器主 RP 正文用的同一套文風。但其中「對白約占正文 40%」「心理描述」等指引**不適用於對撞正文**：對撞正文零對白、零心理（見【描寫邊界】），只沿用其**語言文風**——命名規則、禁用詞、表達偏好（否定排比、模糊微量描寫、情緒標註、動物比喻等一律照辦）。\n- 融入雙方角色的招式與當前狀態，寫出實際的攻防過程與餘波\n- 讓文本讀起來就是角色真的在交手，而不是在報告一場計算\n\n開始直接寫正文：",
+    "range_judge": "你是招式對撞系統的距離修正判定器。依交戰距離與雙方招式/動作的範圍，判定雙方 Range_Mod。\n\n輸入：\n- distance: 交戰距離描述（Phase A 依討論串判斷）\n- sides: attacker / defender 各自的動作資訊\n  - char: 角色名\n  - action_type: skill / melee / domain\n  - skill: 招式名（action_type 非 skill 時為 null）\n  - skill_range: 招式自身的有效攻擊距離（招式表 range 欄位；留空字串表示沿用能力極限距離）\n  - ability_range_limit: 所屬能力極限距離（遠程/狙擊等）\n  - ability_range_decay: 所屬能力超過極限距離後的衰減規則\n  - weapon_category: 徒手/輕/單手/重型（melee 相關）\n\n判定規則（Range_Mod）：\n- 以「招式自身 skill_range」為準；skill_range 留空時沿用 ability_range_limit；皆無 → 預設近戰範圍\n- 交戰距離在射程內 → 1.0\n- 交戰距離超過射程 → 依 ability_range_decay 衰減（<1.0；無指定衰減規則時合理推估）\n- **近戰型**（skill_range 含「近身/近戰」，或 action_type = melee、普通攻擊）：只在近身交戰時 1.0；\n  交戰距離超出近戰範圍 → 距離不符，Range_Mod 給 0.3~0.5，reason 標註「距離不符，無法有效命中」\n- **射程型招式**（如水狙擊槍）：射程內中距/遠距不衰減 → 1.0\n- action_type = domain（張開結界）：結界為領域，不因距離衰減 → 1.0\n- 純迴避/純防禦（evade/guard）：不套距離衰減 → 1.0\n- 兜底：未描述距離（distance 標註「未描述，預設近身」）→ 視為近身，雙方皆 1.0\n\n【輸出格式】（只能輸出 JSON）\n{\"range_mod\": {\"attacker\": 1.0, \"defender\": 0.4}, \"reason\": {\"attacker\": \"...\", \"defender\": \"交戰距離約 40 公尺，超出近戰範圍（約 5 公尺）→ 距離不符，無法有效命中\"}}",
+    "calibrate": "你是招式對撞系統的反派數值校準器。管理員新增了一個開啟「動態難度」的反派角色，\n並提供了該反派將登場的篇章與「該篇章預定上場的角色」（玩家自己會知道上場名單）。\n\n任務：依現有強度，為反派設定**有挑戰性但合理**的數值。反派數值校準**一次**後即鎖定，\n該篇章內不再變動——登場越晚的篇章，上場角色通常越強（玩家已成長），反派自然越強。\n\n輸入：\n- 反派名稱、種族\n- 篇章名（calibrate_arc）\n- 預定上場角色清單（含各自的六維評級/隱藏分數、exp、martial、max_mp）\n- 機械基準（collide_engine.villain_calibration_baseline 產出：各六維目標隱藏分數、\n  目標 exp / martial / max_mp——由「上場角色中該項最高者 × 加成倍率」計算）\n\n規則（不可違反）：\n- 校準基準 = 預定上場角色中**現有強度最高者**；反派各六維隱藏分數 ≈ 該項最高值 × 加成\n  （篇章定位加成：普通反派 0.9~1.0，篇章 Boss 1.05~1.15，最終 Boss 可到 1.2）\n- 隱藏分數上限 9.0、exp 上限 100、martial 上限 100、max_mp 上限 100\n- 輸出評級只能是 E/D/C/B/A/S（隱藏分數 = 評級常數 × 種族修正）\n- 反派數值要讓該篇章上場角色「打得動但吃力」，不可碾壓到無法反擊，也不可太弱\n- 六維輸出物件 key 依序：力量/敏捷/智力/體質/魅力/幸運\n\n【輸出格式】（只能輸出 JSON）\n{\n  \"calibrated\": {\n    \"stats\": {\"力量\": \"B\", \"敏捷\": \"A\", \"智力\": \"C\", \"體質\": \"B\", \"魅力\": \"D\", \"幸運\": \"E\"},\n    \"exp\": 25, \"martial\": 65, \"max_mp\": 60\n  },\n  \"basis\": {\"strongest_in_roster\": \"角色名\", \"arc\": \"第一篇\", \"ratio\": 1.1},\n  \"chain_of_thought\": \"逐項說明以誰為基準、加成多少、為何如此設定（供審查）\",\n  \"warnings\": []\n}",
+    "write_character": "你是招式對撞系統的資料輸入解析器。請把管理員的自然語言描述轉成結構化 JSON。\n目標資料表：角色（collide_characters）。輸出只能是 JSON，不要額外說明；所有欄位值一律使用繁體中文（Traditional Chinese），禁止簡體中文。\n\n【角色必填欄位】\n- name: 角色名（字串）\n- affiliation: 所屬（字串，無則空字串）\n- race: 種族/化形形態（字串，必填）\n- school_rank: 學校/魔物評級（字串，無則空字串）\n- stats: 六維物件 {\"力量\": \"B\", \"敏捷\": \"A\", \"智力\": \"C\", \"體質\": \"B\", \"魅力\": \"D\", \"幸運\": \"E\"}\n  評級只能是 E/D/C/B/A/S 之一\n- special_tags: 特殊狀態標籤陣列（如 [\"強化人\",\"血月癌\"]，無則 []）\n- special_forms: 特殊型態物件 {\"型態名\": 倍率}，倍率須在 1.1~1.5 之間（無則 {}）\n- weapon: 主武器描述（字串，如「長劍」「短刀」，無則空字串=徒手）\n- weapon_base: 武器基數覆寫（數字或 null，2.0~5.0；僅管理員設定傳說/特製武器時使用，\n  一般武器留 null 由系統依武器分類判定表機械取值）\n- max_mp: 最大魔力量（整數，10~100）\n- martial: 武藝值（整數，0~100）\n- exp: 實戰經驗（整數，0~100）\n- is_teacher: 是否教師（布林）\n- is_villain: 是否反派（布林，預設 false）——AI 依此判斷哪些角色可為其預設動作（見 U6）\n- dynamic_difficulty: 動態難度（布林，預設 false；僅反派可開啟）——開啟時反派數值\n  依「該篇章預定上場角色」校準一次後鎖定（見角色表說明）\n- calibrate_arc: 校準篇章名（字串，可空；動態難度開啟時建議填，如「第一篇」）\n- calibrate_roster: 該篇章預定上場角色名陣列（字串陣列，可空；動態難度開啟時必填）\n\n【範圍約束（不可違反，違反則回報錯誤）】\n- max_mp 必須在 10~100；martial 與 exp 必須在 0~100\n- 六維評級只能是 E/D/C/B/A/S\n- special_forms 各倍率必須在 1.1~1.5\n- weapon_base 若填寫必須在 2.0~5.0\n- is_villain / is_teacher / dynamic_difficulty 必須是布林\n- dynamic_difficulty = true 時 calibrate_roster 不可為空\n\n【未定義種族處理】\n若種族未在種族修正表中，照常輸出其他欄位即可——系統會自動請 AI 設計該種族的六維修正並填入種族表（立即生效、標記待人工審查），角色寫入流程不需在此處理。",
+    "write_ability": "你是招式對撞系統的資料輸入解析器。請把管理員的自然語言描述轉成結構化 JSON。\n目標資料表：能力（collide_abilities）。輸出只能是 JSON，不要額外說明；所有欄位值一律使用繁體中文（Traditional Chinese），禁止簡體中文。\n\n【能力必填欄位】\n- name: 能力名稱（字串）\n- owner: 擁有角色（字串）\n- category: 能力分類（字串，建議分類：攻擊型/輔助型/防禦型/控制型/召喚型/移動型/治癒型/偵查型/複合型；\n  可自訂，依能力用途判斷，預設「複合型」）\n- principle: 能力原理（字串，驅動機制/限制/成長方向，必填）\n- range_limit: 極限有效距離（字串自由描述，如「極限 80 公尺」；近身型能力可留空或寫「近身」）\n- range_decay: 超過極限距離後的衰減規則（字串自由描述，如「每超 10 公尺威力 -5%」；射程內不衰減）\n\n【範圍約束】\n- 能力名稱不可為空\n- principle 不可為空（能力必備原理）\n- category 不可為空（招式會依此分類選用擴展應用模板）\n\n【輸出格式】\n{\"name\": \"...\", \"owner\": \"...\", \"category\": \"輔助型\", \"principle\": \"...\", \"range_limit\": \"...\", \"range_decay\": \"...\"}",
+    "write_skill": "你是招式對撞系統的資料輸入解析器。請把管理員的自然語言描述轉成結構化 JSON。\n目標資料表：招式（collide_skills）。輸出只能是 JSON，不要額外說明；所有欄位值一律使用繁體中文（Traditional Chinese），禁止簡體中文。\n\n【招式必填欄位】\n- name: 招式名稱（字串）\n- ability: 所屬能力名稱（字串；招式是該能力的擴展應用）。\n  **個人魔法必填**（須屬於已登記能力）；**通常魔法為三大系之外的通用魔法，不需掛能力，ability 一律留空 \"\"**\n- owner: 擁有角色（字串，通用則空字串）\n- application: 擴展應用分類（字串，依所屬能力的 category 對應模板選填，例如輔助型能力用\n  「擴展一：增益己方／隊友」；也可自訂，但不可為空）\n- skill_type: 個人魔法 / 通常魔法\n- magic_system: **僅 skill_type = 個人魔法 需要填**（超能系 / 自然系 / 療癒系 / 跨系融合）；\n  **通常魔法為三大系之外的通用魔法，magic_system 一律留空 \"\"**\n- element: 世界元素屬性（字串，共 20 種：\n  光/暗/火/水/冰/風/雷/岩/毒/葉/鐵/時間/無限/太空/核/純粹魔力/靈魂/花朵/夢幻/混沌。\n  剋制為多對多組合，一元素可有多個弱點，例如水被冰/雷/葉剋制；水剋火、火不反剋水）\n  **僅 magic_system = 自然系（元素魔法）需要填**；超能系／療癒系／跨系融合與通常魔法\n  不涉及元素，element 一律輸出空字串 \"\"（留空＝無元素剋制，元素修正視為 1.0）\n- mp_cost: 魔力消耗量（整數，1~25）\n- power_base: 招式威力基數（數字，1.0~10.0）\n- effect: 附加狀態效果（字串，無則空字串）\n- range: 招式自身的有效攻擊距離（字串自由描述，如「近身（5 公尺內）」「極限 80 公尺」「中距 30 公尺」；\n  近戰型招式（如水凝成的刀）填「近身」，遠程射擊型招式（如水狙擊槍）填具體射程。\n  留空則沿用所屬能力的極限距離——明確的招式一律建議填寫，距離判定器會以它為準）\n\n【距離修正（Range_Mod，影響對撞計算）】\n- 交戰距離在招式射程內 → Range_Mod = 1.0（不衰減）\n- 近戰型招式/普通攻擊只在近身有效：交戰距離超出近戰範圍 → 距離不符，Range_Mod 極低（0.3~0.5）\n- 射程型招式（如水狙擊槍）：射程內的中距/遠距交戰不衰減 → 1.0\n- 交戰距離超過射程 → 依所屬能力 range_decay 衰減（無指定衰減規則時合理推估）\n- 填寫範圍時請考量招式類型：近戰招式給近身範圍、射程型招式給具體射程，避免招式在實戰中因距離不符而無法有效命中\n\n【擴展應用分類說明】\n- application 依所屬能力的「分類（category）」選擇對應擴展應用模板，不綁死特定兩類。\n  分類與模板對照（模板僅為建議，可自訂但不可為空）：\n  - 攻擊型：以造成傷害為前提的放出 / 持續傷害・追擊 / 強化攻擊\n  - 輔助型：增益己方・隊友 / 削弱敵方 / 環境操控\n  - 防禦型：屏障・護盾防禦 / 反彈・吸收 / 領域防禦\n  - 控制型：束縛・禁錮 / 位移・拉扯 / 感官干擾\n  - 召喚型：召喚使魔・分身 / 召喚物協同 / 召喚強化\n  - 移動型：高速移動・瞬移 / 地形穿越 / 位移攻擊\n  - 治癒型：治療・回復 / 淨化・解除異常 / 再生・強化回復\n  - 偵查型：感知・探測 / 情報收集 / 隱匿・偽裝\n  - 複合型：兩類以上複合 / 隨情境切換 / 自訂擴展\n- 描述中若提供所屬能力的 category，請優先使用該分類對應的模板\n\n【能力原理約束】\n- 招式必須是所屬能力（ability）的合理擴展應用：寫入時系統會以該能力\n  principle（能力原理）與 category（能力分類）檢查推導關係，使用與能力原理無關的機制或違背限制 → 判定不合理\n\n【範圍約束（不可違反，違反則回報錯誤）】\n- mp_cost 必須在 1~25；power_base 必須在 1.0~10.0\n- skill_type 必須是上述選項之一；magic_system 僅個人魔法需要填（三大系之一），\n  通常魔法為三大系之外的通用魔法，magic_system 留空\n- 元素規則：僅 magic_system = 自然系 需要填 element；超能系／療癒系／跨系融合與通常魔法 element 留空\n- 招式威力基數上限 10.0 為表/裡世界天花板，不可超過\n- application 不可為空\n\n【輸出格式】\n{\"name\": \"...\", \"ability\": \"...\", \"owner\": \"...\", \"application\": \"擴展一：以造成傷害為前提的放出\", \"skill_type\": \"...\", \"magic_system\": \"...\", \"element\": \"...\", \"mp_cost\": 12, \"power_base\": 7.5, \"effect\": \"...\", \"range\": \"近身（5 公尺內）\"}",
+    "write_domain": "你是招式對撞系統的資料輸入解析器。請把管理員的自然語言描述轉成結構化 JSON。\n目標資料表：結界（collide_domains）。輸出只能是 JSON，不要額外說明；所有欄位值一律使用繁體中文（Traditional Chinese），禁止簡體中文。\n\n【結界必填欄位】\n- name: 結界名稱（字串）\n- owner: 擁有角色（字串）\n- domain_type: 結界類型（字串）\n- awakening: 覺醒進度（未覺醒/初期覺醒/中期覺醒/後期覺醒/完全覺醒）\n- precision: 結界術精度（數字，0~1.5）\n- rule_self: 領域固有規則_自身增益（字串）\n- rule_enemy: 領域固有規則_敵方限制（字串）\n- rule_environment: 領域固有規則_環境改變（字串）\n- cooldown: 結界融斷冷卻（字串；正常為「6 小時內可再展開」）\n- sustain_mp: 維持魔力消耗（數字）\n\n【範圍約束（不可違反，違反則回報錯誤）】\n- precision 必須在 0~1.5\n- awakening 必須是上述五種之一\n\n【輸出格式】\n{\"name\": \"...\", \"owner\": \"...\", \"domain_type\": \"...\", \"awakening\": \"中期覺醒\", \"precision\": 1.2, \"rule_self\": \"...\", \"rule_enemy\": \"...\", \"rule_environment\": \"...\", \"cooldown\": \"6 小時內可再展開\", \"sustain_mp\": 8}",
+    "formulas": "招式對撞系統公式（公開）：\n\nAtk_BP       = (Skill_Base + Stat_hidden/2) × Exp_Mod × Element_Mod × Domain_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nMelee_BP     = (Weapon_Base + STR_hidden/2) × (1 + Martial/200) × Exp_Mod × Range_Mod × Domain_Mod × Status_Mod × Form_Mod × Variant_Mod × Ambush_Mod\nManaMelee_BP = (Weapon_Base + STR_hidden/2 + INT_hidden/2 + MP_Invested) × (1 + Martial/200) × Exp_Mod × Element_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nDomain_BP    = (Precision × 3 + Stat_hidden/2) × Exp_Mod × Domain_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nExp_Mod      = 1.0 + E/500\n\n變數說明：\n- Skill_Base   招式威力基數（1.0~10.0，10.0 為表/裡世界天花板）\n- Stat_hidden  施法對應隱藏分數 = 評級常數 × 種族修正（魔法取智力，視情況取體質/力量）。\n  種族修正為六維各自獨立（0.8~1.5，人類全 1.0；例：魚人敏捷 1.2、體質/智力偏低 0.9）\n  評級常數：E=1, D=2, C=3, B=4, A=5, S=6；隱藏分數上限 9.0\n- Exp_Mod      實戰經驗修正（1.0~1.2，依 E/500）\n- Element_Mod  元素相剋：剋制 1.2 / 無 1.0 / 被剋 0.8（特殊元素可 1.3）。\n   一個元素可剋制多個元素、也可被多個元素剋制（多弱點），由 STRONG_ELEMENT_PAIRS 組合定義。\n   世界元素共 20 種（光暗火水冰風雷岩毒葉鐵時間無限太空核純粹魔力靈魂花朵夢幻混沌）；\n   剋制表為草稿（程式內 ELEMENT_GRID / STRONG_ELEMENT_PAIRS，公開可查），\n   管理員可依劇本精修——未列組合一律 1.0\n- Domain_Mod   自身結界內依覺醒：初期 1.1 / 中期 1.25 / 後期 1.4 / 完全 1.5；未開結界 1.0。\n  未覺醒只能用「簡易結界」——簡易結界無法與張開的結界對抗：對上開結界方時\n  以未開結界 BP（Domain_Mod=1.0）對抗對方開結界 BP，正常計算，不觸發結界交疊/覆蓋\n- Proficiency_Mod  能力熟練度 1.0 + proficiency/100（同能力招式共用）\n- Status_Mod   當前狀態修正（重傷 0.5~0.8 / 輕傷 0.9~0.95 / 正常 1.0 / 強化 1.05~1.3）\n- Form_Mod     特殊型態修正（1.1~1.5，依角色 special_forms）\n- Variant_Mod  合理招式變體 +5%（1.05）\n- Range_Mod    距離衰減：交戰距離在招式射程內 1.0；超過射程依衰減規則（<1.0）。\n  以招式自身 range（有效攻擊距離）為準，留空沿用能力 range_limit。\n  近戰型招式/普通攻擊只在近身有效，交戰距離超出 → 距離不符，Range_Mod 極低（0.3~0.5）。\n  射程型招式（如水狙擊槍）在射程內中距/遠距不衰減。遠距離射程型能力極限距離長，可玩遠程打法。\n- Ambush_Mod   偷襲劣勢：透過煙霧/障礙擋住視線偷襲時，被偷襲方套用 0.8（劣勢）；\n  無偷襲情境 1.0。純迴避/純防禦亦乘此倍率。\n- Martial      武藝值（0~100，每 10 點 +5% 近戰基礎，最高 1.5 倍）\n- Weapon_Base  武器基數，依固定判定表機械取值（AI 不判數值）：\n  徒手 1.0 / 輕武器（匕首·短刀）2.0 / 單手武器（長劍·魔杖）3.0 /\n  重型（大劍·巨斧）4.0 / 傳說特製 5.0（僅管理員 weapon_base 覆寫）\n- MP_Invested  魔力包裹投入量（1.0~3.0），AI 自動判定：\n  初始投入 1.0~2.0；若計算後仍落後且差距存在，自動加碼（每次 +0.5）追回差距\n  直到追回或達上限 3.0；加碼過程寫入思維鏈\n\n四階對抗判定（攻守由威力比較決定：威力大者為攻擊方）：\n- Atk > Def × 2.0  → 絕對碾壓：無視防禦，斷肢/貫穿/瞬殺\n- Atk > Def        → 優勢壓制：擊退/骨折/內臟震盪/逼出底牌\n- Atk ≈ Def        → 招式僵持：術式對撞、元素抵消、轉入速度與體力消耗戰\n- 雙方同開結界（皆已覺醒）且 Domain_Mod 差距 < 0.3 → 結界交疊：觸發結界融合。\n  任一方未開結界（未覺醒/未張開）→ 不觸發交疊/覆蓋，直接以威力比較判定：\n  未開方用其未開結界 BP 對抗對方開結界 BP，正常計算\n\n非對抗性動作（純迴避/純防禦，無攻擊意圖）——不代入攻擊威力公式：\n- 純迴避：Evade_BP = 敏捷隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod\n- 純防禦：Guard_BP = 體質隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod\n  （明確使用防禦性招式可再 ×0.3 格擋加成，寫入思維鏈）\n- Atk > Def_BP × 2.0 → 命中重創（閃避不及/破防）\n- Atk > Def_BP       → 部分命中（擦傷/震盪/被逼退）\n- Atk ≈ Def_BP       → 成功迴避/成功防禦（招式落空或被擋下）\n- Atk < Def_BP       → 徹底化解（毫髮無傷，取得反打位置）\n- 雙方皆非對抗 → 回報「無對撞發生」\n\n結界覆蓋與魔力彌補：\n- 僅雙方皆開結界才適用覆蓋/彌補規則；任一方未開結界（未覺醒）→ 不適用，\n  未開方以其未開結界 BP 對抗對方開結界 BP，正常計算\n- 差距 ≥ 0.3 → 結界被覆蓋（原始差距 ≥ 0.6 無法彌補）\n- 被覆蓋方可消耗魔力對抗：每 1 點魔力 → 等效 Domain_Mod +0.03，補到差距 < 0.3 為止\n- 系統不追蹤當前魔力；魔力消耗由玩家自行記帳（可用 /clash 的消耗彙整做自動記帳）",
+    "growth": "樓層成長規則（/grow，依草案「提升實戰經驗值的方式」）：\n- 核心主線/重大事件：實戰經驗 +10~20\n- 跨越階級生死決鬥：實戰經驗 +5~10\n- 結界戰鬥實踐：實戰經驗 +5~8，並提升結界術精度\n- 高難度委託與實戰演練：實戰經驗 +1~3（打機器人無法超過 E=20）\n- 能力熟練度：玩家使用該能力任一招式於樓層有使用記錄才提升\n- 背景能力掃描：/grow 總結時，除了 collide_action_log，系統（LLM）直接掃描討論串內容，\n  判斷本樓層使用了哪些能力，寫入 collide_ability_usage（thread_scan）——熟練度成長不綁定 clash\n- 可成長：exp / proficiency / martial / precision / awakening / max_mp\n- 不支援成長：六維能力評級（需管理員人工修改）\n- 每個樓層（討論串）同事件只套用一次；所有變動寫入審計 log，可人工修正\n",
+    "rules": "招式對撞系統公式（公開）：\n\nAtk_BP       = (Skill_Base + Stat_hidden/2) × Exp_Mod × Element_Mod × Domain_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nMelee_BP     = (Weapon_Base + STR_hidden/2) × (1 + Martial/200) × Exp_Mod × Range_Mod × Domain_Mod × Status_Mod × Form_Mod × Variant_Mod × Ambush_Mod\nManaMelee_BP = (Weapon_Base + STR_hidden/2 + INT_hidden/2 + MP_Invested) × (1 + Martial/200) × Exp_Mod × Element_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nDomain_BP    = (Precision × 3 + Stat_hidden/2) × Exp_Mod × Domain_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod\nExp_Mod      = 1.0 + E/500\n\n變數說明：\n- Skill_Base   招式威力基數（1.0~10.0，10.0 為表/裡世界天花板）\n- Stat_hidden  施法對應隱藏分數 = 評級常數 × 種族修正（魔法取智力，視情況取體質/力量）。\n  種族修正為六維各自獨立（0.8~1.5，人類全 1.0；例：魚人敏捷 1.2、體質/智力偏低 0.9）\n  評級常數：E=1, D=2, C=3, B=4, A=5, S=6；隱藏分數上限 9.0\n- Exp_Mod      實戰經驗修正（1.0~1.2，依 E/500）\n- Element_Mod  元素相剋：剋制 1.2 / 無 1.0 / 被剋 0.8（特殊元素可 1.3）。\n   一個元素可剋制多個元素、也可被多個元素剋制（多弱點），由 STRONG_ELEMENT_PAIRS 組合定義。\n   世界元素共 20 種（光暗火水冰風雷岩毒葉鐵時間無限太空核純粹魔力靈魂花朵夢幻混沌）；\n   剋制表為草稿（程式內 ELEMENT_GRID / STRONG_ELEMENT_PAIRS，公開可查），\n   管理員可依劇本精修——未列組合一律 1.0\n- Domain_Mod   自身結界內依覺醒：初期 1.1 / 中期 1.25 / 後期 1.4 / 完全 1.5；未開結界 1.0。\n  未覺醒只能用「簡易結界」——簡易結界無法與張開的結界對抗：對上開結界方時\n  以未開結界 BP（Domain_Mod=1.0）對抗對方開結界 BP，正常計算，不觸發結界交疊/覆蓋\n- Proficiency_Mod  能力熟練度 1.0 + proficiency/100（同能力招式共用）\n- Status_Mod   當前狀態修正（重傷 0.5~0.8 / 輕傷 0.9~0.95 / 正常 1.0 / 強化 1.05~1.3）\n- Form_Mod     特殊型態修正（1.1~1.5，依角色 special_forms）\n- Variant_Mod  合理招式變體 +5%（1.05）\n- Range_Mod    距離衰減：交戰距離在招式射程內 1.0；超過射程依衰減規則（<1.0）。\n  以招式自身 range（有效攻擊距離）為準，留空沿用能力 range_limit。\n  近戰型招式/普通攻擊只在近身有效，交戰距離超出 → 距離不符，Range_Mod 極低（0.3~0.5）。\n  射程型招式（如水狙擊槍）在射程內中距/遠距不衰減。遠距離射程型能力極限距離長，可玩遠程打法。\n- Ambush_Mod   偷襲劣勢：透過煙霧/障礙擋住視線偷襲時，被偷襲方套用 0.8（劣勢）；\n  無偷襲情境 1.0。純迴避/純防禦亦乘此倍率。\n- Martial      武藝值（0~100，每 10 點 +5% 近戰基礎，最高 1.5 倍）\n- Weapon_Base  武器基數，依固定判定表機械取值（AI 不判數值）：\n  徒手 1.0 / 輕武器（匕首·短刀）2.0 / 單手武器（長劍·魔杖）3.0 /\n  重型（大劍·巨斧）4.0 / 傳說特製 5.0（僅管理員 weapon_base 覆寫）\n- MP_Invested  魔力包裹投入量（1.0~3.0），AI 自動判定：\n  初始投入 1.0~2.0；若計算後仍落後且差距存在，自動加碼（每次 +0.5）追回差距\n  直到追回或達上限 3.0；加碼過程寫入思維鏈\n\n四階對抗判定（攻守由威力比較決定：威力大者為攻擊方）：\n- Atk > Def × 2.0  → 絕對碾壓：無視防禦，斷肢/貫穿/瞬殺\n- Atk > Def        → 優勢壓制：擊退/骨折/內臟震盪/逼出底牌\n- Atk ≈ Def        → 招式僵持：術式對撞、元素抵消、轉入速度與體力消耗戰\n- 雙方同開結界（皆已覺醒）且 Domain_Mod 差距 < 0.3 → 結界交疊：觸發結界融合。\n  任一方未開結界（未覺醒/未張開）→ 不觸發交疊/覆蓋，直接以威力比較判定：\n  未開方用其未開結界 BP 對抗對方開結界 BP，正常計算\n\n非對抗性動作（純迴避/純防禦，無攻擊意圖）——不代入攻擊威力公式：\n- 純迴避：Evade_BP = 敏捷隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod\n- 純防禦：Guard_BP = 體質隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod\n  （明確使用防禦性招式可再 ×0.3 格擋加成，寫入思維鏈）\n- Atk > Def_BP × 2.0 → 命中重創（閃避不及/破防）\n- Atk > Def_BP       → 部分命中（擦傷/震盪/被逼退）\n- Atk ≈ Def_BP       → 成功迴避/成功防禦（招式落空或被擋下）\n- Atk < Def_BP       → 徹底化解（毫髮無傷，取得反打位置）\n- 雙方皆非對抗 → 回報「無對撞發生」\n\n結界覆蓋與魔力彌補：\n- 僅雙方皆開結界才適用覆蓋/彌補規則；任一方未開結界（未覺醒）→ 不適用，\n  未開方以其未開結界 BP 對抗對方開結界 BP，正常計算\n- 差距 ≥ 0.3 → 結界被覆蓋（原始差距 ≥ 0.6 無法彌補）\n- 被覆蓋方可消耗魔力對抗：每 1 點魔力 → 等效 Domain_Mod +0.03，補到差距 < 0.3 為止\n- 系統不追蹤當前魔力；魔力消耗由玩家自行記帳（可用 /clash 的消耗彙整做自動記帳）\n\n樓層成長規則（/grow，依草案「提升實戰經驗值的方式」）：\n- 核心主線/重大事件：實戰經驗 +10~20\n- 跨越階級生死決鬥：實戰經驗 +5~10\n- 結界戰鬥實踐：實戰經驗 +5~8，並提升結界術精度\n- 高難度委託與實戰演練：實戰經驗 +1~3（打機器人無法超過 E=20）\n- 能力熟練度：玩家使用該能力任一招式於樓層有使用記錄才提升\n- 背景能力掃描：/grow 總結時，除了 collide_action_log，系統（LLM）直接掃描討論串內容，\n  判斷本樓層使用了哪些能力，寫入 collide_ability_usage（thread_scan）——熟練度成長不綁定 clash\n- 可成長：exp / proficiency / martial / precision / awakening / max_mp\n- 不支援成長：六維能力評級（需管理員人工修改）\n- 每個樓層（討論串）同事件只套用一次；所有變動寫入審計 log，可人工修正\n"
+  }
+};
+const BUILD_INFO = {
+  "generated_by": "make_simulator_html.py",
+  "sources": [
+    "collide_rules.py",
+    "collide_engine.py",
+    "simulator_engine.js"
+  ],
+  "timestamp": "2026-08-11T21:00:56",
+  "element_pairs": 51
+};
+/*
+simulator_engine.js — 招式對撞模擬器的 JS 引擎
+由 collide_engine.py 逐函式鏡像移植（相同運算順序，與正式上線一致）。
+常數取自 globalThis.SIM_DATA（由 make_simulator_html.py 注入，來源為 collide_rules.py）。
+可用於瀏覽器（window.SIM_DATA）或 Node（global.SIM_DATA = require(...)）。
+*/
+
+"use strict";
+
+(function (root) {
+  const D = root.SIM_DATA || {};
+
+  const RATING_CONST = D.RATING_CONST || {};
+  const HIDDEN_SCORE_MAX = D.HIDDEN_SCORE_MAX || 9.0;
+  const STAT_KEYS = D.STAT_KEYS || [];
+  const RATING_REVERSE = D.RATING_REVERSE || {};
+  const WEAPON_BASE_TABLE = D.WEAPON_BASE_TABLE || {};
+  const WEAPON_LABELS = D.WEAPON_LABELS || {};
+  const ELEMENT_GRID = D.ELEMENT_GRID || {};
+  const DOMAIN_MOD_TIERS = D.DOMAIN_MOD_TIERS || {};
+  const EXP_TIERS = D.EXP_TIERS || [];
+  const MP_INVESTED_MAX = D.MP_INVESTED_MAX || 3.0;
+  const MP_INVESTED_STEP = D.MP_INVESTED_STEP || 0.5;
+
+  // Python 的 round()：四捨五入到指定位數（正數情境與 JS 一致；tie 採 half-even）
+  function pyRound(x, nd) {
+    if (nd === undefined) nd = 2;
+    if (!isFinite(x)) return x;
+    const p = Math.pow(10, nd);
+    const f = new Float64Array(1);
+    const u = new BigUint64Array(f.buffer);
+    f[0] = x;
+    const bits = u[0];
+    const sign = (bits >> 63n) ? -1 : 1;
+    let exp = Number((bits >> 52n) & 0x7ffn);
+    let m = bits & 0xfffffffffffffn;
+    const shift = exp === 0 ? -1074 : exp - 1075;
+    if (exp !== 0) m |= 0x10000000000000n;
+    const M = m * BigInt(p);
+    let scaled;
+    if (shift >= 0) {
+      scaled = M << BigInt(shift);
+    } else {
+      const q = -shift;
+      const den = 1n << BigInt(q);
+      const qd = M / den;
+      const rem = M % den;
+      if (rem === 0n) scaled = qd;
+      else {
+        const half = den >> 1n;
+        if (rem > half) scaled = qd + 1n;
+        else if (rem < half) scaled = qd;
+        else scaled = (qd & 1n) === 0n ? qd : qd + 1n;
+      }
+    }
+    return sign * Number(scaled) / p;
+  }
+
+  function num(v) { return Number(v); }
+
+  function pyStr(x) { return Number.isInteger(x) ? x + ".0" : String(x); }
+
+  // ── 隱藏分數 ──────────────────────────────────────────────
+  function hiddenScore(rating, raceMod) {
+    if (raceMod === undefined) raceMod = 1.0;
+    const c = RATING_CONST[rating] || 0;
+    return Math.min(pyRound(c * raceMod, 2), HIDDEN_SCORE_MAX);
+  }
+
+  // ── 武器基數（機械取值）──────────────────────────────────
+  function weaponBase(category, override) {
+    if (override !== undefined && override !== null) return pyRound(num(override), 2);
+    const v = WEAPON_BASE_TABLE[category];
+    return num(v === undefined ? WEAPON_BASE_TABLE["bare"] : v);
+  }
+
+  function resolveWeaponOverride(category, override, charWeapon) {
+    charWeapon = charWeapon || "";
+    if (override !== undefined && override !== null) {
+      return [weaponBase(category, override), "管理員覆寫 weapon_base=" + pyStr(override)];
+    }
+    const cat = category || (charWeapon ? "light" : "bare");
+    const base = weaponBase(cat);
+    const label = WEAPON_LABELS[cat] || "徒手";
+    return [base, (charWeapon || "無武器") + " → " + label + " → Weapon_Base " + pyStr(base)];
+  }
+
+  // ── 元素相剋 ──────────────────────────────────────────────
+  function elementMod(attackerElement, defenderElement) {
+    if (!attackerElement || !defenderElement) return 1.0;
+    const grid = ELEMENT_GRID[attackerElement] || {};
+    const v = grid[defenderElement];
+    return v === undefined ? 1.0 : num(v);
+  }
+
+  // ── 經驗 / 熟練度 / 型態 / 變體 ──────────────────────────
+  function expMod(exp) { return 1.0 + exp / 500.0; }
+  function proficiencyMod(p) { return 1.0 + p / 100.0; }
+
+  function variantSkillBase(existingPowerBases) {
+    if (!existingPowerBases || existingPowerBases.length === 0) return 1.0;
+    let m = Infinity;
+    for (const b of existingPowerBases) m = Math.min(m, num(b));
+    return pyRound(m, 2);
+  }
+
+  function domainMod(awakening, inDomain) {
+    if (inDomain === undefined) inDomain = true;
+    if (!inDomain) return 1.0;
+    const v = DOMAIN_MOD_TIERS[awakening || "未覺醒"];
+    return v === undefined ? 1.0 : num(v);
+  }
+
+  // ── 三條威力公式 ──────────────────────────────────────────
+  function computeAtkBp(skillBase, statHidden, exp,
+    elementM, domainM, proficiencyM, statusM, formM, variantM, rangeM, ambushM) {
+    if (elementM === undefined) elementM = 1.0; if (domainM === undefined) domainM = 1.0;
+    if (proficiencyM === undefined) proficiencyM = 1.0; if (statusM === undefined) statusM = 1.0;
+    if (formM === undefined) formM = 1.0; if (variantM === undefined) variantM = 1.0;
+    if (rangeM === undefined) rangeM = 1.0; if (ambushM === undefined) ambushM = 1.0;
+    const bp = (skillBase + statHidden / 2)
+      * expMod(exp) * elementM * domainM * proficiencyM
+      * statusM * formM * variantM * rangeM * ambushM;
+    return pyRound(bp, 2);
+  }
+
+  function computeDomainBp(precision, statHidden, exp,
+    domainM, statusM, formM, variantM, rangeM, ambushM) {
+    if (domainM === undefined) domainM = 1.0; if (statusM === undefined) statusM = 1.0;
+    if (formM === undefined) formM = 1.0; if (variantM === undefined) variantM = 1.0;
+    if (rangeM === undefined) rangeM = 1.0; if (ambushM === undefined) ambushM = 1.0;
+    const base = precision * 3.0 + statHidden / 2;
+    const bp = base * expMod(exp) * domainM
+      * statusM * formM * variantM * rangeM * ambushM;
+    return pyRound(bp, 2);
+  }
+
+  function computeMeleeBp(weaponBaseV, strHidden, martial, exp,
+    domainM, statusM, formM, variantM, rangeM, ambushM) {
+    if (domainM === undefined) domainM = 1.0; if (statusM === undefined) statusM = 1.0;
+    if (formM === undefined) formM = 1.0; if (variantM === undefined) variantM = 1.0;
+    if (rangeM === undefined) rangeM = 1.0; if (ambushM === undefined) ambushM = 1.0;
+    const bp = (weaponBaseV + strHidden / 2)
+      * (1 + martial / 200) * expMod(exp)
+      * domainM * statusM * formM * variantM * rangeM * ambushM;
+    return pyRound(bp, 2);
+  }
+
+  function computeManaMeleeBp(weaponBaseV, strHidden, intHidden, mpInvested, martial, exp,
+    elementM, proficiencyM, statusM, formM, variantM, rangeM, ambushM) {
+    if (elementM === undefined) elementM = 1.0; if (proficiencyM === undefined) proficiencyM = 1.0;
+    if (statusM === undefined) statusM = 1.0; if (formM === undefined) formM = 1.0;
+    if (variantM === undefined) variantM = 1.0; if (rangeM === undefined) rangeM = 1.0;
+    if (ambushM === undefined) ambushM = 1.0;
+    const bp = (weaponBaseV + strHidden / 2 + intHidden / 2 + mpInvested)
+      * (1 + martial / 200) * expMod(exp)
+      * elementM * proficiencyM * statusM * formM * variantM * rangeM * ambushM;
+    return pyRound(bp, 2);
+  }
+
+  // ── MP_Invested 自動追回差距 ──────────────────────────────
+  function resolveMpInvested(bpFactory, opts) {
+    opts = opts || {};
+    let mp = Math.min(Math.max(opts.initial === undefined ? 1.5 : opts.initial, 1.0), MP_INVESTED_MAX);
+    const opponentBp = opts.opponentBp;
+    const notes = [];
+    let bp = bpFactory(mp);
+    notes.push("初始投入 " + mp.toFixed(1) + " → BP " + bp);
+    while (bp < opponentBp && mp < MP_INVESTED_MAX) {
+      mp = Math.round(Math.min(mp + MP_INVESTED_STEP, MP_INVESTED_MAX) * 10) / 10;
+      bp = bpFactory(mp);
+      notes.push("仍落後 " + (opponentBp - bp).toFixed(2) + " → 加碼至 " + mp.toFixed(1) + " → BP " + bp);
+    }
+    return [mp, bp, notes];
+  }
+
+  // ── 四階判定 ──────────────────────────────────────────────
+  const VERDICT_DECISIVE = "絕對碾壓";
+  const VERDICT_SUPPRESS = "優勢壓制";
+  const VERDICT_STALEMATE = "招式僵持";
+  const VERDICT_FUSION = "結界交疊";
+
+  function decide(atkBp, defBp) {
+    if (atkBp > defBp * 2.0) return VERDICT_DECISIVE;
+    if (atkBp > defBp) return VERDICT_SUPPRESS;
+    return VERDICT_STALEMATE;
+  }
+
+  function computeEvadeBp(agilityHidden, statusM, formM, domainM, ambushM) {
+    if (statusM === undefined) statusM = 1.0; if (formM === undefined) formM = 1.0;
+    if (domainM === undefined) domainM = 1.0; if (ambushM === undefined) ambushM = 1.0;
+    return pyRound(agilityHidden * statusM * formM * domainM * ambushM, 2);
+  }
+
+  function computeGuardBp(constitutionHidden, statusM, formM, domainM, guardBonus, ambushM) {
+    if (statusM === undefined) statusM = 1.0; if (formM === undefined) formM = 1.0;
+    if (domainM === undefined) domainM = 1.0; if (guardBonus === undefined) guardBonus = 0.0;
+    if (ambushM === undefined) ambushM = 1.0;
+    return pyRound(constitutionHidden * statusM * formM * domainM * (1.0 + guardBonus) * ambushM, 2);
+  }
+
+  function decideNonaggressive(atkBp, defBp) {
+    if (atkBp > defBp * 2.0) return "命中重創";
+    if (atkBp > defBp) return "部分命中";
+    if (atkBp >= defBp) return "成功迴避/防禦";
+    return "徹底化解";
+  }
+
+  function decideWithDomain(atkBp, defBp, domainA, domainD, mpInvested) {
+    if (mpInvested === undefined) mpInvested = 0;
+    const bothOpened = domainA > 1.0 && domainD > 1.0;
+    if (!bothOpened) {
+      return [decide(atkBp, defBp), false, pyRound(Math.abs(domainA - domainD), 2)];
+    }
+    let gap = pyRound(Math.abs(domainA - domainD), 2);
+    if (gap >= 0.3) {
+      const originalGap = gap;
+      if (originalGap < 0.6) {
+        let covered = Math.min(domainA, domainD);
+        const needed = 0.3 - gap;
+        let mpNeeded = Math.floor(needed / 0.03) + (needed % 0.03 > 0 ? 1 : 0);
+        mpNeeded = Math.max(0, Math.min(mpNeeded, mpInvested));
+        covered += mpNeeded * 0.03;
+        gap = pyRound(Math.abs(covered - Math.max(domainA, domainD)), 2);
+        if (gap < 0.3) return [VERDICT_FUSION, true, gap];
+      }
+      return [decide(atkBp, defBp), false, gap];
+    }
+    return [VERDICT_FUSION, true, gap];
+  }
+
+  // ── 實戰經驗等級 ──────────────────────────────────────────
+  function expTier(exp) {
+    for (const t of EXP_TIERS) {
+      const lo = t[0], hi = t[1];
+      if (exp >= lo && exp <= hi) {
+        return { name: t[4], range: [lo, hi], exp_mod: [t[2], t[3]], desc: t[5] };
+      }
+    }
+    return { name: "未知", range: [0, 0], exp_mod: [1.0, 1.2], desc: "" };
+  }
+
+  // ── 反派動態難度校準基準 ──────────────────────────────────
+  function hiddenOf(char, stat) {
+    const h = char["stat_" + stat + "_hidden"];
+    if (h !== undefined && h !== null) return num(h);
+    const st = char.stats || {};
+    const rating = st[stat];
+    let raceMod;
+    if (char._race_mods && typeof char._race_mods === "object" && char._race_mods[stat] !== undefined) {
+      raceMod = num(char._race_mods[stat]);
+    } else {
+      raceMod = num(char._race_mod === undefined || char._race_mod === null ? 1.0 : char._race_mod);
+    }
+    return rating ? hiddenScore(rating, raceMod) : 0.0;
+  }
+
+  function ratingForHidden(target, raceMod) {
+    if (raceMod === undefined) raceMod = 1.0;
+    for (let c = 1; c <= 6; c++) {
+      if (c * raceMod >= target) return RATING_REVERSE[c];
+    }
+    return "S";
+  }
+
+  function villainCalibrationBaseline(roster, opts) {
+    opts = opts || {};
+    const ratio = opts.ratio === undefined ? 1.1 : opts.ratio;
+    const raceMods = opts.raceMods || {};
+    const raceMod = opts.raceMod === undefined ? 1.0 : opts.raceMod;
+    const maxHidden = {};
+    let strongestName = "";
+    let strongestScore = -1.0;
+    for (const c of roster) {
+      let score = 0;
+      for (const s of STAT_KEYS) score += hiddenOf(c, s);
+      score += (num(c.max_mp) || 0) / 10;
+      if (score > strongestScore) { strongestScore = score; strongestName = c.name || "未知"; }
+      for (const s of STAT_KEYS) {
+        const h = hiddenOf(c, s);
+        maxHidden[s] = maxHidden[s] === undefined ? h : Math.max(maxHidden[s], h);
+      }
+    }
+    const targets = {};
+    const stats = {};
+    for (const s of STAT_KEYS) {
+      targets[s] = Math.min(maxHidden[s] === undefined ? 0 : maxHidden[s] * ratio, HIDDEN_SCORE_MAX);
+      stats[s] = ratingForHidden(targets[s], raceMods[s] !== undefined ? raceMods[s] : raceMod);
+    }
+    let maxExp = 0, maxMartial = 0, maxMp = 10;
+    for (const c of roster) {
+      maxExp = Math.max(maxExp, num(c.exp) || 0);
+      maxMartial = Math.max(maxMartial, num(c.martial) || 0);
+      maxMp = Math.max(maxMp, num(c.max_mp) || 10);
+    }
+    const rounded = {};
+    for (const s of STAT_KEYS) rounded[s] = pyRound(targets[s], 2);
+    return {
+      stats: stats,
+      exp: Math.min(maxExp + 10, 100),
+      martial: Math.min(maxMartial + 5, 100),
+      max_mp: Math.min(Math.max(maxMp, maxMp + 10), 100),
+      targets: rounded,
+      strongest: strongestName,
+      ratio: ratio,
+    };
+  }
+
+  root.CollideEngine = {
+    pyRound, hiddenScore, weaponBase, resolveWeaponOverride, elementMod,
+    expMod, proficiencyMod, variantSkillBase, domainMod,
+    computeAtkBp, computeDomainBp, computeMeleeBp, computeManaMeleeBp, resolveMpInvested,
+    decide, computeEvadeBp, computeGuardBp, decideNonaggressive, decideWithDomain,
+    expTier, villainCalibrationBaseline, hiddenOf, ratingForHidden,
+    VERDICT_DECISIVE, VERDICT_SUPPRESS, VERDICT_STALEMATE, VERDICT_FUSION,
+    STAT_KEYS, RATING_REVERSE,
+  };
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { CollideEngine: root.CollideEngine };
+  }
+})(typeof globalThis !== "undefined" ? globalThis : this);
+
+const TEST_VECTORS = {"tolerance": 1e-09, "cases": [{"name": "hiddenScore(B,1.0)", "expected": 4.0, "js": "E.hiddenScore('B',1.0)"}, {"name": "hiddenScore(S,1.5)", "expected": 9.0, "js": "E.hiddenScore('S',1.5)"}, {"name": "hiddenScore(上限9.0)", "expected": 9.0, "js": "E.hiddenScore('S',1.5)"}, {"name": "elementMod(水→火)", "expected": 1.2, "js": "E.elementMod('水','火')"}, {"name": "elementMod(火→水)", "expected": 0.8, "js": "E.elementMod('火','水')"}, {"name": "elementMod(未列組合1.0)", "expected": 1.0, "js": "E.elementMod('火','風')"}, {"name": "elementMod(水多弱點:冰/雷/葉)", "expected": [1.2, 1.2, 1.2], "js": "['冰','雷','葉'].map(e=>E.elementMod(e,'水'))"}, {"name": "expMod(50)", "expected": 1.1, "js": "E.expMod(50)"}, {"name": "expMod(0/100)", "expected": [1.0, 1.2], "js": "[E.expMod(0),E.expMod(100)]"}, {"name": "AtkBp 完整", "expected": 30.49, "js": "E.computeAtkBp(7.5, E.hiddenScore('A',1.0), 50, 1.2, 1.25, 1.5, 0.95, 1.3, 1.05, 0.95, 1.0)"}, {"name": "DomainBp 中期覺醒", "expected": 9.16, "js": "E.computeDomainBp(1.2, E.hiddenScore('S',1.0), 55, 1.25)"}, {"name": "DomainBp 未覺醒", "expected": 3.12, "js": "E.computeDomainBp(0.5, E.hiddenScore('C',1.0), 20, 1.0)"}, {"name": "MeleeBp", "expected": 6.32, "js": "E.computeMeleeBp(3.0, E.hiddenScore('B',1.0), 60, 40, 1.0, 0.9)"}, {"name": "ManaMeleeBp", "expected": 9.72, "js": "E.computeManaMeleeBp(3.0, 4.0, 4.0, 1.5, 60, 50, 0.8, 1.0)"}, {"name": "weapon(徒手)", "expected": [1.0, "無武器 → 徒手 → Weapon_Base 1.0"], "js": "E.resolveWeaponOverride('bare', null, '')"}, {"name": "weapon(長劍)", "expected": [3.0, "長劍 → 單手武器 → Weapon_Base 3.0"], "js": "E.resolveWeaponOverride('one_hand', null, '長劍')"}, {"name": "weapon(覆寫5.0)", "expected": [5.0, "管理員覆寫 weapon_base=5.0"], "js": "E.resolveWeaponOverride('heavy', 5.0, '聖劍')"}, {"name": "variantSkillBase([5.0,8.0])", "expected": 5.0, "js": "E.variantSkillBase([5.0,8.0])"}, {"name": "variantSkillBase(空)", "expected": 1.0, "js": "E.variantSkillBase([])"}, {"name": "decide(碾壓)", "expected": "絕對碾壓", "js": "E.decide(25.0,10.0)"}, {"name": "decide(壓制)", "expected": "優勢壓制", "js": "E.decide(15.0,10.0)"}, {"name": "decide(僵持)", "expected": "招式僵持", "js": "E.decide(10.0,10.0)"}, {"name": "EvadeBp", "expected": 6.0, "js": "E.computeEvadeBp(E.hiddenScore('S',1.0))"}, {"name": "GuardBp(+0.3)", "expected": 5.2, "js": "E.computeGuardBp(E.hiddenScore('B',1.0), 1.0, 1.0, 1.0, 0.3)"}, {"name": "decideNonaggressive(命中重創)", "expected": "命中重創", "js": "E.decideNonaggressive(25.0,10.0)"}, {"name": "decideNonaggressive(化解)", "expected": "徹底化解", "js": "E.decideNonaggressive(8.0,10.0)"}, {"name": "decideWithDomain(未開1.0/1.0)", "expected": ["優勢壓制", false, 0.0], "js": "E.decideWithDomain(20.0,10.0,1.0,1.0)"}, {"name": "decideWithDomain(一開1.0/1.4)", "expected": ["優勢壓制", false, 0.4], "js": "E.decideWithDomain(12.0,10.0,1.0,1.4)"}, {"name": "decideWithDomain(融合 gap<0.3)", "expected": ["結界交疊", true, 0.15], "js": "E.decideWithDomain(15.0,10.0,1.4,1.25)"}, {"name": "decideWithDomain(覆蓋 gap>=0.3)", "expected": ["優勢壓制", false, 0.4], "js": "E.decideWithDomain(15.0,10.0,1.5,1.1)"}, {"name": "decideWithDomain(彌補恢復融合)", "expected": ["優勢壓制", false, 0.4], "js": "E.decideWithDomain(15.0,10.0,1.5,1.1,14)"}, {"name": "MP追逐", "expected": [3.0, 14.3, ["初始投入 1.5 → BP 12.16", "仍落後 12.13 → 加碼至 2.0 → BP 12.87", "仍落後 11.41 → 加碼至 2.5 → BP 13.59", "仍落後 10.70 → 加碼至 3.0 → BP 14.3"]], "js": "E.resolveMpInvested(mp=>E.computeManaMeleeBp(3.0,4.0,4.0,mp,60,50),{opponentBp:25.0})"}, {"name": "expTier(10)", "expected": {"name": "學院新星", "range": [0, 20], "exp_mod": [1.0, 1.04], "desc": "準 C 級"}, "js": "E.expTier(10)"}, {"name": "expTier(90)", "expected": {"name": "身經百戰", "range": [81, 100], "exp_mod": [1.16, 1.2], "desc": "戰力天花板"}, "js": "E.expTier(90)"}, {"name": "反派校準基準", "expected": {"stats": {"力量": "A", "敏捷": "S", "智力": "S", "體質": "A", "魅力": "S", "幸運": "A"}, "exp": 50, "martial": 65, "max_mp": 90, "targets": {"力量": 4.4, "敏捷": 5.5, "智力": 6.6, "體質": 4.4, "魅力": 5.5, "幸運": 4.4}, "strongest": "澪", "ratio": 1.1}, "js": "E.villainCalibrationBaseline([{\"name\": \"凌空\", \"stats\": {\"力量\": \"B\", \"敏捷\": \"A\", \"智力\": \"C\", \"體質\": \"B\", \"魅力\": \"D\", \"幸運\": \"E\"}, \"exp\": 25, \"martial\": 60, \"max_mp\": 45}, {\"name\": \"澪\", \"stats\": {\"力量\": \"C\", \"敏捷\": \"B\", \"智力\": \"S\", \"體質\": \"B\", \"魅力\": \"A\", \"幸運\": \"B\"}, \"exp\": 40, \"martial\": 20, \"max_mp\": 80}],{ratio:1.1})"}]};
+</script>
+<script>
+"use strict";
+const E = CollideEngine;
+const PROMPTS = SIM_DATA.PROMPTS;
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const LS_KEY = "collide_sim_db_v1";
+
+// ── 資料庫 ────────────────────────────────────────────────
+function exampleDB(){
+  return { characters: [
+    { id:"c1", name:"澪", race:"神子", race_mod:1.0, race_mods:{力量:1.0,敏捷:1.0,智力:1.0,體質:1.0,魅力:1.0,幸運:1.0},
+      stats:{力量:"C",敏捷:"B",智力:"S",體質:"B",魅力:"A",幸運:"B"},
+      exp:40, martial:20, max_mp:80, weapon:"", weapon_base:null, is_villain:false, is_teacher:false,
+      skills:[
+        {id:"s1", name:"蒼炎流星", ability:"蒼炎", element:"火", power_base:6.5, mp_cost:14, formula:"auto"},
+        {id:"s2", name:"火焰分身", ability:"蒼炎", element:"火", power_base:3.0, mp_cost:8, formula:"auto"},
+      ]},
+    { id:"c2", name:"凌空", race:"劍士", race_mod:1.0, race_mods:{力量:1.0,敏捷:1.0,智力:1.0,體質:1.0,魅力:1.0,幸運:1.0},
+      stats:{力量:"B",敏捷:"A",智力:"C",體質:"B",魅力:"D",幸運:"E"},
+      exp:25, martial:60, max_mp:45, weapon:"長劍", weapon_base:null, is_villain:false, is_teacher:false,
+      skills:[
+        {id:"s3", name:"居合一閃", ability:"劍術", element:"", power_base:4.0, mp_cost:0, formula:"melee"},
+      ]},
+    { id:"c3", name:"羊君", race:"純粹魔力使", race_mod:1.2, race_mods:{力量:1.2,敏捷:1.2,智力:1.2,體質:1.2,魅力:1.2,幸運:1.2},
+      stats:{力量:"E",敏捷:"C",智力:"B",體質:"D",魅力:"C",幸運:"D"},
+      exp:18, martial:10, max_mp:60, weapon:"魔杖", weapon_base:null, is_villain:false, is_teacher:true,
+      skills:[
+        {id:"s4", name:"魔力彈", ability:"魔力操作", element:"純粹魔力", power_base:4.5, mp_cost:9, formula:"auto"},
+      ]},
+    { id:"c4", name:"神月", race:"火魔法使", race_mod:1.0, race_mods:{力量:1.0,敏捷:1.0,智力:1.0,體質:1.0,魅力:1.0,幸運:1.0},
+      stats:{力量:"D",敏捷:"B",智力:"S",體質:"B",魅力:"A",幸運:"C"},
+      exp:40, martial:15, max_mp:85, weapon:"魔杖", weapon_base:null, is_villain:false, is_teacher:false,
+      domains:[{ name:"龍王禁地", type:"封閉式結界", environment:"結界內部為岩石與熔岩環境，並有一隻黑色的龍王" }],
+      skills:[
+        {id:"s5", name:"龍焰吐息", ability:"火之魔法", element:"火", power_base:7.0, mp_cost:14, formula:"auto"},
+        {id:"s6", name:"熔岩焚地", ability:"火之魔法", element:"火", power_base:4.5, mp_cost:10, formula:"auto"},
+        {id:"s7", name:"火龍彈", ability:"火之魔法", element:"火", power_base:3.5, mp_cost:8, formula:"auto"},
+      ]},
+    { id:"c5", name:"甲", race:"水魔法使", race_mod:1.0, race_mods:{力量:1.0,敏捷:1.0,智力:1.0,體質:1.0,魅力:1.0,幸運:1.0},
+      stats:{力量:"D",敏捷:"B",智力:"A",體質:"C",魅力:"D",幸運:"C"},
+      exp:32, martial:20, max_mp:70, weapon:"魔杖", weapon_base:null, is_villain:false, is_teacher:false,
+      domains:[{ name:"噩夢水牢", type:"封閉式結界", environment:"結界內部環境全部都是水，採用內部比較堅固的樣式" }],
+      skills:[
+        {id:"s8", name:"噩夢水牢壓迫", ability:"水之魔法", element:"水", power_base:6.5, mp_cost:13, formula:"auto"},
+        {id:"s9", name:"水彈衝擊", ability:"水之魔法", element:"水", power_base:3.5, mp_cost:7, formula:"auto"},
+        {id:"s10", name:"水之壁", ability:"水之魔法", element:"水", power_base:2.5, mp_cost:5, formula:"auto"},
+      ]},
+  ]};
+}
+function loadDB(){ try { const d = JSON.parse(localStorage.getItem(LS_KEY)); if (d && d.characters) return d; } catch(e){} return exampleDB(); }
+let DB = loadDB();
+function getDB(){ return DB; }
+function setDB(d){ DB = d; saveDB(); renderAll(); }
+function saveDB(){ localStorage.setItem(LS_KEY, JSON.stringify(DB)); }
+function uid(p){ return p + "-" + Math.random().toString(36).slice(2,8); }
+function resetDB(){ DB = exampleDB(); saveDB(); renderAll(); }
+
+// ── 渲染：角色資料 ────────────────────────────────────────
+function renderAll(){
+  renderCharCards(); renderSkillCharSelect(); renderSimSelects(); renderRosterCheck();
+  const m = document.getElementById("build-meta");
+  m.textContent = "來源：" + (BUILD_INFO.sources||[]).join(" / ") + " ｜ 建置於 " + (BUILD_INFO.timestamp||"?");
+}
+function fillRatingSelects(){
+  const opts = SIM_DATA.RATING_ORDER.map(r=>`<option value="${r}">${r}</option>`).join("");
+  SIM_DATA.STAT_KEYS.forEach(k=>{ $("#cf-"+k).innerHTML = opts; });
+  $("#sf-element").innerHTML = SIM_DATA.ELEMENT_LIST.map(e=>`<option value="${e}">${e}</option>`).join("");
+  fillAppHints();
+}
+function appHintsFor(category){
+  const all = [];
+  const cats = SIM_DATA.ABILITY_CATEGORIES || {};
+  const keys = category && cats[category] ? [category] : Object.keys(cats);
+  for (const k of keys) for (const t of (cats[k] || [])) all.push(t);
+  return all;
+}
+function fillAppHints(){
+  const cats = SIM_DATA.ABILITY_CATEGORIES || {};
+  const opts = Object.entries(cats).flatMap(([cat, list]) =>
+    list.map(t => `<option value="${t}">${escapeHtml(cat)}</option>`)).join("");
+  $("#app-hints").innerHTML = opts;
+}
+function charCardsHTML(){
+  return DB.characters.map(c=>{
+    const stats = SIM_DATA.STAT_KEYS.map(k=>`<span class="tag">${k} ${c.stats[k]||"-"}</span>`).join("");
+    const sk = (c.skills||[]).map(s=>`<span class="tag mono">${s.name}(${s.element||"近"})${s.power_base}</span>`).join("");
+    const dom = (c.domains||[]).map(d=>`${d.name}（${d.type||""}：${d.environment}）`).join("；");
+    return `<div class="card" style="margin:8px 0">
+      <div class="row">
+        <b>${c.name}</b><span class="mut">${c.race||""}（mod ${c.race_mod}）</span>
+        ${c.is_villain?'<span class="warn">反派</span>':''}${c.is_teacher?'<span class="mut">教師</span>':''}
+        <span class="spacer"></span>
+        <button onclick="editChar('${c.id}')">編輯</button>
+        <button class="danger" onclick="delChar('${c.id}')">刪除</button>
+      </div>
+      <div style="margin-top:6px">${stats}</div>
+      <div class="mut" style="margin-top:4px">exp ${c.exp} ｜ martial ${c.martial} ｜ max_mp ${c.max_mp} ｜ 武器 ${c.weapon||"徒手"}${c.weapon_base?'（覆寫 '+c.weapon_base+'）':''}</div>
+      <div style="margin-top:6px">招式：${sk||'<span class="mut">無</span>'}</div>
+      <div class="mut" style="margin-top:4px">結界：${dom||'<span class="mut">無</span>'}</div>
+    </div>`;
+  }).join("") || '<div class="mut">尚無角色</div>';
+}
+function renderCharCards(){ $("#char-cards").innerHTML = charCardsHTML(); }
+function renderSkillCharSelect(){
+  const v = $("#skill-char").value;
+  $("#skill-char").innerHTML = '<option value="">請選擇角色</option>' + DB.characters.map(c=>`<option value="${c.id}">${c.name}</option>`).join("");
+  $("#skill-char").value = v; renderSkills();
+}
+function currentSkillChar(){ return DB.characters.find(c=>c.id === $("#skill-char").value) || null; }
+function renderSkills(){
+  const c = currentSkillChar();
+  $("#skill-title").textContent = "招式" + (c ? " — " + c.name : "（先選角色）");
+  const box = $("#skill-form-box");
+  if (!c){ box.classList.add("hidden"); $("#skill-list").innerHTML=""; return; }
+  box.classList.remove("hidden");
+  $("#skill-list").innerHTML = (c.skills||[]).map(s=>
+    `<div class="row" style="margin:4px 0"><span class="tag mono">${s.name}</span>
+     <span class="mut">能力:${s.ability} 元素:${s.element||"近戰"} 基數:${s.power_base} 耗魔:${s.mp_cost} ${s.formula}
+     ${s.application?' 應用:'+escapeHtml(s.application):''}${s.effect?' 效果:'+escapeHtml(s.effect):''}</span>
+     <button onclick="editSkill('${s.id}')">編輯</button>
+     <button class="danger" onclick="delSkill('${s.id}')">刪除</button></div>`).join("") || '<div class="mut">尚無招式</div>';
+  resetSkillForm();
+}
+let editingCharId = null, editingSkillId = null;
+function saveChar(){
+  const name = $("#cf-name").value.trim();
+  if (!name) return alert("請填角色名");
+  const stats = {};
+  SIM_DATA.STAT_KEYS.forEach(k=> stats[k] = $("#cf-"+k).value);
+  const data = {
+    id: editingCharId || uid("c"), name, race: $("#cf-race").value.trim(),
+    race_mod: parseFloat($("#cf-racemod").value)||1.0, stats,
+    exp: parseInt($("#cf-exp").value)||0, martial: parseInt($("#cf-martial").value)||0,
+    max_mp: parseInt($("#cf-maxmp").value)||40,
+    weapon: $("#cf-weapon").value.trim(),
+    weapon_base: $("#cf-wbase").value==="" ? null : parseFloat($("#cf-wbase").value),
+    is_villain: $("#cf-villain").checked, is_teacher: $("#cf-teacher").checked,
+    domains: editingCharId ? (DB.characters.find(c=>c.id===editingCharId)||{}).domains||[] : [],
+    skills: editingCharId ? (DB.characters.find(c=>c.id===editingCharId)||{}).skills||[] : [],
+  };
+  if (editingCharId){
+    const i = DB.characters.findIndex(c=>c.id===editingCharId);
+    data.skills = DB.characters[i].skills; DB.characters[i] = data;
+  } else DB.characters.push(data);
+  saveDB(); renderAll(); cancelEditChar(); renderSkills();
+}
+function editChar(id){
+  const c = DB.characters.find(x=>x.id===id); if(!c) return;
+  editingCharId = id;
+  $("#cf-name").value=c.name; $("#cf-race").value=c.race; $("#cf-racemod").value=c.race_mod;
+  SIM_DATA.STAT_KEYS.forEach(k=> $("#cf-"+k).value = c.stats[k]||"E");
+  $("#cf-exp").value=c.exp; $("#cf-martial").value=c.martial; $("#cf-maxmp").value=c.max_mp;
+  $("#cf-weapon").value=c.weapon||""; $("#cf-wbase").value = c.weapon_base==null?"":c.weapon_base;
+  $("#cf-villain").checked=!!c.is_villain; $("#cf-teacher").checked=!!c.is_teacher;
+  $("#char-form-title").textContent = "編輯角色："+c.name;
+  $("#cf-cancel").classList.remove("hidden");
+  window.scrollTo({top:0, behavior:"smooth"});
+}
+function cancelEditChar(){
+  editingCharId=null; $("#char-form-title").textContent="新增角色"; $("#cf-cancel").classList.add("hidden");
+  ["cf-name","cf-race","cf-exp","cf-martial","cf-maxmp","cf-weapon","cf-wbase"].forEach(id=> $("#"+id).value="");
+  $("#cf-racemod").value=1.0; ["cf-villain","cf-teacher"].forEach(id=> $("#"+id).checked=false);
+}
+function delChar(id){ if(confirm("刪除角色？")){ DB.characters=DB.characters.filter(c=>c.id!==id); saveDB(); renderAll(); } }
+function saveSkill(){
+  const c = currentSkillChar(); if(!c) return;
+  const name = $("#sf-name").value.trim(); if(!name) return alert("請填招式名");
+  const data = { id: editingSkillId||uid("s"), name, ability: $("#sf-ability").value.trim(),
+    element: $("#sf-element").value, power_base: parseFloat($("#sf-power").value)||1.0,
+    mp_cost: parseInt($("#sf-mp").value)||0, formula: $("#sf-formula").value,
+    skill_type: $("#sf-skilltype").value, magic_system: $("#sf-magicsys").value,
+    application: $("#sf-application").value.trim(), effect: $("#sf-effect").value.trim() };
+  if (editingSkillId){ const i=(c.skills||[]).findIndex(s=>s.id===editingSkillId); c.skills[i]=data; }
+  else (c.skills=c.skills||[]).push(data);
+  saveDB(); renderSkills();
+}
+function editSkill(id){ const c=currentSkillChar(); const s=(c.skills||[]).find(x=>x.id===id); if(!s) return;
+  editingSkillId=id; $("#sf-name").value=s.name; $("#sf-ability").value=s.ability; $("#sf-element").value=s.element;
+  $("#sf-power").value=s.power_base; $("#sf-mp").value=s.mp_cost; $("#sf-formula").value=s.formula;
+  $("#sf-skilltype").value=s.skill_type||"個人魔法"; $("#sf-magicsys").value=s.magic_system||"自然系";
+  $("#sf-application").value=s.application||""; $("#sf-effect").value=s.effect||"";
+  $("#sf-cancel").classList.remove("hidden"); }
+function cancelEditSkill(){ editingSkillId=null; $("#sf-cancel").classList.add("hidden");
+  ["sf-name","sf-ability","sf-power","sf-mp","sf-application","sf-effect"].forEach(id=> $("#"+id).value="");
+  $("#sf-element").selectedIndex=0; $("#sf-skilltype").selectedIndex=0; $("#sf-magicsys").selectedIndex=0; }
+function delSkill(id){ const c=currentSkillChar(); c.skills=(c.skills||[]).filter(s=>s.id!==id); saveDB(); renderSkills(); }
+function resetSkillForm(){ cancelEditSkill();
+  $("#sf-name").value=""; $("#sf-ability").value=""; $("#sf-power").value=""; $("#sf-mp").value=""; $("#sf-element").selectedIndex=0; }
+function fillExample(){ resetDB(); renderAll(); }
+
+// ── 自然語言寫入（natural language → 表單）───────────────
+const NL_TEMPLATES = {
+  skill: [
+    "【招式】",
+    "名稱：",
+    "所屬能力（ability，須為已登記能力）：",
+    "招式類型（skill_type：個人魔法 / 通常魔法）：",
+    "魔法體系（magic_system：超能系 / 自然系 / 療癒系 / 跨系融合）：",
+    "元素（element，20 種之一，例：火）：",
+    "威力基數（power_base，1.0~10.0）：",
+    "魔力消耗（mp_cost，1~25）：",
+    "擴展應用分類（application，依所屬能力分類選用，例輔助型→「擴展一：增益己方／隊友」；可自訂）：",
+    "附加狀態效果（effect，無則留空）：",
+  ],
+  character: [
+    "【角色】",
+    "名稱：",
+    "種族：",
+    "種族修正係數（race_mod，可留空）：",
+    "六維（stats，力量/敏捷/智力/體質/魅力/幸運，各 E~S）：",
+    "經驗值（exp，0~100）：",
+    "武藝值（martial，0~100）：",
+    "MaxMP（10~100）：",
+    "武器（weapon，無則留空）：",
+    "武器威力覆寫（weapon_base，2.0~5.0，可留空）：",
+    "是否反派（is_villain，true/false）：",
+    "是否教師（is_teacher，true/false）：",
+  ],
+  ability: [
+    "【能力】",
+    "名稱：",
+    "擁有者（owner，通用可留空）：",
+    "能力分類（category，例：攻擊型/輔助型/防禦型/控制型/召喚型/移動型/治癒型/偵查型/複合型）：",
+    "能力原理（principle）：",
+  ],
+  domain: [
+    "【結界】",
+    "名稱：",
+    "擁有者（owner，通用可留空）：",
+    "結界類型（domain_type）：",
+    "覺醒進度（awakening：未覺醒 / 初期覺醒 / 中期覺醒 / 後期覺醒 / 完全覺醒）：",
+    "精度（precision，0~1.5）：",
+    "結界規則（rules）：",
+    "持續消耗（sustain_cost）：",
+  ],
+};
+const NL_TARGET_LABEL = { skill: "招式", character: "角色", ability: "能力", domain: "結界" };
+function selectedNLTargets(){
+  return ["skill", "character", "ability", "domain"].filter(t => $("#nl-t-" + t).checked);
+}
+function insertNLTemplate(){
+  const targets = selectedNLTargets();
+  if (!targets.length) return alert("請先勾選要寫入的類型");
+  const blocks = targets.map(t => NL_TEMPLATES[t].join("\n")).join("\n\n");
+  const box = $("#nl-raw");
+  box.value = (box.value ? box.value.replace(/\s+$/, "") + "\n\n" : "") + blocks;
+  box.focus();
+  $("#nl-status").textContent = "已插入「" + targets.map(t => NL_TARGET_LABEL[t]).join("、") + "」填表模板：留空的欄位 DeepSeek 會自動補全";
+  $("#nl-status").classList.add("ok");
+}
+function buildNL(){
+  const targets = selectedNLTargets();
+  if (!targets.length) return alert("請先勾選要寫入的類型");
+  const desc = $("#nl-raw").value.trim();
+  if (!desc) return alert("請先填自然語言描述");
+  let full;
+  if (targets.length === 1){
+    const target = targets[0];
+    full = PROMPTS["write_" + target] + "\n\n【自然語言描述】\n" + desc;
+    if (target === "skill") full += "\n\n【備註】若招式屬於某角色，owner 請填該角色名；所屬能力（ability）須為已登記能力。";
+    $("#nl-status").textContent = "已產生「" + NL_TARGET_LABEL[target] + "」寫入提示詞（複製到 DeepSeek）";
+  } else {
+    const specs = targets.map(t =>
+      "── " + NL_TARGET_LABEL[t] + " 欄位規範 ──\n" + PROMPTS["write_" + t]).join("\n\n");
+    full = "請把以下自然語言描述解析成「JSON 陣列」，每個元素是 { type, ... } 物件，type 為 " +
+      targets.map(t => `"${t}"`).join(" / ") + "，並帶對應類型的欄位。\n\n" + specs +
+      "\n\n【自然語言描述】\n" + desc +
+      "\n\n【輸出格式】只輸出 JSON 陣列，例：[{\"type\":\"skill\",\"name\":\"...\",...},{\"type\":\"character\",\"name\":\"...\",...}]。若描述只含某一類型，也請輸出單元素陣列。";
+    $("#nl-status").textContent = "已產生「" + targets.map(t => NL_TARGET_LABEL[t]).join("、") + "」批次寫入提示詞（複製到 DeepSeek）";
+  }
+  $("#nl-prompt").textContent = full; $("#nl-prompt").classList.remove("hidden");
+  $("#nl-status").classList.add("ok");
+}
+function nlValidate(parsed, target){
+  const errs = [];
+  const num = (v, lo, hi, label) => { if (typeof v === "number" && !(lo <= v && v <= hi)) errs.push(label + " " + v + " 超出 " + lo + "~" + hi); };
+  if (target === "character"){
+    if (!parsed.name || typeof parsed.name !== "string") errs.push("缺 name");
+    const s = parsed.stats || {};
+    for (const k of SIM_DATA.STAT_KEYS){ if (s[k] && SIM_DATA.RATING_ORDER.indexOf(s[k]) === -1) errs.push("六維 " + k + " 評級 " + s[k] + " 須為 E/D/C/B/A/S"); }
+    num(parsed.max_mp, 10, 100, "max_mp"); num(parsed.martial, 0, 100, "martial"); num(parsed.exp, 0, 100, "exp");
+    if (parsed.special_forms) for (const k of Object.keys(parsed.special_forms)){ const v = parsed.special_forms[k]; if (!(1.1 <= v && v <= 1.5)) errs.push("special_forms." + k + " " + v + " 須在 1.1~1.5"); }
+    if (parsed.weapon_base != null && !(2.0 <= parsed.weapon_base && parsed.weapon_base <= 5.0)) errs.push("weapon_base " + parsed.weapon_base + " 須在 2.0~5.0");
+    if (parsed.dynamic_difficulty && !((parsed.calibrate_roster || []).length)) errs.push("dynamic_difficulty=true 時 calibrate_roster 不可為空");
+  } else if (target === "skill"){
+    if (!parsed.name) errs.push("缺 name");
+    if (!parsed.application) errs.push("application 不可為空");
+    if (parsed.skill_type && ["個人魔法","通常魔法"].indexOf(parsed.skill_type) === -1) errs.push("skill_type 須為 個人魔法/通常魔法");
+    if (parsed.magic_system && ["超能系","自然系","療癒系","跨系融合"].indexOf(parsed.magic_system) === -1) errs.push("magic_system 選項不符");
+    num(parsed.mp_cost, 1, 25, "mp_cost"); num(parsed.power_base, 1.0, 10.0, "power_base");
+  } else if (target === "domain"){
+    if (!parsed.name) errs.push("缺 name");
+    if (parsed.awakening && ["未覺醒","初期覺醒","中期覺醒","後期覺醒","完全覺醒"].indexOf(parsed.awakening) === -1) errs.push("awakening 選項不符");
+    num(parsed.precision, 0, 1.5, "precision");
+  } else if (target === "ability"){
+    if (!parsed.name) errs.push("缺 name");
+    if (!parsed.principle) errs.push("principle 不可為空（能力必備原理）");
+    if (parsed.category && !SIM_DATA.ABILITY_CATEGORIES[parsed.category]) errs.push("category「" + parsed.category + "」不在建議分類（可自訂或改用複合型）");
+  }
+  return errs;
+}
+function fillSkillForm(p, ownerName){
+  const c = ownerName ? DB.characters.find(x => x.name === ownerName) : currentSkillChar();
+  if (!c) return false;
+  if (ownerName){ $("#skill-char").value = c.id; renderSkills(); }
+  $("#sf-name").value = p.name || ""; $("#sf-ability").value = p.ability || "";
+  $("#sf-skilltype").value = p.skill_type || "個人魔法";
+  $("#sf-magicsys").value = p.magic_system || "自然系";
+  $("#sf-application").value = p.application || ""; $("#sf-effect").value = p.effect || "";
+  $("#sf-power").value = p.power_base != null ? p.power_base : "";
+  $("#sf-mp").value = p.mp_cost != null ? p.mp_cost : "";
+  return c;
+}
+function fillCharForm(p){
+  editingCharId = null; $("#cf-cancel").classList.add("hidden"); $("#char-form-title").textContent = "新增角色";
+  $("#cf-name").value = p.name || ""; $("#cf-race").value = p.race || "";
+  $("#cf-racemod").value = p.race_mod != null ? p.race_mod : 1.0;
+  const s = p.stats || {};
+  SIM_DATA.STAT_KEYS.forEach(k=>{ const v = s[k]; if (v) $("#cf-"+k).value = v; });
+  $("#cf-exp").value = p.exp != null ? p.exp : 0;
+  $("#cf-martial").value = p.martial != null ? p.martial : 0;
+  $("#cf-maxmp").value = p.max_mp != null ? p.max_mp : 40;
+  $("#cf-weapon").value = p.weapon || "";
+  $("#cf-wbase").value = p.weapon_base == null ? "" : p.weapon_base;
+  $("#cf-villain").checked = !!p.is_villain; $("#cf-teacher").checked = !!p.is_teacher;
+}
+function parseNLEntry(entry, singleTarget){
+  const type = entry.type || singleTarget;
+  if (!type) return { type: null, errors: ["缺少 type 欄位（character/ability/skill/domain）"], p: entry };
+  const errors = nlValidate(entry, type);
+  return { type, errors, p: entry };
+}
+function saveNLCharacter(p){
+  let c = DB.characters.find(x => x.name === p.name);
+  if (!c){ c = { id: uid("c"), name: p.name, skills: [], domains: [] }; DB.characters.push(c); }
+  c.race = p.race || ""; c.race_mod = p.race_mod != null ? p.race_mod : 1.0;
+  c.stats = (p.stats && Object.keys(p.stats).length) ? p.stats : (c.stats || {});
+  c.exp = p.exp != null ? p.exp : 0; c.martial = p.martial != null ? p.martial : 0;
+  c.max_mp = p.max_mp != null ? p.max_mp : 40;
+  c.weapon = p.weapon || ""; c.weapon_base = p.weapon_base == null ? null : p.weapon_base;
+  c.is_villain = !!p.is_villain; c.is_teacher = !!p.is_teacher;
+  c.affiliation = p.affiliation || c.affiliation || "";
+  c.special_tags = p.special_tags || c.special_tags || [];
+  return c;
+}
+function saveNLSkill(p, ownerName){
+  const owner = ownerName || (typeof p.owner === "string" && p.owner.trim() ? p.owner.trim() : null);
+  const c = owner ? DB.characters.find(x => x.name === owner) : currentSkillChar();
+  if (!c) return null;
+  c.skills = c.skills || [];
+  let s = c.skills.find(x => x.name === p.name);
+  const data = {
+    id: s ? s.id : uid("s"), name: p.name, ability: p.ability || "",
+    element: p.element || "", power_base: p.power_base != null ? p.power_base : 1.0,
+    mp_cost: p.mp_cost != null ? p.mp_cost : 0, formula: p.formula || "auto",
+    skill_type: p.skill_type || "個人魔法", magic_system: p.magic_system || "自然系",
+    application: p.application || "", effect: p.effect || "",
+  };
+  if (s){ const i = c.skills.indexOf(s); c.skills[i] = data; }
+  else c.skills.push(data);
+  return c;
+}
+function saveNLDomain(p, ownerName){
+  const owner = ownerName || (typeof p.owner === "string" && p.owner.trim() ? p.owner.trim() : null);
+  const c = owner ? DB.characters.find(x => x.name === owner) : null;
+  if (!c) return null;
+  c.domains = c.domains || [];
+  let d = c.domains.find(x => x.name === p.name);
+  const data = {
+    name: p.name, type: p.domain_type || p.type || "",
+    environment: p.rule_environment || p.environment || "",
+    awakening: p.awakening || "", precision: p.precision != null ? p.precision : null,
+    rule_self: p.rule_self || "", rule_enemy: p.rule_enemy || "",
+    cooldown: p.cooldown || "", sustain_mp: p.sustain_mp != null ? p.sustain_mp : null,
+  };
+  if (d){ const i = c.domains.indexOf(d); c.domains[i] = data; }
+  else c.domains.push(data);
+  return c;
+}
+function parseNL(){
+  try {
+    parseNLInner();
+  } catch (e) {
+    $("#nl-errors").textContent = "❌ 解析時發生錯誤：" + (e && e.message ? e.message : String(e));
+    console.error("[parseNL]", e);
+  }
+}
+function parseNLInner(){
+  const raw = $("#nl-json").value;
+  const parsed = tryParse(raw);
+  if (!parsed) return;
+  const singleTargets = selectedNLTargets();
+  const singleTarget = singleTargets.length === 1 ? singleTargets[0] : null;
+  let entries;
+  if (Array.isArray(parsed)) entries = parsed;
+  else if (parsed && typeof parsed === "object") entries = [parsed];
+  else { $("#nl-errors").textContent = "❌ JSON 必須是物件或陣列"; return; }
+  const items = entries.map(e => parseNLEntry(e || {}, singleTarget));
+  const allErrs = [];
+  for (const it of items) for (const e of it.errors) allErrs.push((it.type ? NL_TARGET_LABEL[it.type] + "：" : "") + e);
+  if (allErrs.length){ $("#nl-errors").textContent = "❌ " + allErrs.join("；"); $("#nl-status").textContent = ""; return; }
+  $("#nl-errors").textContent = "";
+  const autosave = $("#nl-autosave").checked;
+  const msgs = [];
+  let scrollTop = false;
+  const savedCount = { character: 0, skill: 0, domain: 0 };
+  if (autosave){
+    const chars = items.filter(it => it.type === "character");
+    const others = items.filter(it => it.type !== "character");
+    for (const it of chars) saveNLCharacter(it.p);
+    for (const it of others){
+      const p = it.p;
+      if (it.type === "skill"){
+        const c = saveNLSkill(p);
+        if (!c){ allErrs.push("招式「" + (p.name||"") + "」找不到所屬角色（owner 需為已登記角色，或先在「招式」區選角色）"); continue; }
+        savedCount.skill++;
+      } else if (it.type === "domain"){
+        const c = saveNLDomain(p);
+        if (!c){ allErrs.push("結界「" + (p.name||"") + "」找不到所屬角色（owner 需為已登記角色）"); continue; }
+        savedCount.domain++;
+      }
+    }
+    saveDB();
+    for (const it of chars) savedCount.character++;
+    const parts = [];
+    if (savedCount.character) parts.push("角色 " + savedCount.character + " 筆");
+    if (savedCount.skill) parts.push("招式 " + savedCount.skill + " 筆");
+    if (savedCount.domain) parts.push("結界 " + savedCount.domain + " 筆");
+    if (parts.length) msgs.push("已寫入角色資料：" + parts.join("、"));
+    renderAll();
+    renderSkills();
+  }
+  if (allErrs.length){ $("#nl-errors").textContent = "❌ " + allErrs.join("；"); return; }
+  const lastSkill = items.filter(it => it.type === "skill").pop();
+  const lastChar = items.filter(it => it.type === "character").pop();
+  if (lastSkill){
+    const c = fillSkillForm(lastSkill.p, typeof lastSkill.p.owner === "string" && lastSkill.p.owner.trim() ? lastSkill.p.owner.trim() : null);
+    if (!c){ allErrs.push("招式「" + (lastSkill.p.name||"") + "」找不到所屬角色"); }
+    else {
+      let m = "已填入「" + c.name + "」的招式表單：" + lastSkill.p.name;
+      if (lastSkill.p.element){ const el = $("#sf-element"); el.value = lastSkill.p.element; if (el.value !== lastSkill.p.element) m += "　⚠️ 元素「" + lastSkill.p.element + "」不在元素表，請手動選"; }
+      msgs.push(m); scrollTop = true;
+    }
+  }
+  if (lastChar){ fillCharForm(lastChar.p); msgs.push("已填入角色表單（" + lastChar.p.name + "）"); scrollTop = true; }
+  for (const it of items){
+    if (it.type === "ability") msgs.push("能力「" + (it.p.name||"") + "」結構已驗證（模擬器無能力表單，可用 /writeability 寫入資料庫）");
+    else if (it.type === "domain" && !savedCount.domain) msgs.push("結界「" + (it.p.name||"") + "」結構已驗證（可用 /writedomain 寫入資料庫）");
+  }
+  if (allErrs.length){ $("#nl-errors").textContent = "❌ " + allErrs.join("；"); return; }
+  const notes = [];
+  for (const it of items){ const nx = it.p && it.p._errors; if (Array.isArray(nx)) for (const n of nx) notes.push(n); }
+  let msg = "✅ 驗證通過：" + (msgs.length ? msgs.join("；") : "結構有效");
+  if (notes.length) msg += "　⚠️ 附註：" + notes.join("；");
+  $("#nl-status").textContent = msg; $("#nl-status").classList.add("ok");
+  if (scrollTop) window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+// ── Phase A 首次出現招式偵測 ──────────────────────────────
+function jsStr(s){ return String(s).replace(/'/g, "\\'"); }
+function detectNewSkills(){
+  const p = phase.A ? phase.A.json : null;
+  if (!p) return;
+  const unknowns = [];
+  for (const slot of ["attacker", "defender"]){
+    const cand = p[slot + "_candidate"];
+    if (!cand || !cand.char || !cand.skill) continue;
+    const char = DB.characters.find(x => x.name === cand.char);
+    const known = char && (char.skills || []).some(s => s.name === cand.skill);
+    if (!known) unknowns.push({ char: cand.char, skill: cand.skill });
+  }
+  if (!unknowns.length) return;
+  const btns = unknowns.map(u =>
+    `<button onclick="registerNewSkill('${jsStr(u.char)}','${jsStr(u.skill)}')">登記「${escapeHtml(u.skill)}」</button>`).join(" ");
+  $("#pa-errors").innerHTML = "⚠️ 偵測到首次出現的招式：" +
+    unknowns.map(u => escapeHtml(u.skill) + "（" + escapeHtml(u.char) + "）").join("、") +
+    "。<br>按「登記」預填招式表單 → 用上方自然語言寫入或手動補齊 → 儲存 → 重置後即可用該招式對撞。<br>" + btns;
+}
+function registerNewSkill(charName, skillName){
+  const char = DB.characters.find(x => x.name === charName);
+  if (!char) return alert("角色「" + charName + "」不在清單，請先到「新增角色」建立");
+  $("#skill-char").value = char.id;
+  renderSkills();
+  $("#sf-name").value = skillName;
+  const box = document.getElementById("skill-form-box");
+  box.classList.remove("hidden");
+  box.scrollIntoView({ behavior: "smooth" });
+}
+
+// ── 對撞模擬：選單 ────────────────────────────────────────
+const sim = { charA:null, charB:null, skillA:null, skillB:null, range:"近身（5 公尺內）", domA:"0", domB:"0", mpchase:true, thread:"" };
+const phase = { A:null, B:null, C:null };
+
+function renderSimSelects(){
+  const opts = '<option value="">請選擇</option>' + DB.characters.map(c=>`<option value="${c.id}">${c.name}</option>`).join("");
+  $("#sim-charA").innerHTML = opts; $("#sim-charB").innerHTML = opts;
+  syncSkillSelects();
+}
+function getChar(id){ return DB.characters.find(c=>c.id===id)||null; }
+function syncSkillSelects(){
+  const a = getChar($("#sim-charA").value), b = getChar($("#sim-charB").value);
+  const skOpts = c => '<option value="">（未選招式）</option>' + (c?(c.skills||[]).map(s=>`<option value="${s.id}">${s.name}</option>`).join(""):"");
+  const ava = $("#sim-skillA").value, avb = $("#sim-skillB").value;
+  $("#sim-skillA").innerHTML = skOpts(a); $("#sim-skillB").innerHTML = skOpts(b);
+  $("#sim-skillA").value = ava; $("#sim-skillB").value = avb;
+}
+function readSim(){
+  sim.charA = getChar($("#sim-charA").value); sim.charB = getChar($("#sim-charB").value);
+  sim.skillA = (sim.charA?(sim.charA.skills||[]):[]).find(s=>s.id===$("#sim-skillA").value)||null;
+  sim.skillB = (sim.charB?(sim.charB.skills||[]):[]).find(s=>s.id===$("#sim-skillB").value)||null;
+  sim.range = $("#sim-range").value; sim.domA = $("#sim-domA").value; sim.domB = $("#sim-domB").value;
+  sim.mpchase = $("#sim-mpchase").value==="1"; sim.thread = $("#sim-thread").value.trim();
+  return sim;
+}
+function hiddenOf(c, stat){ return E.hiddenOf({stats:c.stats, _race_mod:c.race_mod}, stat); }
+function charBlock(c, withHidden){
+  const stats = SIM_DATA.STAT_KEYS.map(k=> withHidden ? `${k} ${c.stats[k]||"?"}(${hiddenOf(c,k)})` : `${k} ${c.stats[k]||"?"}`).join(" / ");
+  const lines = ["── " + c.name + " ──", "種族：" + (c.race||"") + "（種族修正 " + c.race_mod + "）", "六維：" + stats,
+    "exp " + c.exp + " ｜ martial " + c.martial + " ｜ max_mp " + c.max_mp + " ｜ 武器 " + (c.weapon||"徒手") + (c.weapon_base?"（weapon_base 覆寫 "+c.weapon_base+"）":"")];
+  if (c.is_villain) lines.push("（反派 is_villain = true：未設動作時由 AI 預設）");
+  lines.push("招式：");
+  (c.skills||[]).forEach(s=> lines.push("- " + s.name + "（能力：" + s.ability + "｜元素：" + (s.element||"無/近戰") + "｜威力基數：" + s.power_base + "｜魔力消耗：" + s.mp_cost + "）"));
+  if ((c.domains||[]).length){
+    lines.push("結界：");
+    (c.domains||[]).forEach(d=> lines.push("- " + d.name + "（" + (d.type||"") + "）：" + d.environment));
+  }
+  return lines.join("\n");
+}
+
+// ── Phase A ───────────────────────────────────────────────
+function buildPhaseA(){
+  readSim();
+  if (!sim.charA || !sim.charB) return alert("請選擇角色 A 與角色 B");
+  const user = "# 對撞戰局分析（Phase A）\n\n【討論串內容】\n" + (sim.thread||"（未填討論串，請補上情境描述）") + "\n\n【角色資料】\n" + charBlock(sim.charA,false) + "\n\n" + charBlock(sim.charB,false);
+  const full = "【系統提示詞】\n" + PROMPTS.phase_a + "\n\n【使用者訊息】\n" + user;
+  $("#pa-prompt").textContent = full; $("#pa-prompt").classList.remove("hidden");
+  $("#pa-status").textContent = "已產生（與正式版相同）";
+  $("#pa-status").classList.add("ok");
+}
+function parsePhaseA(){ const raw = $("#pa-raw").value; const parsed = tryParseShape(raw, "A"); if(!parsed) return;
+  phase.A = { raw, json: parsed }; showEdit("pa"); $("#pa-status").textContent = "Phase A 已儲存（可繼續編輯）";
+  detectNewSkills(); }
+function reparsePhaseA(){ const v = tryParseShape($("#pa-json").value, "A"); if(!v) return; phase.A.json = v; phase.A.raw=$("#pa-json").value;
+  $("#pa-status").textContent = "Phase A 已更新"; }
+function showEdit(tag){ const KEY = { pa:"A", pb:"B", pc:"C" }[tag]; $("#"+tag+"-detail").classList.remove("hidden"); $("#"+tag+"-json").value = JSON.stringify(phase[KEY].json, null, 2); }
+
+// ── Phase B ───────────────────────────────────────────────
+function skillBaseInfo(c, skill){
+  const skills = c.skills||[];
+  const hit = skill ? skills.find(s=>s.name===skill.name) : null;
+  if (hit) return { base: Number(hit.power_base), note: "已登記招式「" + hit.name + "」power_base " + hit.power_base, variant:false };
+  if (skill && skills.length){
+    const bases = skills.map(s=>Number(s.power_base)); const base = E.variantSkillBase(bases);
+    return { base, note: "未登記招式「" + skill.name + "」→ 合理變體規則：該能力最低 power_base " + base + "（Variant_Mod 1.05）", variant:true };
+  }
+  return { base: 1.0, note: "未登記且無既有招式 → 普通攻擊（Melee_BP）", variant:false };
+}
+function domainInfo(c, name){
+  const doms = c.domains||[];
+  const hit = doms.find(d=>d.name===name);
+  if (hit) return { domain: hit, note: "已登記結界「" + hit.name + "」：覺醒 " + (hit.awakening||"未登記") + " → Domain_Mod " + E.domainMod(hit.awakening) + "，精度 " + (hit.precision!=null?hit.precision:1.0) };
+  return { domain: { name, awakening:"中期覺醒", precision:1.0 }, note: "結界「" + name + "」未登記，以覺醒「中期覺醒」+ 精度 1.0 兜底（請管理員補充）" };
+}
+function actionTypeFor(sideKey){
+  const p = phase.A ? phase.A.json : null;
+  if (!p) return "skill";
+  const key = (sideKey==="A"||sideKey==="attacker") ? "attacker" : (sideKey==="B"||sideKey==="defender") ? "defender" : sideKey;
+  const cand = p[key+"_candidate"];
+  return (cand && cand.action_type) || "skill";
+}
+function mechRefs(){
+  const A = sim.charA, B = sim.charB, sA = sim.skillA, sB = sim.skillB;
+  const refs = [];
+  const wA = E.resolveWeaponOverride("one_hand", A.weapon_base, A.weapon), wB = E.resolveWeaponOverride("one_hand", B.weapon_base, B.weapon);
+  refs.push("Weapon_Base：A(" + A.name + ") = " + wA[0] + "（" + wA[1] + "）");
+  refs.push("Weapon_Base：B(" + B.name + ") = " + wB[0] + "（" + wB[1] + "）");
+  refs.push("Exp_Mod：A " + E.expMod(A.exp).toFixed(3) + " ｜ B " + E.expMod(B.exp).toFixed(3));
+  if (sA && sB){
+    refs.push("Element_Mod：A(" + (sA.element||"無") + ") → B(" + (sB.element||"無") + ") = " + E.elementMod(sA.element, sB.element));
+    refs.push("Element_Mod：B(" + (sB.element||"無") + ") → A(" + (sA.element||"無") + ") = " + E.elementMod(sB.element, sA.element));
+  }
+  const tA = actionTypeFor("attacker"), tB = actionTypeFor("defender");
+  if (tA === "domain" || tB === "domain"){
+    const candA = phase.A.json.attacker_candidate, candB = phase.A.json.defender_candidate;
+    const dA = domainInfo(A, (candA&&candA.skill)||""), dB = domainInfo(B, (candB&&candB.skill)||"");
+    refs.push("動作型別：A(" + A.name + ") = " + tA + (tA==="domain"?"（結界 " + dA.note + "）":"") + "；B(" + B.name + ") = " + tB + (tB==="domain"?"（結界 " + dB.note + "）":""));
+    if (tA==="domain"){ const b = E.computeDomainBp(dA.domain.precision!=null?dA.domain.precision:1.0, hiddenOf(A,"智力"), A.exp, E.domainMod(dA.domain.awakening), 1.0,1.0,1.0,1.0,1.0); refs.push("A Domain_BP（機械）=" + b + "　" + dA.note); }
+    if (tB==="domain"){ const b = E.computeDomainBp(dB.domain.precision!=null?dB.domain.precision:1.0, hiddenOf(B,"智力"), B.exp, E.domainMod(dB.domain.awakening), 1.0,1.0,1.0,1.0,1.0); refs.push("B Domain_BP（機械）=" + b + "　" + dB.note); }
+  } else {
+    const ba = skillBaseInfo(A, sA), bb = skillBaseInfo(B, sB);
+    refs.push("Skill_Base 解析：A → " + ba.note);
+    refs.push("Skill_Base 解析：B → " + bb.note);
+  }
+  return refs.join("\n");
+}
+function buildPhaseB(){
+  readSim();
+  if (!phase.A) return alert("請先完成 Phase A（解析並儲存）");
+  const A = sim.charA, B = sim.charB, sA = sim.skillA, sB = sim.skillB;
+  const user = "# 對撞計算資料（Phase B）\n\n【角色資料】\n" + charBlock(A,true) + "\n\n" + charBlock(B,true) +
+    "\n\n【Phase A 判定結果】\n" + JSON.stringify(phase.A.json, null, 2) +
+    "\n\n【機械參照（引擎已計算，直接採用）】\n" + mechRefs() +
+    "\n\n請依公式計算雙方最終威力（Atk_BP / Melee_BP / ManaMelee_BP）、攻守與四階判定，輸出 JSON。";
+  const full = "【系統提示詞】\n" + PROMPTS.phase_b + "\n\n【使用者訊息】\n" + user;
+  $("#pb-prompt").textContent = full; $("#pb-prompt").classList.remove("hidden");
+  $("#pb-status").textContent = "已產生（含 Phase A 結果與機械參照）"; $("#pb-status").classList.add("ok");
+}
+function parsePhaseB(){ const raw = $("#pb-raw").value; const parsed = tryParseShape(raw, "B"); if(!parsed) return;
+  phase.B = { raw, json: parsed }; showEdit("pb"); $("#pb-status").textContent = "Phase B 已儲存";
+  renderPhaseBResult(parsed); }
+function reparsePhaseB(){ const v = tryParseShape($("#pb-json").value, "B"); if(!v) return; phase.B.json = v; phase.B.raw=$("#pb-json").value; $("#pb-status").textContent = "Phase B 已更新"; renderPhaseBResult(v); }
+
+// 玩家可讀的結果＋預估結果（判斷計算靠不靠譜）
+function renderPhaseBResult(b){
+  const r = b.result || {};
+  const a = b.computation && b.computation.attacker, d = b.computation && b.computation.defender;
+  if (!r.verdict && !r.projection && !r.summary) return;
+  let h = '<div class="result" style="margin:10px 0;padding:10px 12px;background:#f7f5ef;border:1px solid #e3dcc9;border-radius:6px">';
+  h += '<b>對撞結果：</b>' + escapeHtml(r.verdict || b.verdict || "") + '<br>';
+  if (b.domain_fusion){
+    const dov = b.domain_override || {};
+    h += '<div class="warn" style="margin:4px 0;padding:4px 8px;background:#fffbe6;border:1px solid #ffe58f;border-radius:4px">';
+    h += '<b>結界交疊（融合）</b>';
+    if (dov.effective_gap != null) h += '　Domain_Mod 差距：' + dov.effective_gap;
+    if (dov.mp_invested) h += '　魔力彌補：' + dov.mp_invested;
+    h += '</div>';
+  } else if (b.domain_override && b.domain_override.applied){
+    h += '<div class="warn" style="margin:4px 0;padding:4px 8px;background:#fff1f0;border:1px solid #ffccc7;border-radius:4px">';
+    h += '<b>結界覆蓋</b>（差距 ' + (b.domain_override.effective_gap||"?") + ' ≥ 0.3）';
+    if (b.domain_override.mp_invested) h += '　被覆蓋方魔力彌補：' + b.domain_override.mp_invested;
+    h += '</div>';
+  }
+  if (r.summary) h += '<b>摘要：</b>' + escapeHtml(r.summary) + '<br>';
+  if (a && d) h += '<div class="mono" style="margin:6px 0">' + escapeHtml(a.char) + '（BP ' + a.bp + '） vs ' + escapeHtml(d.char) + '（BP ' + d.bp + '）</div>';
+  if (r.projection) h += '<b>預估結果：</b>' + escapeHtml(r.projection) + '<br>';
+  if (r.reason) h += '<b>判定理由：</b><span class="mut">' + escapeHtml(r.reason) + '</span>';
+  h += '</div>';
+  $("#pb-verify").innerHTML = h + $("#pb-verify").innerHTML;
+}
+
+// ── 機械驗算（JS 引擎）────────────────────────────────────
+function domainM(v){ if (!v || v==="0" || v==="未覺醒") return 1.0; return E.domainMod(v); }
+function computeSide(sideKey){
+  const isA = sideKey==="A";
+  const c = isA ? sim.charA : sim.charB;
+  const sk = isA ? sim.skillA : sim.skillB;
+  const other = isA ? sim.skillB : sim.skillA;
+  const p = phase.A.json;
+  const intent = (p.action_intents&&p.action_intents[sideKey])||"attack";
+  const statusM = (p.status&&p.status[sideKey]&&p.status[sideKey].status_mod)||1.0;
+  const formM = (p.form_mods&&p.form_mods[sideKey])||1.0;
+  const variantM = (p.variant_mods&&p.variant_mods[sideKey])||1.0;
+  const rangeM = (p.distance&&p.distance.range_mod&&p.distance.range_mod[sideKey])||1.0;
+  const ambush = (p.ambush&&p.ambush.active&&p.ambush.target===c.name) ? 0.8 : 1.0;
+  const dom = isA ? domainM(sim.domA) : domainM(sim.domB);
+  const h = s => hiddenOf(c, s);
+  if (intent==="evade") return { side:sideKey, intent, bp: E.computeEvadeBp(h("敏捷"), statusM, formM, dom, ambush) };
+  if (intent==="guard"){
+    const gb = (p.guard_bonus&&p.guard_bonus[sideKey])||0;
+    return { side:sideKey, intent, bp: E.computeGuardBp(h("體質"), statusM, formM, dom, gb, ambush) };
+  }
+  const actionType = actionTypeFor(sideKey);
+  if (actionType === "domain"){
+    const key = sideKey==="A" ? "attacker" : "defender";
+    const cand = p[key+"_candidate"];
+    const dname = (cand && cand.skill) || (sk?sk.name:"");
+    const dinfo = domainInfo(c, dname);
+    const domM = E.domainMod(dinfo.domain.awakening);
+    const precision = dinfo.domain.precision != null ? dinfo.domain.precision : 1.0;
+    const bp = E.computeDomainBp(precision, h("智力"), c.exp, domM, statusM, formM, variantM, rangeM, ambush);
+    return { side:sideKey, intent, kind:"domain", bp, sbi:{ note:dinfo.note }, domain:{ name:dname, domain_mod:domM, precision }, actionType };
+  }
+  const sbi = skillBaseInfo(c, sk);
+  const formula = sk ? (sk.formula||"auto") : "melee";
+  const wb = E.resolveWeaponOverride("one_hand", c.weapon_base, c.weapon)[0];
+  let bp, kind;
+  if (formula==="melee" || (formula==="auto" && !(sk&&sk.element))){
+    bp = E.computeMeleeBp(wb, h("力量"), c.martial, c.exp, dom, statusM, formM, variantM, ambush); kind="melee";
+  } else if (formula==="manamelee"){
+    bp = E.computeManaMeleeBp(wb, h("力量"), h("智力"), 1.5, c.martial, c.exp,
+      other&&sk&&other.element?E.elementMod(sk.element,other.element):1.0, 1.0, statusM, formM, variantM, rangeM, ambush); kind="manamelee";
+  } else {
+    const elemM = (sk&&other&&other.element) ? E.elementMod(sk.element, other.element) : 1.0;
+    bp = E.computeAtkBp(sbi.base, h("智力"), c.exp, elemM, dom, 1.0, statusM, formM, variantM, rangeM, ambush); kind="magic";
+  }
+  return { side:sideKey, intent, kind, bp, sbi, formula };
+}
+function mechanicalVerify(){
+  readSim();
+  if (!phase.A) return alert("請先完成 Phase A");
+  if (!sim.charA || !sim.charB) return alert("請選擇角色");
+  const rA = computeSide("A"), rB = computeSide("B");
+  let rows = "";
+  const each = [rA, rB];
+  rows += each.map(r=>{
+    const c = r.side==="A"?sim.charA:sim.charB;
+    const sk = r.side==="A"?sim.skillA:sim.skillB;
+    return `<tr><td>${r.side}（${c.name}）</td><td>${r.intent}</td><td>${r.kind||"-"}</td>
+      <td>${(r.domain&&r.domain.name)||(sk?sk.name:"（無招式）")}</td><td class="mono">${r.bp}</td>
+      <td class="mut">${r.sbi?r.sbi.note:""}</td></tr>`;
+  }).join("");
+  let verdict = "";
+  if (rA.intent==="attack" && rB.intent==="attack"){
+    if (rA.kind==="domain" && rB.kind==="domain"){
+      const domA = rA.domain.domain_mod, domB = rB.domain.domain_mod;
+      const gap = Math.abs(domA-domB);
+      if (gap < 0.3){ verdict = "結界交疊（融合，Domain_Mod 差距 " + gap.toFixed(2) + " < 0.3）　" + rA.domain.name + " vs " + rB.domain.name; }
+      else { verdict = "結界覆蓋（差距 " + gap.toFixed(2) + " ≥ 0.3）：Domain_Mod 較高方「" + (domA>domB?sim.charA.name:sim.charB.name) + "」覆蓋對方；可消耗魔力彌補"; }
+    } else {
+      const domA = domainM(sim.domA), domB = domainM(sim.domB);
+      if (domA>1.0 && domB>1.0 && Math.abs(domA-domB)<0.3){ verdict = "結界交疊（融合，差距 " + Math.abs(domA-domB).toFixed(2) + " < 0.3）"; }
+      else {
+        const atk = rA.bp>=rB.bp ? rA : rB, def = rA.bp>=rB.bp ? rB : rA;
+        verdict = "攻擊方 " + (atk.side==="A"?sim.charA.name:sim.charB.name) + "（BP " + atk.bp + "） vs " + (def.side==="A"?sim.charA.name:sim.charB.name) + "（BP " + def.bp + "）→ " + E.decide(atk.bp, def.bp);
+      }
+    }
+  } else if (rA.intent==="attack"||rB.intent==="attack"){
+    const atk = rA.intent==="attack"?rA:rB, def = rA.intent==="attack"?rB:rA;
+    verdict = "攻擊方 " + (atk.side==="A"?sim.charA.name:sim.charB.name) + "（BP " + atk.bp + "）對「" + (def.intent==="evade"?"純迴避":"純防禦") + "」→ " + E.decideNonaggressive(atk.bp, def.bp);
+  } else verdict = "無對撞發生（雙方皆非對抗）";
+  $("#pb-verify").innerHTML = `<table><tr><th>方</th><th>意圖</th><th>公式</th><th>招式</th><th>BP</th><th>說明</th></tr>${rows}</table>
+    <div style="margin-top:8px"><b>判定：</b>${verdict}</div>
+    <div class="mut" style="margin-top:6px">※ 與 Phase B 的 AI 計算結果比對；攻守以威力較大者為攻擊方。</div>`;
+}
+
+// ── Phase C ───────────────────────────────────────────────
+function clashResultView(b){
+  const c = b.computation || {};
+  const pick = side => {
+    const s = c[side];
+    return s ? { char: s.char, skill: s.skill } : null;
+  };
+  return {
+    verdict: b.verdict || "",
+    result: b.result || {},
+    attacker: pick("attacker"),
+    defender: pick("defender"),
+    domain_fusion: !!b.domain_fusion,
+    domain_override: b.domain_override || null,
+    remaining_damage: b.remaining_damage || "",
+  };
+}
+function buildPhaseC(){
+  if (!phase.B) return alert("請先完成 Phase B（解析並儲存）");
+  const b = phase.B.json;
+  const style = $("#pc-style").value.trim();
+  const view = clashResultView(b);
+  const user = "# 對撞計算結果（計算已完成，僅供轉寫為正文）\n" + JSON.stringify(view, null, 2) +
+    "\n\n【轉寫指引】以 result.projection（預估結果）為骨架寫成正文；verdict/summary 是整體走向，不可改判。不要輸出任何數字、公式或說明。" +
+    (style ? "\n\n【文風規則】\n" + style : "");
+  const full = "【系統提示詞】\n" + PROMPTS.phase_c + "\n\n【使用者訊息】\n" + user;
+  $("#pc-prompt").textContent = full; $("#pc-prompt").classList.remove("hidden");
+  $("#pc-status").textContent = "已產生（含結果與預估結果，不含計算）"; $("#pc-status").classList.add("ok");
+}
+function savePhaseC(){
+  const v = $("#pc-raw").value.trim();
+  if (!v) return alert("請先貼上 Phase C 文風文本");
+  phase.C = { raw: v, json: v };
+  $("#pc-final").textContent = v; $("#pc-final").classList.remove("hidden");
+  $("#pc-saved").textContent = "已儲存（見下方）";
+}
+function resetPhases(){
+  phase.A=phase.B=phase.C=null;
+  ["pa","pb","pc"].forEach(t=>{ $("#"+t+"-prompt").classList.add("hidden"); $("#"+t+"-detail").classList.add("hidden"); $("#"+t+"-raw").value=""; });
+  ["pa-status","pb-status","pc-status","pa-errors","pa-errors2","pb-errors","pb-errors2"].forEach(id=> $("#"+id).textContent="");
+  $("#pb-verify").innerHTML=""; $("#pc-final").classList.add("hidden");
+}
+
+// ── 提示詞庫 ──────────────────────────────────────────────
+function promptItems(){
+  return [
+    { t:"Phase A — 戰局分析", k:"phase_a", note:"判斷對抗雙方、意圖、狀態、距離、偷襲、武器分類" },
+    { t:"Phase B — 威力計算", k:"phase_b", note:"公式計算 + 四階判定（含未登記招式/變體規則）" },
+    { t:"Phase C — 文風輸出", k:"phase_c", note:"依判定生成對撞正文" },
+    { t:"距離修正判定 RANGE_MOD_SYSTEM", k:"range_judge", note:"依交戰距離與招式自身範圍判定 Range_Mod（近戰超出距離不符）" },
+    { t:"反派動態難度校準 CALIBRATE_SYSTEM", k:"calibrate", note:"依篇章上場角色校準反派數值" },
+    { t:"寫入規範 — 角色", k:"write_character", note:"自然語言 → 角色 JSON（含反派/動態難度欄位）" },
+    { t:"寫入規範 — 能力", k:"write_ability", note:"自然語言 → 能力 JSON" },
+    { t:"寫入規範 — 招式", k:"write_skill", note:"自然語言 → 招式 JSON（20 元素）" },
+    { t:"寫入規範 — 結界", k:"write_domain", note:"自然語言 → 結界 JSON" },
+    { t:"公式文字 FORMULAS_TEXT", k:"formulas", note:"公開公式與變數說明" },
+    { t:"成長規則 GROWTH_RULES_TEXT", k:"growth", note:"樓層成長規則" },
+    { t:"完整規則 RULES_TEXT", k:"rules", note:"公式 + 成長規則合併" },
+  ];
+}
+function renderPrompts(){
+  $("#prompt-list").innerHTML = promptItems().map((p,i)=>
+    `<div class="card">
+      <div class="row"><b>${i+1}. ${p.t}</b><span class="mut">${p.note}</span>
+        <span class="spacer"></span>
+        <button onclick="copyRaw(${i})">複製</button></div>
+      <details><summary>檢視內容</summary><pre class="prompt" id="pl-${i}">${escapeHtml(PROMPTS[p.k])}</pre></details>
+    </div>`).join("");
+}
+function escapeHtml(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function copyRaw(i){ const k = promptItems()[i].k; copyTextVal(PROMPTS[k]); }
+
+// ── 反派校準 ──────────────────────────────────────────────
+let calBaselineData = null;
+function renderRosterCheck(){
+  $("#cal-roster").innerHTML = DB.characters.map(c=>`<label style="margin:2px 0"><input type="checkbox" class="cal-roster-cb" value="${c.id}"> ${c.name}</label>`).join("") || '<div class="mut">尚無角色</div>';
+}
+function selectedRoster(){
+  const ids = $$(".cal-roster-cb").filter(cb=>cb.checked).map(cb=>cb.value);
+  return DB.characters.filter(c=>ids.includes(c.id));
+}
+function calBaseline(){
+  const roster = selectedRoster().map(c=>({ name:c.name, stats:c.stats, exp:c.exp, martial:c.martial, max_mp:c.max_mp, _race_mod:c.race_mod }));
+  if (!roster.length) return alert("請勾選預定上場角色");
+  calBaselineData = E.villainCalibrationBaseline(roster, { ratio: parseFloat($("#cal-ratio").value), raceMod: parseFloat($("#cal-racemod").value)||1.0 });
+  $("#cal-baseline").textContent = JSON.stringify(calBaselineData, null, 2);
+  $("#cal-baseline").classList.remove("hidden");
+}
+function buildCalPrompt(){
+  const roster = selectedRoster().map(c=>({ name:c.name, race:c.race, stats:c.stats, exp:c.exp, martial:c.martial, max_mp:c.max_mp }));
+  if (!roster.length || !calBaselineData) return alert("請先勾選上場角色並計算機械基準");
+  const user = "# 反派動態難度校準\n反派名稱：" + $("#cal-name").value + "\n篇章名（calibrate_arc）：" + $("#cal-arc").value +
+    "\n種族修正：" + $("#cal-racemod").value + "\n\n【該篇章預定上場角色】\n" + roster.map(c=>JSON.stringify(c)).join("\n") +
+    "\n\n【機械基準（villain_calibration_baseline）】\n" + JSON.stringify(calBaselineData, null, 2);
+  const full = "【系統提示詞】\n" + PROMPTS.calibrate + "\n\n【使用者訊息】\n" + user;
+  $("#cal-prompt").textContent = full; $("#cal-prompt").classList.remove("hidden");
+}
+function parseCal(){
+  const v = tryParse($("#cal-raw").value); if(!v) return;
+  $("#cal-json").value = JSON.stringify(v, null, 2); $("#cal-detail").classList.remove("hidden");
+  $("#cal-final").textContent = JSON.stringify(v, null, 2); $("#cal-final").classList.remove("hidden");
+  $("#cal-errors").textContent = "";
+}
+function reparseCal(){ const v = tryParse($("#cal-json").value); if(!v) return; $("#cal-final").textContent = JSON.stringify(v,null,2); $("#cal-final").classList.remove("hidden"); }
+
+// ── 通用工具 ──────────────────────────────────────────────
+function tryParse(text){
+  text = (text||"").trim();
+  if (text.startsWith("```")){
+    const lines = text.split("\n");
+    if (lines[0].startsWith("```")) lines.shift();
+    if (lines.length && lines[lines.length-1].startsWith("```")) lines.pop();
+    text = lines.join("\n").trim();
+  }
+  if (!text){ alert("無法解析為 JSON：欄位是空的，請先貼上 AI 回答再解析"); return null; }
+  try { return JSON.parse(text); }
+  catch(e1){
+    const s = text.indexOf("{"), en = text.lastIndexOf("}");
+    if (s>=0 && en>s){
+      try { return JSON.parse(text.slice(s, en+1)); }
+      catch(e2){ alert("無法解析為 JSON：" + e2.message + "（可能是 AI 輸出被截斷，請確認以 } 結尾後再試）"); return null; }
+    }
+    alert("無法解析為 JSON：" + e1.message); return null;
+  }
+}
+const FIELD_LABELS = {
+  "sim-thread":"討論串摘要", "pa-raw":"Phase A 回答", "pa-json":"Phase A 編輯",
+  "pb-raw":"Phase B 回答", "pb-json":"Phase B 編輯",
+  "pc-raw":"Phase C 正文", "pc-json":"Phase C 編輯", "pc-style":"文風規則",
+};
+const STRAY_KEYS = { A:["attacker_candidate"], B:["computation","verdict"], C:[] };
+function strayAnswer(tag){
+  const keys = STRAY_KEYS[tag] || [];
+  if (!keys.length) return null;
+  for (const id of Object.keys(FIELD_LABELS)){
+    const el = document.getElementById(id);
+    if (!el || !el.value || !el.value.trim()) continue;
+    const t = el.value.trim();
+    if (keys.every(k => t.indexOf(k) !== -1)) return FIELD_LABELS[id];
+  }
+  return null;
+}
+function tryParseShape(text, tag){
+  text = (text||"").trim();
+  if (!text){
+    const stray = strayAnswer(tag);
+    if (stray) alert("欄位是空的——但我偵測到疑似該階段的 JSON 貼在「" + stray + "」欄位。\n可能貼錯欄位了：請把內容剪下，貼到「貼上 AI 的 Phase " + tag + " 回答」欄位再解析。\n（「討論串摘要」欄位放的是情境描述，不是 AI 回答）");
+    else alert("無法解析為 JSON：欄位是空的，請先貼上 AI 回答再解析");
+    return null;
+  }
+  const parsed = tryParse(text);
+  if (!parsed) return null;
+  if (typeof parsed !== "object" || Array.isArray(parsed)){ alert("無法解析為 JSON：輸出不是物件"); return null; }
+  if (tag === "A"){
+    if (!parsed.attacker_candidate){
+      if (parsed.computation) alert("這不是 Phase A 的戰局分析，看起來像是 Phase B 的計算結果。\nPhase B 結果請貼到「Phase B — 威力計算」欄位。");
+      else alert("這不是 Phase A 的戰局分析：缺少 attacker_candidate / defender_candidate。\n請貼 AI 依「產生 Phase A 提示詞」算出的戰局分析 JSON。");
+      return null;
+    }
+  }
+  if (tag === "B"){
+    if (!parsed.computation || !parsed.verdict){
+      if (parsed.attacker_candidate) alert("這不是 Phase B 的計算結果，看起來是 Phase A 的戰局分析。\nPhase A 輸出請貼到「Phase A — 戰局分析」欄位解析；\nPhase B 需要再呼叫一次 AI：產生 Phase B 提示詞 → 把 AI 算出的 JSON 貼回此欄位。");
+      else alert("這不是 Phase B 的計算結果：缺少 computation / verdict。\n請貼 AI 依公式算出的 Phase B 計算 JSON（含 computation 與 verdict）。");
+      return null;
+    }
+  }
+  return parsed;
+}
+function copyText(id){ copyTextVal($("#"+id).textContent); }
+function copyTextVal(text){
+  if (navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(()=>flash("已複製")); }
+  else { const ta=document.createElement("textarea"); ta.value=text; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); flash("已複製"); }
+}
+let flashTimer=null;
+function flash(msg){ const m=$("#build-meta"); const old=m.textContent; m.textContent=msg; clearTimeout(flashTimer); flashTimer=setTimeout(()=>m.textContent=old,1200); }
+function exportDB(){
+  const blob=new Blob([JSON.stringify(DB,null,2)],{type:"application/json"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="collide_sim_db.json"; a.click(); URL.revokeObjectURL(a.href);
+}
+$("#file-import").addEventListener("change", e=>{
+  const f=e.target.files[0]; if(!f) return; const r=new FileReader();
+  r.onload=()=>{ try{ const d=JSON.parse(r.result); if(!d.characters) throw 0; DB=d; saveDB(); renderAll(); alert("匯入成功"); }catch(err){ alert("匯入失敗：格式不正確"); } };
+  r.readAsText(f);
+});
+
+// ── 引擎自測 ──────────────────────────────────────────────
+function approx(a,b,eps){
+  if (typeof a==="number" && typeof b==="number") return Math.abs(a-b)<=eps;
+  if (typeof a!==typeof b) return false;
+  if (Array.isArray(a)) return a.length===b.length && a.every((x,i)=>approx(x,b[i],eps));
+  if (a && typeof a==="object"){ const ka=Object.keys(a), kb=Object.keys(b); return ka.length===kb.length && ka.every(k=>approx(a[k],b[k],eps)); }
+  return a===b;
+}
+function runSelfTest(){
+  let fail=0; const lines=[];
+  for (const c of TEST_VECTORS.cases){
+    let got; try{ got = eval(c.js); }catch(e){ got="ERR:"+e.message; }
+    const ok = approx(c.expected, got, TEST_VECTORS.tolerance);
+    if (!ok){ fail++; lines.push("❌ " + c.name + "\n  期望 " + JSON.stringify(c.expected) + "\n  實際 " + JSON.stringify(got)); }
+  }
+  lines.unshift(fail===0 ? ("✅ 全部 " + TEST_VECTORS.cases.length + " 項 JS 引擎自測通過（與 Python 引擎一致）") : ("❌ " + fail + " / " + TEST_VECTORS.cases.length + " 項不一致"));
+  const box=$("#selftest"); box.innerHTML="<h3 style='margin:0 0 8px'>引擎自測</h3>"+lines.map(l=>`<div class="mono">${l}</div>`).join(""); box.classList.add("show");
+  setTimeout(()=>box.classList.remove("show"), fail?0:6000);
+}
+
+// ── 初始化 ────────────────────────────────────────────────
+fillRatingSelects();
+$$(".tab-btn").forEach(btn=>btn.addEventListener("click",()=>{
+  $$(".tab-btn").forEach(b=>b.classList.remove("active")); btn.classList.add("active");
+  $$("section.tab").forEach(s=>s.classList.remove("active")); $("#tab-"+btn.dataset.tab).classList.add("active");
+}));
+$("#sim-charA").addEventListener("change",syncSkillSelects);
+$("#sim-charB").addEventListener("change",syncSkillSelects);
+renderAll(); renderPrompts();
+</script>
+</body>
+</html>

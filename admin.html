@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>招式對撞系統管理頁</title>
+<style>
+body{font-family:'Segoe UI','Microsoft JhengHei',sans-serif;max-width:1200px;margin:1.5rem auto;padding:0 1.5rem;line-height:1.6;color:#222;background:#fafafa}
+h1{color:#b00020;border-bottom:2px solid #eee;padding-bottom:.4rem}
+h2{color:#0d47a1;margin-top:2rem;border-bottom:1px solid #eee;padding-bottom:.3rem}
+.tabs{display:flex;gap:.5rem;margin:1rem 0}
+.tab{padding:.5rem 1rem;border:1px solid #ccc;border-radius:6px;cursor:pointer;background:#fff}
+.tab.active{background:#0d47a1;color:#fff;border-color:#0d47a1}
+.panel{display:none}
+.panel.active{display:block}
+table{border-collapse:collapse;width:100%;margin:.8rem 0;background:#fff;font-size:.9rem}
+th,td{border:1px solid #ddd;padding:.4rem .6rem;text-align:left;vertical-align:top}
+th{background:#f0f4ff;position:sticky;top:0}
+tr.unreviewed td{background:#fff8e1}
+tr.manual td{background:#e8f5e9}
+code{background:#f0f0f0;padding:.05rem .25rem;border-radius:3px}
+input,textarea,button{font-family:inherit;font-size:.9rem}
+textarea{width:100%;min-height:60px}
+.btn{padding:.35rem .8rem;border-radius:5px;border:1px solid #ccc;cursor:pointer;background:#fff}
+.btn.primary{background:#0d47a1;color:#fff;border-color:#0d47a1}
+.btn.green{background:#2e7d32;color:#fff;border-color:#2e7d32}
+.btn.gray{background:#eee}
+.btn.danger{background:#c62828;color:#fff;border-color:#c62828}
+.ctx-menu{position:fixed;z-index:100;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.2);padding:.3rem;min-width:180px}
+.ctx-item{display:block;width:100%;text-align:left;border:none;background:none;padding:.45rem .6rem;border-radius:4px;cursor:pointer;font-size:.88rem}
+.ctx-item:hover{background:#ffebee;color:#c62828}
+tr.battle-row{cursor:context-menu}
+.status{display:inline-block;padding:.15rem .5rem;border-radius:10px;font-size:.8rem}
+.status.ok{background:#e8f5e9;color:#2e7d32}
+.status.warn{background:#fff3e0;color:#e65100}
+.status.err{background:#ffebee;color:#c62828}
+#toast{position:fixed;bottom:1rem;right:1rem;background:#333;color:#fff;padding:.6rem 1rem;border-radius:6px;display:none;z-index:99}
+.loading{color:#888;font-style:italic}
+.hd{color:#888;font-size:.75rem}
+.tag{display:inline-block;background:#e3f2fd;border:1px solid #90caf9;border-radius:10px;padding:.05rem .4rem;margin:.1rem .15rem;font-size:.8rem}
+.tag-x{border:none;background:transparent;color:#0d47a1;cursor:pointer;margin-left:.15rem;font-weight:bold}
+.tag-add{margin-left:.3rem}
+.tag-input{width:6rem;font-size:.8rem;padding:.15rem .3rem;border:1px solid #ccc;border-radius:4px}
+.tag-btn{padding:.1rem .5rem;font-size:.8rem}
+</style>
+</head>
+<body>
+<h1>招式對撞系統管理頁</h1>
+
+<div class="tabs">
+  <div class="tab active" data-panel="panel-growth">成長審計</div>
+  <div class="tab" data-panel="panel-data">資料表</div>
+  <div class="tab" data-panel="panel-logs">Action Log</div>
+  <div class="tab" data-panel="panel-floors">樓層</div>
+  <div class="tab" data-panel="panel-sheets">Sheets 同步</div>
+</div>
+
+<div id="panel-growth" class="panel active">
+  <h2>成長審計（人工審查 / 數值修正）</h2>
+  <p><label>依討論串過濾：</label><input id="growth-filter" placeholder="thread_id（留空=全部）"></p>
+  <table id="growth-table">
+    <thead><tr>
+      <th>ID</th><th>討論串</th><th>類別</th><th>目標</th><th>欄位</th>
+      <th>old→new</th><th>delta</th><th>來源</th><th>原因</th><th>審查</th><th>操作</th>
+    </tr></thead>
+    <tbody id="growth-body"><tr><td colspan="11" class="loading">載入中…</td></tr></tbody>
+  </table>
+</div>
+
+<div id="panel-data" class="panel">
+  <h2>資料表查閱</h2>
+  <div class="tabs" style="margin-top:0">
+    <div class="tab active" data-panel="dt-char">角色</div>
+    <div class="tab" data-panel="dt-skill">招式</div>
+    <div class="tab" data-panel="dt-domain">結界</div>
+    <div class="tab" data-panel="dt-battle">對撞紀錄</div>
+  </div>
+  <div id="dt-char" class="panel active"><table id="char-table"><thead></thead><tbody></tbody></table></div>
+  <div id="dt-skill" class="panel"><table id="skill-table"><thead></thead><tbody></tbody></table></div>
+  <div id="dt-domain" class="panel"><table id="domain-table"><thead></thead><tbody></tbody></table></div>
+  <div id="dt-battle" class="panel"><table id="battle-table"><thead></thead><tbody></tbody></table></div>
+</div>
+
+<div id="panel-logs" class="panel">
+  <h2>樓層 Action Log</h2>
+  <table id="action-table"><thead><tr>
+    <th>ID</th><th>討論串</th><th>類型</th><th>角色</th><th>內容</th><th>關聯數值</th><th>battle_id</th><th>時間</th>
+  </tr></thead><tbody id="action-body"><tr><td colspan="8" class="loading">載入中…</td></tr></tbody></table>
+</div>
+
+<div id="panel-floors" class="panel">
+  <h2>樓層</h2>
+  <table id="floor-table"><thead><tr>
+    <th>ID</th><th>討論串</th><th>名稱</th><th>狀態</th><th>已總結</th><th>總結時間</th>
+  </tr></thead><tbody id="floor-body"><tr><td colspan="6" class="loading">載入中…</td></tr></tbody></table>
+</div>
+
+<div id="panel-sheets" class="panel">
+  <h2>Google Sheets 同步</h2>
+  <div id="sheets-status"><span class="loading">讀取中…</span></div>
+  <p><button class="btn primary" id="sheets-sync-btn">立即同步全部工作表</button></p>
+  <div id="sheets-result"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+function toast(msg, ok=true){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.style.background = ok ? '#2e7d32' : '#c62828';
+  t.style.display = 'block';
+  setTimeout(()=> t.style.display='none', 2600);
+}
+async function api(path, opts={}){
+  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+  if(!r.ok){
+    let d=''; try{ d = (await r.json()).detail || ''; }catch(e){}
+    throw new Error(d || `HTTP ${r.status}`);
+  }
+  return r.json();
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const short = s => { const t = String(s ?? ''); return t.length>120 ? t.slice(0,120)+'…' : t; };
+
+// ── tabs ──
+// 每個 tab bar 只切換自己群組內的 panel（外層 tab bar 管 body 直屬 panel，
+// 資料表內層 tab bar 只管 #panel-data 內部的子 panel），互不干擾。
+function bindTabs(){
+  document.querySelectorAll('.tabs').forEach(bar=>{
+    bar.querySelectorAll('.tab').forEach(t=>t.addEventListener('click', ()=>{
+      bar.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+      t.classList.add('active');
+      const host = bar.parentElement;
+      host.querySelectorAll(':scope > .panel').forEach(p=>p.classList.remove('active'));
+      const target = host.querySelector(':scope > #' + t.dataset.panel);
+      if(target) target.classList.add('active');
+    }));
+  });
+}
+bindTabs();
+
+// ── growth log ──
+function renderGrowth(rows){
+  const body = $('#growth-body');
+  if(!rows.length){ body.innerHTML = '<tr><td colspan="11">無成長紀錄</td></tr>'; return; }
+  body.innerHTML = rows.map(g=>`
+    <tr class="${g.source==='manual'?'manual':(g.reviewed?'':'unreviewed')}">
+      <td>${g.id}</td>
+      <td>${esc(g.thread_id)}</td>
+      <td>${esc(g.category)}</td>
+      <td>${esc(g.target_name)}</td>
+      <td>${esc(g.field)}</td>
+      <td>${esc(g.old_value)} → <b>${esc(g.new_value)}</b></td>
+      <td>${esc(g.delta)}</td>
+      <td>${esc(g.source)}</td>
+      <td>${esc(short(g.reason))}</td>
+      <td>${g.reviewed ? `✅ ${esc(g.reviewed_by)}` : '<span class="status warn">未審查</span>'}</td>
+      <td>
+        <button class="btn green" onclick="openReview(${g.id})">審查/修正</button>
+        <span style="font-size:.8rem;color:#888">event:${esc(g.floor_event_id||'')}</span>
+      </td>
+    </tr>`).join('');
+}
+async function loadGrowth(){
+  const tid = $('#growth-filter').value.trim();
+  try{
+    const rows = await api('/api/growth' + (tid ? '?thread_id='+encodeURIComponent(tid) : ''));
+    renderGrowth(rows);
+  }catch(e){ $('#growth-body').innerHTML = `<tr><td colspan="11">載入失敗：${esc(e.message)}</td></tr>`; }
+}
+$('#growth-filter').addEventListener('input', ()=>{ clearTimeout(window._gf); window._gf = setTimeout(loadGrowth, 300); });
+
+let currentReviewId = null;
+function openReview(id){ currentReviewId = id; $('#review-dialog').showModal(); }
+function closeReview(){ $('#review-dialog').close(); }
+async function submitReview(){
+  const val = $('#review-new').value.trim();
+  const note = $('#review-note').value.trim();
+  try{
+    const r = await api(`/api/growth/${currentReviewId}/review`, {
+      method:'POST', body: JSON.stringify({reviewed_by:'admin', approved:!val, new_value: val || null, note})
+    });
+    toast(r.correction ? `已修正 → ${r.correction.new_value}（新 log #${r.correction.id}）` : '已標記審查');
+    closeReview(); $('#review-new').value=''; $('#review-note').value='';
+    loadGrowth();
+  }catch(e){ toast(e.message, false); }
+}
+
+// ── data tables ──
+function renderTable(sel, rows, cols){
+  const tbl = $(sel);
+  if(!rows.length){ tbl.querySelector('tbody').innerHTML='<tr><td>無資料</td></tr>'; return; }
+  const keys = cols || Object.keys(rows[0]);
+  tbl.querySelector('thead').innerHTML = '<tr>'+keys.map(k=>`<th>${esc(k)}</th>`).join('')+'</tr>';
+  tbl.querySelector('tbody').innerHTML = rows.map(r=>'<tr>'+keys.map(k=>{
+    let v = r[k];
+    if(typeof v==='object' && v!==null) v = JSON.stringify(v);
+    return `<td>${esc(short(v))}</td>`;
+  }).join('')+'</tr>').join('');
+}
+
+// ── 角色表（含隱藏分顯示 + 特殊標籤編輯）──
+const STAT_KEYS = ['力量','敏捷','智力','體質','魅力','幸運'];
+let charRows = [];
+function safeJson(s, fallback){
+  if(typeof s === 'object' && s !== null) return s;
+  if(typeof s === 'string' && s.trim()){ try{ return JSON.parse(s); }catch(e){} }
+  return fallback;
+}
+function renderCharacters(chars){
+  charRows = chars;
+  const tbl = $('#char-table');
+  tbl.querySelector('thead').innerHTML = '<tr>' +
+    ['名稱','種族','學校評級','六維（評級／隱藏分）','特殊標籤','特殊型態','武器','MP','武藝','經驗']
+    .map(h=>`<th>${h}</th>`).join('') + '</tr>';
+  const tbody = tbl.querySelector('tbody');
+  if(!chars.length){ tbody.innerHTML='<tr><td colspan="10">無資料</td></tr>'; return; }
+  tbody.innerHTML = chars.map((c,ridx)=>{
+    const stats = safeJson(c.stats, {});
+    const forms = safeJson(c.special_forms, {});
+    const tags = safeJson(c.special_tags, []);
+    const h = c.hidden || {};
+    const statCell = STAT_KEYS.map(s=>{
+      const r = stats[s] || '?';
+      const hv = h[s];
+      return `<div>${s} <b>${esc(r)}</b>${hv!=null?` <span class="hd">${hv}</span>`:''}</div>`;
+    }).join('');
+    const tagCell = tags.map((t,ti)=>`<span class="tag">${esc(t)}<button class="tag-x" data-ridx="${ridx}" data-tidx="${ti}" title="移除">×</button></span>`).join(' ') +
+      `<span class="tag-add"><input class="tag-input" placeholder="新標籤"><button class="btn tag-btn" data-addtag="${ridx}">＋</button></span>`;
+    const badges = [
+      c.is_teacher ? '教師' : '',
+      c.is_villain ? '反派' : '',
+      c.dynamic_difficulty ? '動態難度' : '',
+    ].filter(Boolean).map(b=>`<span class="status warn">${b}</span>`).join(' ');
+    return `<tr>
+      <td><b>${esc(c.name)}</b> ${badges}</td>
+      <td>${esc(c.race)}</td>
+      <td>${esc(c.school_rank)}</td>
+      <td>${statCell}</td>
+      <td>${tagCell}</td>
+      <td>${Object.entries(forms).map(([k,v])=>`${esc(k)}×${v}`).join('<br>')||'—'}</td>
+      <td>${esc(c.weapon)}</td>
+      <td>${c.max_mp}</td>
+      <td>${c.martial}</td>
+      <td>${c.exp}</td>
+    </tr>`;
+  }).join('');
+}
+$('#char-table').addEventListener('click', e=>{
+  const delBtn = e.target.closest('.tag-x');
+  if(delBtn){
+    const row = charRows[+delBtn.dataset.ridx];
+    const tag = safeJson(row.special_tags, [])[+delBtn.dataset.tidx];
+    api('/api/characters/'+encodeURIComponent(row.name)+'/tags', {
+      method:'POST', body: JSON.stringify({tag, action:'remove'})
+    }).then(()=>{ toast(`已移除標籤「${tag}」`); loadDataTables(); })
+      .catch(err=>toast(err.message, false));
+    return;
+  }
+  const addBtn = e.target.closest('[data-addtag]');
+  if(addBtn){
+    const row = charRows[+addBtn.dataset.addtag];
+    const input = addBtn.closest('td').querySelector('.tag-input');
+    const tag = (input.value || '').trim();
+    if(!tag){ toast('請輸入標籤名稱', false); return; }
+    api('/api/characters/'+encodeURIComponent(row.name)+'/tags', {
+      method:'POST', body: JSON.stringify({tag, action:'add'})
+    }).then(()=>{ toast(`已新增標籤「${tag}」`); loadDataTables(); })
+      .catch(err=>toast(err.message, false));
+  }
+});
+async function loadDataTables(){
+  try{
+    const [chars, skills, domains, battles] = await Promise.all([
+      api('/api/tables/characters'), api('/api/tables/skills'),
+      api('/api/tables/domains'), api('/api/tables/battles'),
+    ]);
+    renderCharacters(chars);
+    renderTable('#skill-table', skills);
+    renderTable('#domain-table', domains);
+    renderBattles(battles);
+  }catch(e){ toast('資料表載入失敗：'+e.message, false); }
+}
+
+// ── action log / floors ──
+async function loadActionLog(){
+  try{
+    const rows = await api('/api/actionlog');
+    const body = $('#action-body');
+    if(!rows.length){ body.innerHTML='<tr><td colspan="8">無 Action Log</td></tr>'; return; }
+    body.innerHTML = rows.map(r=>`<tr>
+      <td>${r.id}</td><td>${esc(r.thread_id)}</td><td>${esc(r.action_type)}</td>
+      <td>${esc(r.actor)}</td><td>${esc(short(r.action_detail))}</td>
+      <td>${esc(short(r.related_values))}</td><td>${esc(r.battle_id??'')}</td><td>${esc(r.created_at)}</td>
+    </tr>`).join('');
+  }catch(e){ $('#action-body').innerHTML=`<tr><td colspan="8">載入失敗：${esc(e.message)}</td></tr>`; }
+}
+async function loadFloors(){
+  try{
+    const rows = await api('/api/floors');
+    const body = $('#floor-body');
+    if(!rows.length){ body.innerHTML='<tr><td colspan="6">無樓層</td></tr>'; return; }
+    body.innerHTML = rows.map(r=>`<tr>
+      <td>${r.id}</td><td>${esc(r.thread_id)}</td><td>${esc(r.thread_name)}</td>
+      <td>${esc(r.status)}</td><td>${r.summary_generated?'✅':'—'}</td><td>${esc(r.summary_at||'')}</td>
+    </tr>`).join('');
+  }catch(e){ $('#floor-body').innerHTML=`<tr><td colspan="6">載入失敗：${esc(e.message)}</td></tr>`; }
+}
+
+// ── sheets ──
+async function loadSheets(){
+  try{
+    const s = await api('/api/sheets/status');
+    $('#sheets-status').innerHTML = `
+      <p>試算表：${s.configured ? esc(s.spreadsheet_id) : '<span class="status err">未設定 spreadsheet_id</span>'}</p>
+      <p>credentials.json：${s.credentials ? '<span class="status ok">已存在</span>' : '<span class="status err">缺少</span>'}
+      　token.json：${s.token ? '<span class="status ok">已授權</span>' : '<span class="status warn">未授權</span>'}</p>
+      <p>排程中工作表：${s.dirty.length ? esc(s.dirty.join('、')) : '<span class="status ok">無</span>'}
+      　API 呼叫次數：${s.call_count}</p>
+      ${s.last_error ? `<p>上次錯誤：<span class="status err">${esc(s.last_error)}</span></p>` : ''}`;
+  }catch(e){ $('#sheets-status').innerHTML = `<span class="status err">讀取失敗：${esc(e.message)}</span>`; }
+}
+$('#sheets-sync-btn').addEventListener('click', async ()=>{
+  const btn = $('#sheets-sync-btn'); btn.disabled = true; btn.textContent = '同步中…';
+  $('#sheets-result').innerHTML = '<span class="loading">正在同步…</span>';
+  try{
+    const r = await api('/api/sheets/sync', {method:'POST', body:'{}'});
+    $('#sheets-result').innerHTML = '<p>✅ 同步完成：</p><table><tr><th>工作表</th><th>行數</th><th>狀態</th></tr>' +
+      r.results.map(x=>`<tr><td>${esc(x.title)}</td><td>${x.rows}</td><td>${x.ok?'✅':'❌'}</td></tr>`).join('') + '</table>';
+    toast('同步完成');
+    loadSheets();
+  }catch(e){ $('#sheets-result').innerHTML = `<span class="status err">${esc(e.message)}</span>`; toast(e.message, false); }
+  btn.disabled = false; btn.textContent = '立即同步全部工作表';
+});
+
+// ── 對撞紀錄表（含刪除按鈕 + 右鍵選單）──
+let battleRows = [];
+function renderBattles(battles){
+  battleRows = battles;
+  const tbl = $('#battle-table');
+  tbl.querySelector('thead').innerHTML = '<tr>' +
+    ['ID','狀態','攻擊方','防禦方','BP 攻→守','判定','時間','操作']
+    .map(h=>`<th>${h}</th>`).join('') + '</tr>';
+  const tbody = tbl.querySelector('tbody');
+  if(!battles.length){ tbody.innerHTML='<tr><td colspan="8">無對撞紀錄</td></tr>'; return; }
+  tbody.innerHTML = battles.map(b=>`
+    <tr class="battle-row" data-battle="${b.id}" title="右鍵：刪除對撞紀錄">
+      <td>${b.id}</td>
+      <td>${esc(b.status)}${b.undone_by?`<br><span class="hd">${esc(b.undone_by)}</span>`:''}</td>
+      <td>${esc(b.attacker)}${b.attacker_skill?`<br><span class="hd">${esc(b.attacker_skill)}</span>`:''}</td>
+      <td>${esc(b.defender)}${b.defender_skill?`<br><span class="hd">${esc(b.defender_skill)}</span>`:''}</td>
+      <td>${b.atk_output??''} → ${b.def_output??''}</td>
+      <td>${esc(b.verdict||'')}</td>
+      <td class="hd">${esc(b.created_at||'')}</td>
+      <td><button class="btn danger" data-delbattle="${b.id}">刪除</button></td>
+    </tr>`).join('');
+}
+function confirmDeleteBattle(id){
+  if(!confirm(`確定要永久刪除對撞紀錄 #${id}？\n（此動作不可復原；關聯的成長/動作紀錄不會被刪除）`)) return;
+  api('/api/tables/battles/'+id, {method:'DELETE'})
+    .then(()=>{ toast(`已刪除對撞紀錄 #${id}`); loadDataTables(); })
+    .catch(err=>toast(err.message, false));
+}
+$('#battle-table').addEventListener('click', e=>{
+  const btn = e.target.closest('[data-delbattle]');
+  if(btn) confirmDeleteBattle(+btn.dataset.delbattle);
+});
+let _ctxMenu = null;
+function hideCtxMenu(){ if(_ctxMenu){ _ctxMenu.remove(); _ctxMenu = null; } }
+$('#battle-table').addEventListener('contextmenu', e=>{
+  const tr = e.target.closest('tr[data-battle]');
+  if(!tr){ return; }
+  e.preventDefault();
+  hideCtxMenu();
+  const id = +tr.dataset.battle;
+  _ctxMenu = document.createElement('div');
+  _ctxMenu.className = 'ctx-menu';
+  _ctxMenu.style.left = e.clientX+'px';
+  _ctxMenu.style.top = e.clientY+'px';
+  const item = document.createElement('button');
+  item.className = 'ctx-item';
+  item.textContent = '🗑 刪除對撞紀錄 #'+id;
+  item.onclick = ()=>{ hideCtxMenu(); confirmDeleteBattle(id); };
+  _ctxMenu.appendChild(item);
+  document.body.appendChild(_ctxMenu);
+});
+document.addEventListener('click', hideCtxMenu);
+document.addEventListener('scroll', hideCtxMenu, true);
+
+// ── review dialog ──
+document.body.insertAdjacentHTML('beforeend', `
+  <dialog id="review-dialog" style="border-radius:8px;border:1px solid #ccc;padding:1.2rem;min-width:420px">
+    <h3 style="margin-top:0">成長審查 / 數值修正</h3>
+    <p style="color:#888;font-size:.85rem">修正會新增一筆 <code>source=manual</code> 的新 log（old=原 new_value），原紀錄標記已審查。</p>
+    <label>修正後數值（留空 = 僅標記已審查）</label>
+    <input id="review-new" placeholder="例如 35" style="width:100%;padding:.4rem;margin:.3rem 0">
+    <label>備註</label>
+    <textarea id="review-note" placeholder="修正原因"></textarea>
+    <p style="text-align:right;margin-top:.6rem">
+      <button class="btn gray" onclick="closeReview()">取消</button>
+      <button class="btn primary" onclick="submitReview()">送出</button>
+    </p>
+  </dialog>`);
+
+// ── init ──
+loadGrowth(); loadDataTables(); loadActionLog(); loadFloors(); loadSheets();
+</script>
+</body>
+</html>

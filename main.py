@@ -1,5 +1,6 @@
 import asyncio
 import io
+import sys
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -24,6 +25,14 @@ from profiles import (
 )
 from prompts import build_style_block, build_banned_str, build_expr_str, build_safety_str
 import image_reader
+
+# Windows 主控台 cp950 印不出 UTF-8 特殊字元（emoji/罕用字）會讓 print() 拋
+# UnicodeEncodeError，進而炸掉整個訊息處理（「陷入沉思」fallback）。
+# 統一重設為 UTF-8，印不出的字元以 ? 取代，不再 crash。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 load_dotenv()
 
@@ -207,8 +216,12 @@ async def load_prompt_config() -> dict:
     return _prompt_config_cache
 
 
-# 初始化 DeepSeek 客戶端
-client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
+# 初始化 DeepSeek 客戶端（60 秒 timeout，避免 Phase 3 等太久）
+client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com/v1",
+    timeout=60.0,
+)
 
 
 _db_init()
@@ -1184,6 +1197,8 @@ async def phase3_process(
         "deepseek-v4-pro",
     ]
     for attempt in range(4):
+        if attempt > 0:
+            await asyncio.sleep(2.0 * attempt)  # 退避：2s、4s、6s
         model = models[attempt]
         temp = temps[attempt] if attempt < len(temps) else 0.3
         try:
@@ -1198,6 +1213,11 @@ async def phase3_process(
             )
         except Exception as e:
             log_lines.append(f"  [檢測API失敗] attempt={attempt + 1} {model} {e}")
+            if message and attempt >= 1:
+                try:
+                    await _log_error("phase3_detect_api_error", f"{model} attempt={attempt + 1}: {e}")
+                except Exception:
+                    pass
             continue
         detected = (resp.choices[0].message.content or "").strip()
         finish_reason = (
@@ -1209,11 +1229,25 @@ async def phase3_process(
             log_lines.append(
                 f"  [空白檢測] attempt={attempt + 1} {model} temp={temp} fr={finish_reason}，重試中…"
             )
+            if message and attempt >= 1:
+                try:
+                    await _log_error(
+                        "phase3_detect_blank",
+                        f"{model} attempt={attempt + 1} temp={temp} fr={finish_reason}",
+                    )
+                except Exception:
+                    pass
             continue
         break
     else:
         log_lines.append(f"  [檢測失敗] 4 次重試後仍為空白，跳過")
-        await _log_error("phase3_timeout", "4 次重試後仍為空白/API 無回應")
+        detail = "4 次重試後仍為空白/API 無回應"
+        fail_lines = [
+            l for l in log_lines if "檢測API失敗" in l or "空白檢測" in l
+        ]
+        if fail_lines:
+            detail += "；" + " | ".join(fail_lines[-4:])
+        await _log_error("phase3_timeout", detail)
         if message:
             try:
                 await message.channel.send(
@@ -1227,7 +1261,7 @@ async def phase3_process(
     async with aiofiles.open(
         os.path.join(PROMPT_LOG_DIR, "last_phase3.txt"), "w", encoding="utf-8"
     ) as f:
-        await f.write(detected)
+        await f.write("\n".join(log_lines) + "\n---detected---\n" + detected)
     async with aiofiles.open(
         os.path.join(PROMPT_LOG_DIR, "last_phase3_prompt.txt"),
         "w",
@@ -3556,6 +3590,38 @@ async def cmd_modify_context(
     await interaction.response.send_modal(ModifyModal(message))
 
 
+@bot.tree.context_menu(name="刪除訊息")
+async def cmd_delete_context(
+    interaction: discord.Interaction, message: discord.Message
+):
+    """右鍵機器人訊息 → 刪除訊息（需「管理訊息」權限或機器人擁有者）。"""
+    if message.author != bot.user:
+        await interaction.response.send_message(
+            "❌ 只能刪除機器人發出的訊息", ephemeral=True
+        )
+        return
+    allowed = False
+    if interaction.guild:
+        perm = interaction.user.guild_permissions
+        allowed = bool(perm.manage_messages) or bool(perm.administrator)
+    if not allowed:
+        try:
+            owner = (await bot.application_info()).owner
+            allowed = interaction.user.id == owner.id
+        except Exception:
+            pass
+    if not allowed:
+        await interaction.response.send_message(
+            "❌ 需要「管理訊息」權限才能刪除", ephemeral=True
+        )
+        return
+    try:
+        await message.delete()
+        await interaction.response.send_message("✅ 已刪除訊息", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 刪除失敗：{e}", ephemeral=True)
+
+
 async def _review_edit_suggestion(original: str, suggestion: str) -> dict:
     """AI 審查修改建議的合理性"""
     cfg = await load_prompt_config()
@@ -3854,6 +3920,11 @@ say_cmd.register_say(bot)
 autopilot.register_commands(bot)
 gods_eye.register_commands(bot)
 tarot.register_tarot(bot)
+import collide_write_cmds
+import collide_cmds
+
+collide_write_cmds.register_commands(bot)
+collide_cmds.register_commands(bot)
 
 if __name__ == "__main__":
     # 啟動機器人

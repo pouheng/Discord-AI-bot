@@ -1,0 +1,78 @@
+{
+  "name": "招式對撞系統規則（公開）",
+  "version": "1.0",
+  "formulas": {
+    "Atk_BP": "(Skill_Base + Stat_hidden/2) × Exp_Mod × Element_Mod × Domain_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Range_Mod × Ambush_Mod",
+    "Melee_BP": "(Weapon_Base + STR_hidden/2) × (1 + Martial/200) × Exp_Mod × Range_Mod × Domain_Mod × Status_Mod × Form_Mod × Variant_Mod × Ambush_Mod",
+    "ManaMelee_BP": "(Weapon_Base + STR_hidden/2 + INT_hidden/2 + MP_Invested) × (1 + Martial/200) × Exp_Mod × Element_Mod × Proficiency_Mod × Status_Mod × Form_Mod × Variant_Mod × Ambush_Mod",
+    "Exp_Mod": "1.0 + E/500",
+    "Evade_BP": "敏捷隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod",
+    "Guard_BP": "體質隱藏分數 × Status_Mod × Form_Mod × Domain_Mod × Ambush_Mod"
+  },
+  "variable_explanation": {
+    "Skill_Base": "招式威力基數（1.0~10.0，10.0 為表/裡世界天花板）",
+    "Stat_hidden": "施法對應隱藏分數 = 評級常數 × 種族修正（魔法取智力，視情況取體質/力量）",
+    "rating_constants": {"E": 1, "D": 2, "C": 3, "B": 4, "A": 5, "S": 6},
+    "hidden_score_max": 9.0,
+    "Exp_Mod": "實戰經驗修正（1.0~1.2，依 E/500）",
+    "Element_Mod": "元素相剋：剋制 1.2 / 無 1.0 / 被剋 0.8（特殊元素可 1.3）",
+    "Domain_Mod": "自身結界內依覺醒：初期 1.1 / 中期 1.25 / 後期 1.4 / 完全 1.5；未開結界 1.0。未覺醒只能用「簡易結界」，無法與張開的結界對抗",
+    "Proficiency_Mod": "能力熟練度 1.0 + proficiency/100",
+    "Status_Mod": "當前狀態修正（重傷 0.5~0.8 / 輕傷 0.9~0.95 / 正常 1.0 / 強化 1.05~1.3）",
+    "Form_Mod": "特殊型態修正（1.1~1.5）",
+    "Variant_Mod": "合理招式變體 +5%（1.05）",
+    "Range_Mod": "距離衰減：交戰距離在招式射程內 1.0；超過射程依衰減規則（<1.0）。以招式自身 range 為準，留空沿用能力 range_limit。近戰型招式/普通攻擊只在近身有效，交戰距離超出 → 距離不符，Range_Mod 極低（0.3~0.5）。射程型招式（如水狙擊槍）在射程內中距/遠距不衰減",
+    "Ambush_Mod": "偷襲劣勢：被偷襲方 0.8；無偷襲 1.0",
+    "Martial": "武藝值（0~100，每 10 點 +5% 近戰基礎，最高 1.5 倍）",
+    "MP_Invested": "魔力包裹投入量（1.0~3.0），初始 1.0~2.0，落後自動加碼每次 +0.5 追回差距或達上限"
+  },
+  "weapon_base_table": {
+    "bare": {"base": 1.0, "example": "徒手：拳、掌、爪"},
+    "light": {"base": 2.0, "example": "輕武器：匕首、短刀、飛刀"},
+    "one_hand": {"base": 3.0, "example": "單手武器：長劍、單手戰斧、魔杖"},
+    "heavy": {"base": 4.0, "example": "重型武器：大劍、巨斧、長槍"},
+    "legend": {"base": 5.0, "example": "傳說特製（僅管理員 weapon_base 覆寫）"}
+  },
+  "element_system": {
+    "elements": ["光", "暗", "火", "水", "冰", "風", "雷", "岩", "毒", "葉", "鐵", "時間", "無限", "太空", "核", "純粹魔力", "靈魂", "花朵", "夢幻", "混沌"],
+    "rule": "剋制 1.2 / 無 1.0 / 被剋 0.8（特殊元素可 1.3）；未列組合一律 1.0；剋制方向以組合定義為準，不自動反推",
+    "strong_pairs": [["光", "暗"], ["光", "靈魂"], ["光", "夢幻"], ["暗", "靈魂"], ["暗", "夢幻"], ["火", "冰"], ["火", "葉"], ["火", "鐵"], ["火", "毒"], ["水", "火"], ["水", "岩"], ["水", "毒"], ["冰", "水"], ["冰", "葉"], ["風", "毒"], ["風", "葉"], ["雷", "水"], ["雷", "鐵"], ["雷", "風"], ["岩", "風"], ["岩", "雷"], ["岩", "冰"], ["毒", "葉"], ["毒", "花朵"], ["毒", "鐵"], ["葉", "岩"], ["葉", "水"], ["鐵", "葉"], ["鐵", "岩"], ["時間", "太空"], ["時間", "核"], ["無限", "時間"], ["無限", "太空"], ["太空", "核"], ["太空", "光"], ["太空", "混沌"], ["核", "鐵"], ["核", "毒"], ["核", "靈魂"], ["核", "純粹魔力"], ["純粹魔力", "混沌"], ["純粹魔力", "夢幻"], ["純粹魔力", "暗"], ["靈魂", "夢幻"], ["靈魂", "時間"], ["花朵", "夢幻"], ["花朵", "毒"], ["夢幻", "時間"], ["混沌", "光"], ["混沌", "時間"], ["混沌", "無限"]]
+  },
+  "domain_mod_tiers": {
+    "未覺醒": 1.0,
+    "初期覺醒": 1.1,
+    "中期覺醒": 1.25,
+    "後期覺醒": 1.4,
+    "完全覺醒": 1.5
+  },
+  "verdicts": {
+    "clash": [
+      {"condition": "Atk > Def × 2.0", "label": "絕對碾壓", "effect": "無視防禦，斷肢/貫穿/瞬殺"},
+      {"condition": "Atk > Def", "label": "優勢壓制", "effect": "擊退/骨折/內臟震盪/逼出底牌"},
+      {"condition": "Atk ≈ Def", "label": "招式僵持", "effect": "術式對撞、元素抵消、轉入速度與體力消耗戰"}
+    ],
+    "fusion": "雙方同開結界（皆已覺醒）且 Domain_Mod 差距 < 0.3 → 結界交疊：觸發結界融合。任一方未開結界 → 不觸發交疊/覆蓋，以威力比較判定",
+    "non_aggressive": [
+      {"condition": "Atk > Def_BP × 2.0", "label": "命中重創", "effect": "閃避不及/破防"},
+      {"condition": "Atk > Def_BP", "label": "部分命中", "effect": "擦傷/震盪/被逼退"},
+      {"condition": "Atk ≈ Def_BP", "label": "成功迴避/成功防禦", "effect": "招式落空或被擋下"},
+      {"condition": "Atk < Def_BP", "label": "徹底化解", "effect": "毫髮無傷，取得反打位置"}
+    ]
+  },
+  "domain_override": {
+    "rule": "僅雙方皆開結界才適用覆蓋/彌補；任一方未開結界（未覺醒）→ 不適用",
+    "threshold": "差距 ≥ 0.3 → 結界被覆蓋（原始差距 ≥ 0.6 無法彌補）",
+    "mp_compensation": "被覆蓋方可消耗魔力對抗：每 1 點魔力 → 等效 Domain_Mod +0.03，補到差距 < 0.3 為止",
+    "mp_tracking": "系統不追蹤當前魔力；魔力消耗由玩家自行記帳"
+  },
+  "growth_rules": {
+    "main_arc": "實戰經驗 +10~20",
+    "life_or_death_duel": "實戰經驗 +5~10",
+    "domain_battle": "實戰經驗 +5~8，並提升結界術精度",
+    "high_difficulty_task": "實戰經驗 +1~3（打機器人無法超過 E=20）",
+    "proficiency": "玩家使用該能力任一招式於樓層有使用記錄才提升；背景能力掃描寫入 collide_ability_usage（thread_scan），不綁定 clash",
+    "growable_fields": ["exp", "proficiency", "martial", "precision", "awakening", "max_mp"],
+    "not_growable": ["六維能力評級（需管理員人工修改）"],
+    "dedupe": "每個樓層（討論串）同事件只套用一次；所有變動寫入審計 log，可人工修正"
+  }
+}
