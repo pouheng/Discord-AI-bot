@@ -344,6 +344,175 @@ def resolve_mp_invested(
     return mp, bp, notes
 
 
+# ── 招式效果（effect）機械套用 ─────────────────────────────
+#
+# 招式庫的 effect 欄位是自由文字；Phase A2（效果解析）每次對撞把它解析成結構化
+# 效果清單，這裡以純函式**機械套用**（數值決定勝負，LLM 不重判）。
+#
+# 效果型別與參數：
+#   shield  護盾/氣泡/防護罩  {absorb, blocks: "all"|"magic"|"physical",
+#                             exempt: ["光", ...], duration}
+#           blocks 控制擋魔法/物理/全部；exempt 為「元素例外」——攻擊為該元素時護盾**不生效**
+#           （例：無效盾 blocks:"all"+exempt:["光"] → 光傷害以外的物理/魔法全數無效）
+#   dodge   替身/分身/閃避強化 {bonus}          → 防禦方有效防禦 + bonus
+#   buff    增益強化（自身）   {mult}            → 自身 BP × (1+mult)
+#   debuff  削弱敵方           {penalty}         → 對方 BP × (1-penalty)
+#   bind    束縛/控制/位移限制 {penalty}         → 對方 BP × (1-penalty)
+#   summon  召喚協同           {damage_bonus}    → 自身 BP + damage_bonus
+#   trap    陷阱/環境設置      {damage_bonus}    → 自身 BP + damage_bonus
+#   heal    治療/回復          {amount}          → 不影響對撞數值（記帳性質）
+#
+# shield/dodge 為「防禦性效果」：只套用在該場對撞的**防禦方**（被攻擊方）身上。
+# buff/debuff/bind/summon/trap 對自身或對方有效威力作用，與攻守位置無關。
+# 所有效果附帶 note 供思維鏈/正文引用（如「水球氣泡」）。
+
+
+def _fx_float(effect: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return round(float(effect.get(key) or default), 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fx_blocks(
+    blocks: str,
+    atk_kind: str,
+    atk_element: str = "",
+    exempt: object = None,
+) -> bool:
+    """護盾是否能擋住該次攻擊。
+
+    blocks 為 all 或與攻擊型別相符，且攻擊元素不在 exempt（元素例外）內才擋。
+    """
+    exempt_list = [str(e).strip() for e in (exempt or []) if str(e).strip()]
+    if exempt_list and atk_element and atk_element in exempt_list:
+        return False
+    b = (blocks or "all").strip()
+    if not b or b == "all":
+        return True
+    if b in ("magic", "魔法"):
+        return atk_kind in ("magic", "manamelee")
+    if b in ("physical", "物理"):
+        return atk_kind == "melee"
+    return False
+
+
+def apply_effects(
+    atk_bp: float,
+    def_bp: float,
+    atk_effects: list[dict] | None = None,
+    def_effects: list[dict] | None = None,
+    *,
+    atk_kind: str = "magic",
+    def_kind: str = "magic",
+    atk_element: str = "",
+    def_element: str = "",
+) -> tuple[float, float, list[str]]:
+    """機械套用雙方效果到有效 BP。
+
+    順序：
+    1. 防禦方 shield 逐層吸收來襲威力（blocks 相符且元素不在 exempt 才擋；吸收滿 → 氣泡破裂）
+    2. 平面加成：防禦方 dodge → Def_BP + bonus；攻擊方 summon/trap → Atk_BP + damage_bonus
+    3. 倍率：buff（自身）、debuff/bind（對方）
+    4. heal 只記錄，不改數值
+
+    Args:
+        atk_bp / def_bp: 套用前雙方 BP。
+        atk_effects / def_effects: 各自已解析的效果清單（[{type, ...params}]）。
+        atk_kind / def_kind: 雙方招式型別（magic/melee/manamelee/domain），
+            供護盾 blocks 過濾（擋住的是「來襲方」的型別）。
+        atk_element / def_element: 雙方招式元素（自然系才有值，如光/暗/火），
+            供護盾 exempt 過濾（例：無效盾 exempt:["光"] → 光傷害穿透）。
+
+    Returns:
+        (final_atk_bp, final_def_bp, log)
+    """
+    atk_effects = atk_effects or []
+    def_effects = def_effects or []
+    log: list[str] = []
+
+    # 1. 防禦方護盾（absorb 來襲威力）
+    for fx in def_effects:
+        if str(fx.get("type") or "").lower() != "shield":
+            continue
+        absorb = _fx_float(fx, "absorb")
+        if absorb <= 0:
+            continue
+        exempt_list = [str(e).strip() for e in (fx.get("exempt") or []) if str(e).strip()]
+        if exempt_list and atk_element and atk_element in exempt_list:
+            log.append(
+                f"護盾「{fx.get('note') or '?'}」不生效：{atk_element}屬性的攻擊穿透，護盾被突破"
+            )
+            continue
+        if not _fx_blocks(fx.get("blocks") or "", atk_kind):
+            log.append(f"護盾「{fx.get('note') or '?'}」不生效（本次為{atk_kind}攻擊，型別不符）")
+            continue
+        blocked = min(absorb, atk_bp)
+        atk_bp = round(atk_bp - blocked, 2)
+        name = fx.get("note") or fx.get("type") or "護盾"
+        if blocked >= absorb:
+            log.append(f"護盾「{name}」抵擋 {blocked:.2f} BP，完全吸收（氣泡破裂）")
+        else:
+            log.append(
+                f"護盾「{name}」抵擋 {blocked:.2f} BP，剩餘吸收 {round(absorb - blocked, 2):.2f}"
+            )
+
+    # 2. 平面加成
+    for fx in def_effects:
+        if str(fx.get("type") or "").lower() == "dodge":
+            bonus = _fx_float(fx, "bonus")
+            if bonus > 0:
+                def_bp = round(def_bp + bonus, 2)
+                log.append(f"替身/閃避「{fx.get('note') or '?'}」：有效防禦 +{bonus:.2f}")
+    for fx in atk_effects:
+        t = str(fx.get("type") or "").lower()
+        if t in ("summon", "trap"):
+            dmg = _fx_float(fx, "damage_bonus")
+            if dmg > 0:
+                atk_bp = round(atk_bp + dmg, 2)
+                log.append(f"「{fx.get('note') or t}」：威力 +{dmg:.2f}")
+
+    # 3. 倍率（buff 自身 / debuff·bind 對方）
+    for fx in atk_effects:
+        t = str(fx.get("type") or "").lower()
+        if t == "buff":
+            mult = _fx_float(fx, "mult")
+            if mult > 0:
+                atk_bp = round(atk_bp * (1 + mult), 2)
+                log.append(f"增益「{fx.get('note') or '?'}」：自身威力 ×{round(1 + mult, 2):.2f}")
+    for fx in def_effects:
+        t = str(fx.get("type") or "").lower()
+        if t == "buff":
+            mult = _fx_float(fx, "mult")
+            if mult > 0:
+                def_bp = round(def_bp * (1 + mult), 2)
+                log.append(f"增益「{fx.get('note') or '?'}」：自身防禦 ×{round(1 + mult, 2):.2f}")
+    for fx in atk_effects:
+        t = str(fx.get("type") or "").lower()
+        if t in ("debuff", "bind"):
+            penalty = _fx_float(fx, "penalty")
+            if 0 < penalty < 1:
+                def_bp = round(def_bp * (1 - penalty), 2)
+                log.append(f"削弱「{fx.get('note') or t}」：對方威力 ×{round(1 - penalty, 2):.2f}")
+    for fx in def_effects:
+        t = str(fx.get("type") or "").lower()
+        if t in ("debuff", "bind"):
+            penalty = _fx_float(fx, "penalty")
+            if 0 < penalty < 1:
+                atk_bp = round(atk_bp * (1 - penalty), 2)
+                log.append(f"削弱「{fx.get('note') or t}」：對方威力 ×{round(1 - penalty, 2):.2f}")
+
+    # 4. heal 記錄
+    for fx in atk_effects:
+        if str(fx.get("type") or "").lower() == "heal":
+            log.append(f"治療「{fx.get('note') or '?'}」回復 {_fx_float(fx, 'amount'):.0f}（記帳，不影響本次勝負）")
+    for fx in def_effects:
+        if str(fx.get("type") or "").lower() == "heal":
+            log.append(f"治療「{fx.get('note') or '?'}」回復 {_fx_float(fx, 'amount'):.0f}（記帳，不影響本次勝負）")
+
+    return atk_bp, def_bp, log
+
+
 # ── 四階判定 ──────────────────────────────────────────────
 
 VERDICT_DECISIVE = "絕對碾壓"
@@ -565,3 +734,42 @@ if __name__ == "__main__":
     assert "龍王禁地" in fx["特殊規則融合"]["rule_self"] and "地獄水牢" in fx["特殊規則融合"]["rule_self"]
     print("fusion_effects:", fx)
     assert domain_fusion_effects({"name": "甲", "rule_self": "普通水牢"}, {"name": "乙", "rule_self": "普通火界"})["必中中和"]["active"] is False
+
+    # 招式效果機械套用
+    fx_atk = [
+        {"type": "buff", "mult": 0.15, "note": "燃火增幅"},
+        {"type": "summon", "damage_bonus": 1.2, "note": "火焰分身協同"},
+    ]
+    fx_def = [
+        {"type": "shield", "absorb": 2.5, "blocks": "magic", "note": "水球氣泡"},
+        {"type": "dodge", "bonus": 0.5, "note": "烈焰替身"},
+        {"type": "debuff", "penalty": 0.1, "note": "水氣干擾"},
+    ]
+    a0, d0 = 20.0, 12.0
+    a1, d1, log = apply_effects(a0, d0, fx_atk, fx_def, atk_kind="magic", def_kind="magic")
+    # 護盾吸收 2.5 → 17.5；summon +1.2 → 18.7；buff ×1.15 → 21.505
+    # 防禦方 debuff 削攻擊方 ×0.9 → 19.3545
+    # dodge +0.5 → 12.5（防禦方自己的 debuff 不影響自己）
+    assert abs(a1 - 19.35) < 0.01, f"atk={a1}"
+    assert abs(d1 - 12.5) < 0.01, f"def={d1}"
+    assert any("水球氣泡" in l and "破裂" in l for l in log), "吸收滿應標記氣泡破裂"
+    print("effects:", a0, d0, "->", a1, d1)
+    for l in log:
+        print("  ", l)
+    # 物理護盾不擋魔法
+    a2, d2, log2 = apply_effects(20.0, 12.0, [], [{"type": "shield", "absorb": 2.5, "blocks": "physical", "note": "岩壁"}], atk_kind="magic")
+    assert a2 == 20.0, "physical 護盾不應擋魔法"
+    # 護盾未滿：剩餘吸收
+    a3, d3, log3 = apply_effects(1.0, 12.0, [], [{"type": "shield", "absorb": 2.5, "blocks": "all", "note": "氣泡"}], atk_kind="magic")
+    assert a3 == 0.0 and any("剩餘吸收" in l for l in log3)
+    # 無效盾（blocks all + exempt 光）：非光傷害全數無效
+    null_shield = [{"type": "shield", "absorb": 999, "blocks": "all", "exempt": ["光"], "note": "暗影潛形"}]
+    a4, d4, log4 = apply_effects(20.0, 12.0, [], null_shield, atk_kind="magic", atk_element="暗")
+    assert a4 == 0.0, f"無效盾應完全吸收，got atk={a4}"
+    # 光屬性的攻擊穿透無效盾
+    a5, d5, log5 = apply_effects(20.0, 12.0, [], null_shield, atk_kind="magic", atk_element="光")
+    assert a5 == 20.0, f"光屬性應穿透無效盾，got atk={a5}"
+    assert any("穿透" in l for l in log5), "應記錄光屬性穿透"
+    # 光屬性但護盾無 exempt → 正常擋
+    a6, d6, log6 = apply_effects(20.0, 12.0, [], [{"type": "shield", "absorb": 5.0, "blocks": "all", "note": "氣泡"}], atk_kind="magic", atk_element="光")
+    assert a6 == 15.0, f"無 exempt 護盾應正常擋光，got atk={a6}"

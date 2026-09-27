@@ -17,7 +17,7 @@ import autopilot
 import tarot
 from dotenv import load_dotenv
 from db import get_db, init_db as _db_init, DB_FILE
-from parsers import extract_json, parse_learn_tags, parse_mem_tag, strip_planning, strip_mem_learn_tags, strip_html_tags
+from parsers import extract_json, parse_learn_tags, parse_mem_tag, strip_planning, strip_mem_learn_tags, strip_html_tags, strip_body_marker
 from profiles import (
     PROFILE_FIELDS, PROFILE_LABELS,
     get_character_profile, update_character_profile,
@@ -308,6 +308,79 @@ async def save_user_memory(
         print(f"[錯誤] 寫入資料庫失敗: {e}")
 
 
+async def _find_semantic_self_memory(
+    conn, topic: str, content: str, limit: int = 300
+):
+    """語意防重：找「topic 措辭不同但內容同一事實」的既有記憶。
+
+    判定（同時滿足才視為同一條，避免誤併不同主題）：
+     1. topic 核心詞共享：英數 token >=1 或中文詞 >=2（_memory_keywords）
+     2. content 佐證：content 也抽得出共享詞，或整體相似度足夠
+    回傳 (id, existing_topic, existing_content) 或 None。
+    """
+    kw_new = _memory_keywords(topic)
+    kw_c_new = _memory_keywords(content)
+    cursor = await conn.execute(
+        "SELECT id, topic, content FROM memories WHERE user_id = '__BOT__' "
+        "AND topic != ? ORDER BY timestamp DESC LIMIT ?",
+        (topic, limit),
+    )
+    rows = await cursor.fetchall()
+    best = None
+    best_score = 0.0
+    for mid, etopic, econtent in rows:
+        kw_old = _memory_keywords(etopic)
+        en_new = {t for t in kw_new if re.search(r"[A-Za-z0-9]", t)}
+        en_old = {t for t in kw_old if re.search(r"[A-Za-z0-9]", t)}
+        zh_new = {t for t in kw_new if not re.search(r"[A-Za-z0-9]", t)}
+        zh_old = {t for t in kw_old if not re.search(r"[A-Za-z0-9]", t)}
+        en_share = en_new & en_old
+        zh_share = zh_new & zh_old
+        if not en_share and len(zh_share) < 2:
+            continue
+        s1 = content or ""
+        s2 = econtent or ""
+        if len(s1) < 8 or len(s2) < 8:
+            continue
+        import difflib as _diff
+
+        sm = _diff.SequenceMatcher(None, s1, s2)
+        ratio = sm.ratio()
+        lm = sm.find_longest_match(0, len(s1), 0, len(s2))
+        # content 佐證：content 共享詞（英數>=1 或中文>=2）、或相似度/公共子串足夠
+        kw_c_old = _memory_keywords(econtent)
+        en_c_share = {
+            t
+            for t in kw_c_new & kw_c_old
+            if re.search(r"[A-Za-z0-9]", t)
+        }
+        zh_c_share = {
+            t
+            for t in kw_c_new & kw_c_old
+            if not re.search(r"[A-Za-z0-9]", t)
+        }
+        content_ok = (
+            len(en_c_share) >= 1
+            or len(zh_c_share) >= 2
+            or ratio >= 0.2
+            or lm.size >= 8
+        )
+        if not content_ok:
+            continue
+        score = (
+            0.5
+            + len(en_share) * 0.2
+            + len(zh_share) * 0.05
+            + len(en_c_share) * 0.05
+            + min(ratio, 0.3)
+            + min(lm.size / 80.0, 0.1)
+        )
+        if score > best_score:
+            best_score = score
+            best = (mid, etopic, econtent)
+    return best
+
+
 async def save_self_memory(
     topic: str, content: str, mem_type: str = "真實", context: str = "ic"
 ):
@@ -350,14 +423,34 @@ async def save_self_memory(
                     print(f"[自我記憶] 去重更新 -> {topic} ({mem_type})")
 
         if not matched:
-            char_name = await get_character_name() or "角色"
-            await conn.execute(
-                "INSERT INTO memories (timestamp, user_id, user_name, topic, content, mem_type, context) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (now_str, "__BOT__", char_name, topic, content, mem_type, context),
+            # 語意防重：topic 措辭不同但講同一件事時（如「事件:凌空CNC購買計畫」
+            # vs「事件:CNC機台購買計劃」），也要合併更新而非新增，否則會不斷堆積
+            # 雷同記憶（9/15 的 76 條重複即敗破此處）。
+            semantic_match = await _find_semantic_self_memory(
+                conn, topic, content, limit=300
             )
-            print(
-                f"[自我記憶] 寫入 -> {topic}: {content[:80]}... ({mem_type}, {context})"
-            )
+            if semantic_match:
+                mid, existing_topic, existing_content = semantic_match
+                if content not in existing_content:
+                    new_body = existing_content + "；" + content
+                else:
+                    new_body = existing_content
+                await conn.execute(
+                    "UPDATE memories SET content = ?, timestamp = ?, mem_type = ?, context = ? WHERE id = ?",
+                    (new_body, now_str, mem_type, context, mid),
+                )
+                print(
+                    f"[自我記憶] 語意合併 -> {existing_topic} (+{topic[:40]}) ({mem_type})"
+                )
+            else:
+                char_name = await get_character_name() or "角色"
+                await conn.execute(
+                    "INSERT INTO memories (timestamp, user_id, user_name, topic, content, mem_type, context) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (now_str, "__BOT__", char_name, topic, content, mem_type, context),
+                )
+                print(
+                    f"[自我記憶] 寫入 -> {topic}: {content[:80]}... ({mem_type}, {context})"
+                )
         await conn.commit()
         await conn.close()
     except Exception as e:
@@ -534,24 +627,22 @@ async def _ai_edit_message(original: str, find_text: str, new_text: str) -> str 
             else ""
         )
     )
-    try:
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你只輸出修改後的完整文章，不加任何多餘文字。",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=2000,
+    result = await _flash_chat(
+        "你只輸出修改後的完整文章，不加任何多餘文字。",
+        prompt,
+        max_tokens=2000,
+        temperature=0.1,
+    )
+    if not result:
+        print("[修改] 首次編輯無回應，稍候重試一次")
+        await asyncio.sleep(2.0)
+        result = await _flash_chat(
+            "你只輸出修改後的完整文章，不加任何多餘文字。",
+            prompt,
+            max_tokens=4000,
+            temperature=0.2,
         )
-        result = (resp.choices[0].message.content or "").strip()
-        return result if result else None
-    except Exception as e:
-        print(f"[EDIT_MSG] AI 編輯呼叫失敗: {e}")
-        return None
+    return result if result else None
 
 
 # --- 任務系統 ---
@@ -714,38 +805,316 @@ async def get_self_memory_raw(limit: int = 50) -> list[dict]:
 
 
 
+def _memory_keywords(topic: str) -> set[str]:
+    """從 topic 去前綴後抽「關鍵詞」：英數 token + 2-6 字中文詞（濾掉過度常見詞）。
+
+    用於把「措辭不同但共享核心名詞」的記憶聚在一起
+    （例：「中之人經歷:凌空考慮購入CNC機台」vs「事件:CNC 機台討論」都含 CNC）。
+    """
+    import re as _re
+
+    _STOP = {
+        "凌空", "星狐", "澪", "bot", "角色", "人物", "設定", "方面",
+        "中之人", "相關", "曾經", "目前", "已經", "尚未", "本次", "前面",
+        "討論", "問題", "事件", "計畫", "預算", "購買", "計劃", "談論",
+        "裝置", "系統", "機台", "開發", "設計", "使用", "利用", "擁有",
+        "工作室", "公司", "有", "是", "那", "這", "自己", "覺得", "認為",
+        "為何", "如何", "是否", "結果", "情況", "開始", "出現", "提及",
+        "東西", "設備", "事情", "內容", "資訊", "過程", "部分", "來源",
+    }
+    t = _re.sub(r"^(事件|人物|物品|場景|世界觀|任務|角色背景|中之人經歷|角色能力|角色名稱|角色身份)[：:]", "", topic.strip())
+    toks: set[str] = set()
+    for m in _re.finditer(r"[A-Za-z0-9\u00e0-\u00ff]{2,}", t):
+        toks.add(m.group().lower())
+    # 中文採 2-3 字滑窗（非整串貪婪），避開把「凌空的老婆騎」整串當單一 token
+    zh_chars = _re.findall(r"[\u3400-\u9fff]", t)
+    if len(zh_chars) >= 2:
+        for size in (3, 2):
+            for start in range(0, len(zh_chars) - size + 1):
+                gram = "".join(zh_chars[start : start + size])
+                if gram not in _STOP:
+                    toks.add(gram)
+    return toks
+
+
+def _group_similar_memories(memories: list[dict]) -> list[list[dict]]:
+    """依 topic 相似度把記憶聚成候選重複組。
+
+    回傳成「候選重複組」：每組包含 >= 2 條主題高度相似的記憶。
+    判斷準則（兩輪）：
+      1. 去前綴（事件:/人物:/物品: 等）後比對主體字串，相似度 > 0.66 判定為候選重複。
+      2. 對第 1 輪沒被併走的殘餘，比對「共享關鍵詞」>= 2 個即併入同組，
+         用來抓住措辭不同但核心名詞相同的重複（CNC／震動／切削液 等）。
+    只做建議，是否合併仍由 AI 決定。
+    """
+    import difflib
+
+    def _body(topic: str) -> str:
+        t = re.sub(r"^(事件|人物|物品|場景|世界觀|任務|角色背景|中之人經歷|角色能力|角色名稱|角色身份)[：:]", "", topic.strip())
+        return t.strip() or topic.strip()
+
+    pairs = [(m, _body(m["topic"])) for m in memories]
+    groups: list[list[dict]] = []
+    used: set[int] = set()
+    # 第一輪：序列相似度聚類
+    for i, (mi, bi) in enumerate(pairs):
+        if i in used:
+            continue
+        group = [mi]
+        used.add(i)
+        for j, (mj, bj) in enumerate(pairs):
+            if j in used or j == i:
+                continue
+            if not bi or not bj:
+                continue
+            short, long = sorted((bi, bj), key=len)
+            sim = difflib.SequenceMatcher(None, bi, bj).ratio()
+            # 兩條都只有純中文（無英數縮寫/術語，如 CNC、CAN）時，字面相似度可能誤導
+            # （「凌空的電動叉車」vs「凌空的老婆騎電動自行車」sim≈0.67）；
+            # 純中文採較嚴的模糊帶判定：sim≥0.78 直接併，0.60≤sim<0.78 需 LCS≥4 才併。
+            has_en = bool(re.search(r"[A-Za-z0-9]", bi) or re.search(r"[A-Za-z0-9]", bj))
+            if has_en:
+                threshold, fuzzy = 0.66, False
+            elif sim >= 0.78:
+                threshold, fuzzy = sim, False
+            else:
+                threshold, fuzzy = 0.60, True
+            if sim <= threshold:
+                continue
+            lm = difflib.SequenceMatcher(None, short, long).find_longest_match(
+                0, len(short), 0, len(long)
+            )
+            if fuzzy and lm.size < 4:
+                continue
+            # 長度懸殊時，須共享英數核心詞或 LCS 才算同主題，
+            # 避免「凌空的電動叉車」誤併「凌空的老婆騎電動自行車」這類純字面重複
+            if len(short) * 2 < len(long):
+                kw_i = _memory_keywords(bi)
+                kw_j = _memory_keywords(bj)
+                en_i = {t for t in kw_i if re.search(r"[A-Za-z0-9]", t)}
+                en_j = {t for t in kw_j if re.search(r"[A-Za-z0-9]", t)}
+                if not (en_i & en_j) and lm.size < 3:
+                    continue
+            group.append(mj)
+            used.add(j)
+        if len(group) >= 2:
+            groups.append(group)
+
+    # 第二輪：共享關鍵詞聚類（抓措辭不同的同主題重複）
+    def _shared_strength(tk1: set[str], tk2: set[str]) -> bool:
+        """兩條記憶是否構成同主題：共享英文/數字核心詞 >=1，或共享 >=2 個 3 字以上中文詞。"""
+        en1 = {t for t in tk1 if re.search(r"[A-Za-z0-9]", t)}
+        en2 = {t for t in tk2 if re.search(r"[A-Za-z0-9]", t)}
+        zh1 = {t for t in tk1 if not re.search(r"[A-Za-z0-9]", t) and len(t) >= 3}
+        zh2 = {t for t in tk2 if not re.search(r"[A-Za-z0-9]", t) and len(t) >= 3}
+        if en1 & en2:
+            return True
+        return len(zh1 & zh2) >= 2
+
+    kws = [(m, _memory_keywords(m["topic"])) for m in memories]
+    for i, (mi, ki) in enumerate(kws):
+        if i in used:
+            continue
+        if not ki:
+            continue
+        group = [mi]
+        used.add(i)
+        for j, (mj, kj) in enumerate(kws):
+            if j in used or j == i or not kj:
+                continue
+            if _shared_strength(ki, kj):
+                group.append(mj)
+                used.add(j)
+        if len(group) >= 2:
+            groups.append(group)
+    return groups
+
+
+def _auto_merge_dup_groups(groups: list[list[dict]], strict_category: bool = True) -> list[dict]:
+    """程式端自動合併候選重複組（毋需 AI）。
+
+    每組取內容最長的一條為基底，其餘按「[topic] content」串接保留下來，
+    產生成與 AI 相同格式的 merge action。回傳空清單代表沒有值得合併的組。
+    預設只合併同類別（事件:/人物:/場景: 等前綴一致）的組，避免跨類別誤合併；
+    strict_category=False 時解除限制（供內容高度重複的跨類別組使用）。
+    """
+
+    def _category(topic: str) -> str:
+        m = re.match(r"^(事件|人物|物品|場景|世界觀|任務|角色背景|中之人經歷|角色能力|角色名稱|角色身份)[：:]", topic.strip())
+        return m.group(1) if m else "無前綴"
+
+    def _body(topic: str) -> str:
+        t = re.sub(r"^(事件|人物|物品|場景|世界觀|任務|角色背景|中之人經歷|角色能力|角色名稱|角色身份)[：:]", "", topic.strip())
+        return t.strip() or topic.strip()
+
+    actions = []
+    for g in groups:
+        if len(g) < 2:
+            continue
+        cats = {_category(m["topic"]) for m in g}
+        bodies = {_body(m["topic"]) for m in g}
+        if strict_category and len(cats) > 1 and len(bodies) > 1:
+            # 跨類別：去前綴後主題本體完全相同（如 事件:頭盔印製 vs 任務:頭盔印製）、
+            # 共享英文/數字核心詞（如 CNC、CAN、Golf——這類縮寫本身就代表同一事物）、
+            # 共享 ≥2 個中文關鍵詞、或任兩條 body 有 >=3 字的最長公共子串
+            # （如「呼叫系統」「工作室」——跨類別但講同一件事）。
+            bodies_l = list(bodies)
+            kw_sets = [_memory_keywords(m["topic"]) for m in g]
+            kw_sets = [s for s in kw_sets if s]
+            shared_kw = set.intersection(*kw_sets) if kw_sets else set()
+            en_sets = [
+                set(re.findall(r"[A-Za-z0-9\u00e0-\u00ff]{2,}", _body(m["topic"])))
+                for m in g
+            ]
+            en_sets = [s for s in en_sets if s]
+            shared_en = set.intersection(*en_sets) if en_sets else set()
+            max_lcs = 0
+            try:
+                import difflib as _dl
+                for a_i in range(len(bodies_l)):
+                    for b_i in range(a_i + 1, len(bodies_l)):
+                        aa, bb = bodies_l[a_i], bodies_l[b_i]
+                        lm = _dl.SequenceMatcher(None, aa, bb).find_longest_match(
+                            0, len(aa), 0, len(bb)
+                        )
+                        max_lcs = max(max_lcs, lm.size)
+            except Exception:
+                pass
+            if (
+                len(bodies) == 1
+                or len(shared_en) >= 1
+                or len(shared_kw) >= 2
+                or max_lcs >= 3
+            ):
+                pass  # 任一成立 → 允許合併
+            else:
+                continue
+        base = max(g, key=lambda m: len(m["content"]))
+        others = [m for m in g if m["id"] != base["id"]]
+        parts = [base["content"]]
+        for m in others:
+            parts.append(f"[{m['topic']}] {m['content']}")
+        new_content = "；".join(p for p in parts if p)
+        actions.append(
+            {
+                "action": "merge",
+                "ids": [m["id"] for m in g],
+                "new_topic": base["topic"],
+                "new_content": new_content[:500],
+            }
+        )
+    return actions
+
+
+def _group_content_dups(memories: list[dict]) -> list[list[dict]]:
+    """依 content 相似度聚類（允許跨類別）。
+
+    只挑「內容高度重複」的對：sim >= 0.65 且短文在長文中保留率 >= 0.5。
+    用於抓同類別偵測漏掉的跨類別重複（同一事實被重複記錄在不同類別下）。
+    """
+    import difflib
+
+    groups: list[list[dict]] = []
+    used: set[int] = set()
+    for i, mi in enumerate(memories):
+        if i in used:
+            continue
+        group = [mi]
+        used.add(i)
+        for j, mj in enumerate(memories):
+            if j in used or j == i:
+                continue
+            ca, cb = mi["content"], mj["content"]
+            if not ca or not cb:
+                continue
+            short, long = sorted((ca, cb), key=len)
+            sim = difflib.SequenceMatcher(None, ca, cb).ratio()
+            if sim < 0.65:
+                continue
+            lmatch = difflib.SequenceMatcher(None, short, long).find_longest_match(0, len(short), 0, len(long)).size
+            if lmatch / len(short) >= 0.5:
+                group.append(mj)
+                used.add(j)
+        if len(group) >= 2:
+            groups.append(group)
+    return groups
+
+
 async def maintain_self_memories():
     """當自我記憶超過閾值時，請 AI 做合併／簡化／刪除"""
-    cfg = await load_prompt_config()
-    threshold = cfg.get("maint_threshold", 20)
-    memories = await get_self_memory_raw(limit=50)
     file_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    maint_log = []
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    maint_log.append(f"=== 記憶維護紀錄 [{now_str}] ===")
 
-    if len(memories) <= threshold:
-        return
+    try:
+        cfg = await load_prompt_config()
+        threshold = cfg.get("maint_threshold", 20)
+        memories = await get_self_memory_raw(limit=200)
 
-    mem_list = "\n".join(
-        f"[id={m['id']}] [{m['topic']}] {m['content'][:200]}" for m in memories
-    )
+        if len(memories) <= threshold:
+            return
 
-    prompt = f"""你是記憶整理器。以下是角色的自我記憶（共 {len(memories)} 條）。記憶過多，請進行整理。
+        maint_log.append(f"維護前記憶數：{len(memories)} 條\n")
+
+        # --- 程式端先做「重複主題聚類」，讓 AI 知道該優先合併哪些 ---
+        dup_groups = _group_similar_memories(memories)
+        grouped_ids = {m["id"] for g in dup_groups for m in g}
+        # 話題 fallback 實際會合併的 ids（strict 模式下成功產生的 merge 動作）
+        dup_actions_pre = _auto_merge_dup_groups(dup_groups)
+        consumed_ids = {i for a in dup_actions_pre for i in a["ids"]}
+        # --- 再抓「內容高度重複」的跨類別重複（同一事實被重複記錄在不同類別下）---
+        # 掃全部記憶（含話題重複組成員），僅排除會被話題 fallback 合併掉的 ids，
+        # 避免同一條記憶被兩個 fallback 重複合併。
+        content_groups = _group_content_dups(
+            [m for m in memories if m["id"] not in consumed_ids]
+        )
+        content_ids = {m["id"] for g in content_groups for m in g}
+        rest = [m for m in memories if m["id"] not in grouped_ids | content_ids]
+
+        list_lines = []
+        for gi, g in enumerate(dup_groups, 1):
+            list_lines.append(f"🔹 候選重複組 {gi}（{len(g)} 條）：")
+            for m in g:
+                list_lines.append(f"[id={m['id']}] [{m['topic']}] {m['content'][:120]}")
+            list_lines.append("")
+        for gi, g in enumerate(content_groups, len(dup_groups) + 1):
+            list_lines.append(f"🔹 跨類別內容重複組 {gi - len(dup_groups)}（{len(g)} 條）：")
+            for m in g:
+                list_lines.append(f"[id={m['id']}] [{m['topic']}] {m['content'][:120]}")
+            list_lines.append("")
+        if rest:
+            list_lines.append("【其餘記憶】（較獨立，機率較低但如有明確重複仍可合併）")
+            for m in rest:
+                list_lines.append(
+                    f"[id={m['id']}] [{m['topic']}] {m['content'][:120]}"
+                )
+        mem_list = "\n".join(list_lines)
+
+        prompt = f"""你是記憶整理器。以下是角色的自我記憶（共 {len(memories)} 條）。記憶過多，請進行整理。
 
 可執行三種操作：
 - merge：將多條相關記憶合併為一條（指定 ids + new_topic + new_content）
 - simplify：將內容冗長的記憶簡化（指定 id + new_content）
 - delete：刪除無用／重複／過時的記憶（指定 ids）
 
- 特別注意：
+  執行順序與優先級：
+  1. 上方標示的「候選重複組」與「跨類別內容重複組」是程式已篩出的高相似對，**請逐組先比對內容**：若組內記憶確為同一事實（僅用詞/類別寫法不同），必須 merge；只有確認內容確實不同才可不處理。
+  2. 其次處理「其餘記憶」中明顯重複、矛盾或已過時的條目（可 merge 或 delete）。
+  3. 「可遺忘」類型的記憶若無保留價值，優先 delete。
+
+  特別注意：
 - 「人物:」開頭的記憶（記錄其他角色設定）務必保留，絕不可刪除
 - 「角色名稱」和「角色身份」類的記憶務必保留（或合併成一條），不可刪除
 - 「場景:」「世界觀:」「事件:」「劇情:」開頭的記憶務必保留（可合併），不可刪除
 - 能力、魔法類記憶若有重複，合併成最完整的一條
 - mem_type 為「可遺忘」的記憶優先刪除，不必保留
 
-  ⛔ 嚴禁將不同類別的記憶合併在一起！
+  ⛔ 跨類別合併規則：
+- 一般情況下嚴禁將不同類別的記憶合併在一起！
 - 場景設定（場景:）、人物設定（人物:）、世界觀（世界觀:）、角色自身設定（角色背景:）是各自獨立的類別，禁止合併到同一條。
 - 錯誤範例：把「場景:魔法學園地圖」「人物:嗏姬老師」「角色背景:房間分配」全部合併成一條 → 禁止！
-- 合併僅限於「同類別、同主題」的記憶，例如多條「場景:學園食堂」的不同描述可合併。
+- 例外：「跨類別內容重複組」內標示的記憶，其內容幾乎完全相同（同一事實被重複記錄在不同類別），此種可合併，保留內容最完整的一條並採用其中一個合適的類別。
 - 若無法確定是否相關，寧可不合併，也不要亂合併。
 
 {mem_list}
@@ -756,38 +1125,55 @@ async def maintain_self_memories():
   {{"action":"simplify","id":12,"new_content":"簡化後內容"}},
   {{"action":"delete","ids":[5,9]}}
 ]}}
-若不需要任何操作則回傳 {{"actions":[]}}"""
+注意：上方「候選重複組」是已由程式篩出的高度相似記憶，你必須逐組判斷，不能忽略它們。每組候選內若有高度重複，至少要 merge 一次；確實無法合併的組才可不處理。除非你確認整理後確實無法再精簡，否則不要回傳 {{"actions":[]}}。"""
 
-    maint_log = []
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    maint_log.append(f"=== 記憶維護紀錄 [{now_str}] ===")
-    maint_log.append(f"維護前記憶數：{len(memories)} 條\n")
+        all_groups = dup_groups + content_groups
 
-    try:
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": "你只輸出 JSON，不要加任何解釋。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=2500,
-            response_format={"type": "json_object"},
-        )
-        raw = resp.choices[0].message.content or '{"actions":[]}'
+        # —— AI 連續回空 >= 2 次 → 跳過 AI，直接走程式端合併（省成本）——
+        global _ai_empty_streak
+        if _ai_empty_streak >= 2:
+            maint_log.append("AI 已連續回空 2 次以上，跳過 AI，直接由程式端合併。")
+            actions = []
+            raw = '{"actions":[]}'
+        else:
+            resp = await client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[
+                    {"role": "system", "content": "你只輸出 JSON，不要加任何解釋。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=8000,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content or '{"actions":[]}'
 
-        maint_log.append("--- AI 回傳 ---")
-        maint_log.append(raw)
-        maint_log.append("")
+            maint_log.append("--- AI 回傳 ---")
+            maint_log.append(raw)
+            maint_log.append("")
 
-        cleaned = extract_json(raw)
-        if cleaned == "{}":
-            maint_log.append("結果：未找到 JSON，略過。")
-            await _write_maint_log(file_ts, maint_log)
-            return
+            cleaned = extract_json(raw)
+            if cleaned == "{}":
+                maint_log.append("結果：AI 回傳不完整（可能截斷），視為空回覆。")
+                actions = []
+            else:
+                plan = json.loads(cleaned)
+                actions = plan.get("actions", [])
 
-        plan = json.loads(cleaned)
-        actions = plan.get("actions", [])
+        # —— 追蹤 AI 空回傳次數（後續用來跳過 AI）——
+        if not actions:
+            _ai_empty_streak += 1
+        else:
+            _ai_empty_streak = 0
+
+        # —— AI 回空 → 程式端自動合併兜底（同類別 + 跨類別內容重複組）——
+        if not actions and all_groups:
+            fallback_actions = _auto_merge_dup_groups(dup_groups) + _auto_merge_dup_groups(
+                content_groups, strict_category=False
+            )
+            if fallback_actions:
+                actions = fallback_actions
+                maint_log.append("結果：AI 未回報動作，改由程式端自動合併候選重複組。")
         if not actions:
             maint_log.append("結果：AI 判定無需任何操作。")
             await _write_maint_log(file_ts, maint_log)
@@ -863,7 +1249,7 @@ async def maintain_self_memories():
         await conn.commit()
         await conn.close()
 
-        after_memories = await get_self_memory_raw(limit=50)
+        after_memories = await get_self_memory_raw(limit=200)
         after_list = "\n".join(
             f"[id={m['id']}] [{m['topic']}] {m['content'][:200]}"
             for m in after_memories
@@ -876,6 +1262,12 @@ async def maintain_self_memories():
     except Exception as e:
         maint_log.append(f"\n❌ 錯誤：{e}")
         print(f"[記憶維護] 失敗: {e}")
+        try:
+            await _log_error(
+                "maint_crash", str(e), traceback=traceback.format_exc()[:500]
+            )
+        except Exception:
+            pass
 
     await _write_maint_log(file_ts, maint_log)
 
@@ -1005,6 +1397,7 @@ async def update_channel_summary(
 
 
 _maint_trigger_count = 0
+_ai_empty_streak = 0
 
 
 async def phase3_process(
@@ -1014,6 +1407,7 @@ async def phase3_process(
     lore_text: str = "",
     self_memories: str = "",
     session_dir: str = "",
+    all_context: list | None = None,
 ):
     """Phase 3：解析標籤寫入、知識檢測、每日日誌、記憶維護"""
     global _maint_trigger_count
@@ -1073,21 +1467,6 @@ async def phase3_process(
                         log_lines.append(
                             f"  [LEARN] [{mem_type or '無type'}] {topic}: {content[:80]}"
                         )
-                    # 人物類 LEARN 也同步寫入 user_memory，方便 get_user_memory 召回
-                    if topic.startswith("人物:") and mem_type == "真實":
-                        await save_user_memory(
-                            user_id=message.author.id,
-                            user_name=message.author.display_name,
-                            topic=topic,
-                            content=content,
-                            context="ooc"
-                            if channel_type == "out_of_character"
-                            else "ic",
-                            mem_type=mem_type,
-                        )
-                        log_lines.append(
-                            f"  [user-mirror] {message.author.display_name} -> {topic}"
-                        )
             except json.JSONDecodeError:
                 pass
 
@@ -1110,6 +1489,23 @@ async def phase3_process(
         r"<planning>.*?</planning>", "", raw_phase2_response, flags=re.DOTALL
     ).strip()
     bot_response_snippet = clean_response[:1200]
+
+    # 組對話歷史：取所有 context 訊息（最多 ~20 條，每條截斷以免爆 token）
+    conv_lines = []
+    for cm in (all_context or []):
+        role = cm.get("role", "?")
+        ctext = cm.get("content", "")
+        if not ctext or not ctext.strip():
+            continue
+        if role == "system":
+            continue
+        speaker = "使用者" if role == "user" else ("澪" if role == "assistant" else role)
+        conv_lines.append(f"[{speaker}] {ctext[:300]}")
+    conversation_history = "\n".join(conv_lines[-20:]) or "（無）"
+    # 已知記憶採「最新優先」：get_self_memory 組出的是舊→新字串，
+    # 若直接取前 8000 字元會只剩最舊記憶，導致 AI 看不見剛寫入的新記憶、
+    # 每次都把近期話題當全新主題重複 learn。改取最後 8000 字元＝最新記憶。
+    self_mem_snippet = self_memories[-8000:] if len(self_memories) > 8000 else self_memories
     detect_prompt = f"""# ── 靜態指令區（上方）：規則說明 ──
 
 逐條比對【bot回覆】與【角色已知記憶】中的每條記憶，找出所有需要新增或更新之處。
@@ -1144,6 +1540,14 @@ async def phase3_process(
     例（更新內容）：{{"action":"edit_self","topic":"角色能力:結界（圖書館/檔案室）","new_type":"真實","new_content":"更新的內容..."}}
     例（確認既有）：{{"action":"edit_self","topic":"事件:學園入學測驗","new_type":"真實","new_content":"（與既有記憶一致，已確認）"}}
 
+    ⚠️ 避免記憶爆炸的最重要原則：
+    - 當「角色已知記憶」裡**已經有一條與當前內容相關的記憶**（即使 topic 措辭略有不同），一律 → 用 edit_self 更新那條，
+      把新細節併入既有記憶，**絕不要**用 learn 再開一條雷同的新記憶。
+    - 例：既有「事件:魔法陣叫出隕石」與 bot 回覆「隕石被嗑掉、已當日常插曲收尾」→ 應 edit_self 那條既有記憶補上收尾，
+      而不是 learn 新增「事件:隕石被嗑掉的橋段」。
+    - 「確認/重述既有記憶」也絕不新增 learn，最多 edit_self。
+    - 只有當 bot 回覆帶來**真正全新、既有記憶完全沒有**的主題，才用 learn 建立新記憶。
+
  4. profile / profile_char — 更新角色檔案
     profile = bot 自己（不需 char），profile_char = 其他角色（必須有 char）
     三個欄位：char / field（gender_age/intro/appearance/items/experience）/ value
@@ -1177,6 +1581,9 @@ async def phase3_process(
 {user_msg_text}
 （由 {user_display_name} 發送）
 
+【對話歷史】（所有有參與到此話題的訊息，按時間順序，供你判斷「這是新資訊還是舊事重提」）
+{conversation_history}
+
 【bot回覆】
 {bot_response_snippet}
 
@@ -1186,7 +1593,7 @@ async def phase3_process(
 {lore_snippet}
 
 【角色已知記憶（逐條比對）】
-{self_memories[:5000]}
+{self_mem_snippet}
 """
 
     temps = [0.3, 0.4, 0.5]
@@ -1209,7 +1616,7 @@ async def phase3_process(
                     {"role": "user", "content": detect_prompt},
                 ],
                 temperature=temp,
-                max_tokens=800,
+                max_tokens=8000,
             )
         except Exception as e:
             log_lines.append(f"  [檢測API失敗] attempt={attempt + 1} {model} {e}")
@@ -1315,16 +1722,6 @@ async def phase3_process(
                     log_lines.append(
                         f"  [LEARN] [{mem_type or '無type'}] {topic}: {content[:100]}"
                     )
-                if topic.startswith("人物:") and mem_type == "真實" and message:
-                    await save_user_memory(
-                        user_id=message.author.id,
-                        user_name=user_display_name or message.author.name,
-                        topic=topic,
-                        content=content,
-                        context="ooc" if channel_type == "out_of_character" else "ic",
-                        mem_type=mem_type,
-                    )
-                    log_lines.append(f"  [user-mirror] {user_display_name} -> {topic}")
 
             elif act_type == "mem":
                 try:
@@ -1470,9 +1867,17 @@ async def phase3_process(
             f"  [摘要] {ch_name}: 增量更新 ({len(old_summary)} → {len(new_summary)})"
         )
 
-    # --- 4. 記憶維護（每 2 輪觸發一次）---
+    # --- 4. 記憶維護（每 5 輪觸發一次，節省 API 成本）---
     _maint_trigger_count += 1
-    await maintain_self_memories()
+    if _maint_trigger_count % 5 == 0:
+        try:
+            await maintain_self_memories()
+        except Exception as e:
+            print(f"[記憶維護] phase3 觸發時崩潰: {e}")
+            try:
+                await _log_error("maint_trigger_crash", str(e))
+            except Exception:
+                pass
 
     # --- 5. 每日日誌（只記錄有實際變動的）---
     has_action = any(
@@ -1548,7 +1953,11 @@ async def _snapshot_prompt_logs(session_dir: str, wait: float = 0):
         await asyncio.sleep(wait)
     if not os.path.isdir(PROMPT_LOG_DIR):
         return
-    os.makedirs(session_dir, exist_ok=True)
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+    except OSError as e:
+        print(f"[提示詞快照] 無法建立 session 資料夾: {e}")
+        return
     for fname in os.listdir(PROMPT_LOG_DIR):
         if not (fname.startswith("last_") and fname.endswith(".txt")):
             continue
@@ -2082,28 +2491,37 @@ async def get_lore_by_topics(topics: list[str]) -> list[dict]:
 
     clean_topics = [re.sub(r"^\[.*?\]\s*", "", t).strip() for t in topics]
 
-    for t in clean_topics:
-        cursor = await conn.execute(
-            "SELECT category, topic, content FROM world_lore WHERE topic = ?",
-            (t,),
-        )
+    async def _query(sql: str, *params):
+        cursor = await conn.execute(sql, params)
+        rows = []
         async for row in cursor:
+            rows.append(row)
+        return rows
+
+    for t in clean_topics:
+        if not t:
+            continue
+        # 逐個 topic 獨立降級：精確 → topic 名稱模糊 → content 模糊。
+        # 舊邏輯是「全部精確都沒中才做模糊」，只要有一個精確命中，
+        # 其他 topic 就完全沒機會匹配；且 content LIKE 會撈回只是在正文
+        # 順帶提到該詞的無關條目（要 AI醬身世卻回隕石飼料），相關性很差。
+        rows = await _query(
+            "SELECT category, topic, content FROM world_lore WHERE topic = ?", t
+        )
+        if not rows:
+            rows = await _query(
+                "SELECT category, topic, content FROM world_lore WHERE topic LIKE ? LIMIT 2",
+                f"%{t}%",
+            )
+        if not rows:
+            rows = await _query(
+                "SELECT category, topic, content FROM world_lore WHERE content LIKE ? LIMIT 1",
+                f"%{t}%",
+            )
+        for row in rows:
             if row[1] not in seen:
                 seen.add(row[1])
                 results.append({"category": row[0], "topic": row[1], "content": row[2]})
-
-    if not results:
-        for t in clean_topics:
-            cursor2 = await conn.execute(
-                "SELECT category, topic, content FROM world_lore WHERE topic LIKE ? OR content LIKE ? LIMIT 3",
-                (f"%{t}%", f"%{t}%"),
-            )
-            async for row in cursor2:
-                if row[1] not in seen:
-                    seen.add(row[1])
-                    results.append(
-                        {"category": row[0], "topic": row[1], "content": row[2]}
-                    )
 
     await conn.close()
     return results[:8]
@@ -2282,6 +2700,14 @@ async def on_ready():
         print(f"[啟動] 已同步 {len(synced)} 個斜線指令")
     except Exception as e:
         print(f"[啟動] 斜線指令同步失敗: {e}")
+    try:
+        import sheets_sync
+        if sheets_sync.get_spreadsheet_id():
+            sheets_sync.start_auto_flush()
+            sheets_sync.mark_all_dirty()
+            print("[啟動] Google Sheets 自動同步已啟動")
+    except Exception as e:
+        print(f"[啟動] Sheets 自動同步啟動失敗: {e}")
 
     await tarot.ensure_images()
 
@@ -2327,6 +2753,48 @@ def format_supplement(supplement) -> str:
         return text
 
     return ""
+
+
+def _phase1_is_usable(raw: str) -> bool:
+    """判斷 Phase 1 回應是否有效：非空 JSON，且至少有一項決策內容。
+
+    「回空」有兩種：空字串 / "{}"。兩者都會讓召回決策失效。
+    """
+    if not raw or not raw.strip():
+        return False
+    try:
+        data = json.loads(extract_json(raw))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    has_recall = bool(data.get("recall"))
+    has_lore = bool(data.get("lore_topics"))
+    has_notes = bool(data.get("lore_notes"))
+    has_supp = bool(data.get("supplement"))
+    return has_recall or has_lore or has_notes or has_supp
+
+
+def _phase1_has_supplement(raw: str) -> bool:
+    """判斷 Phase 1 是否真的產出了 supplement。
+
+    supplement 是唯一能跨「世界觀＋使用者記憶＋自身記憶」全域召回的通道。
+    只有 lore_topics 的話，模型會把「存在於記憶裡的角色設定」誤塞成
+    lore_topics（例如 AI醬身世），但那些主題不在 world_lore 表 → 撈不到東西，
+    lore_text 最後只剩無關條目，Phase 2 等於拿不到任何背景。
+    """
+    if not raw or not raw.strip():
+        return False
+    try:
+        data = json.loads(extract_json(raw))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    supp = data.get("supplement")
+    if isinstance(supp, list):
+        return len(supp) > 0
+    return bool(isinstance(supp, str) and supp.strip())
 
 
 async def run_phase1(
@@ -2445,21 +2913,82 @@ async def run_phase1(
 
     print("[Phase 1] 記憶召回分析中...")
     print(f"[DEBUG] 上下文歷史 {len(all_context)} 條")
-    phase1_resp = await client.chat.completions.create(
-        model="deepseek-v4-flash",
-        messages=[
-            {
-                "role": "system",
-                "content": "你只輸出 JSON，不要加任何解釋或 markdown。",
-            },
-            {"role": "user", "content": phase1_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=2000,
-        response_format={"type": "json_object"},
-    )
 
-    phase1_raw = phase1_resp.choices[0].message.content or "{}"
+    # 空回應重試：deepseek-flash 偶爾回空（{}或空字串），
+    # 這時召回決策會整個失效、只剩觸發者最近 N 條記憶。
+    # 與 Phase 2 相同策略：空內容時提高預算並強化格式要求重試。
+    phase1_raw = ""
+    for attempt in range(3):
+        budget = 2000 * (attempt + 1)
+        try:
+            phase1_resp = await client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你只輸出 JSON，不要加任何解釋或 markdown。",
+                    },
+                    {"role": "user", "content": phase1_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=budget,
+                response_format={"type": "json_object"},
+            )
+            phase1_raw = phase1_resp.choices[0].message.content or ""
+        except Exception as e:
+            print(f"[Phase 1] API 錯誤 attempt={attempt + 1}: {type(e).__name__}: {e}")
+            phase1_raw = ""
+        if _phase1_is_usable(phase1_raw):
+            # usable 但 supplement 空 → 召回品質不足，繼續重試撈 supplement。
+            # （只回 recall/lore_topics 會讓 lore_text 只剩無關世界觀條目）
+            if _phase1_has_supplement(phase1_raw) or attempt == 2:
+                if attempt > 0:
+                    print(f"[Phase 1] 第 {attempt + 1} 次重試後取得有效回應。")
+                break
+            print(
+                f"[Phase 1] supplement 為空（第 {attempt + 1} 次），"
+                f"召回品質不足，重試中..."
+            )
+            await asyncio.sleep(0.5)
+            continue
+        print(f"[Phase 1] 回應為空（第 {attempt + 1} 次），重試中...")
+        await asyncio.sleep(0.5)
+
+    # ── 最後手段：精簡 prompt 兜底 ──
+    # 完整 prompt（世界觀＋全部記憶＋歷史）可能長到模型罷工回空。
+    # 這時只給「當前訊息＋候選人清單」做召回，寧可召回少也不要整個失效。
+    #
+    # 注意：只在「完全不可用」時啟用。精簡 prompt 沒有附資料庫，
+    # 產不出 supplement；若拿它覆蓋「有 recall＋lore_notes 但 supplement 空」
+    # 的結果，反而會弄丟本來召回到的東西。supplement 不足交由上面的重試迴圈處理。
+    if not _phase1_is_usable(phase1_raw):
+        minimal_prompt = f"""你是記憶召回分析器，只輸出 JSON。
+根據當前訊息，決定要召回誰。
+【當前訊息】
+{clean_input[:1000]}
+【可查詢的參與者】
+{candidates_text[:1000]}
+
+輸出格式：{{"recall":[{{"id":"使用者ID"}}],"lore_topics":[],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_notes":[],"supplement":[]}}"""
+        try:
+            resp = await client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[
+                    {"role": "system", "content": "你只輸出 JSON，不要加任何解釋或 markdown。"},
+                    {"role": "user", "content": minimal_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+            minimal_raw = resp.choices[0].message.content or ""
+            if _phase1_is_usable(minimal_raw):
+                print("[Phase 1] 精簡 prompt 兜底成功。")
+                phase1_raw = minimal_raw
+        except Exception as e:
+            print(f"[Phase 1] 精簡 prompt 兜底也失敗: {type(e).__name__}: {e}")
+
+    phase1_raw = phase1_raw or "{}"
     print(f"[LOG] [Phase 1] 回傳: {phase1_raw[:300]}")
     async with aiofiles.open(
         os.path.join(PROMPT_LOG_DIR, "last_phase1_response.txt"), "w", encoding="utf-8"
@@ -2491,6 +3020,14 @@ async def run_phase1(
         lore_notes = phase1_json.get("lore_notes", [])
         if not isinstance(lore_notes, list):
             lore_notes = []
+        # 模型常把 lore_notes 回成純字串而非 {"topic":..,"note":..} 物件。
+        # assemble_lore_text 只認 dict，不正規化的話這些備註會被靜默丟棄，
+        # 導致 Phase 2 拿不到本輪最重要的世界觀／身世線索。
+        lore_notes = [
+            {"note": n.strip()} if isinstance(n, str) and n.strip() else n
+            for n in lore_notes
+        ]
+        lore_notes = [n for n in lore_notes if n]
         recall_threads = phase1_json.get("recall_threads", [])
         if not isinstance(recall_threads, list):
             recall_threads = []
@@ -2629,7 +3166,7 @@ async def build_phase2_system_prompt(
         phase2_system += f"""
 {self_memories}
 
-喔好，收到了，我現在會開始思考、開始 planning：
+喔好，收到了，我現在會開始思考、開始回應：
 
 <planning>
 {planning_tpl}
@@ -2952,6 +3489,75 @@ async def pull_ooc_ic_content(message: discord.Message, channel_type: str, load_
     return ic_context_text, channel_note
 
 
+async def search_memories_by_keyword(keywords: list[str], limit: int = 6) -> str:
+    """關鍵字檢索記憶（Phase 1 失效時的兜底）。
+
+    以 LIKE 比對 topic/content，跨 user_id（含 __BOT__）搜尋，
+    讓『非最近但字面相關』的記憶（例如使用者點名問的舊設定）仍能被帶進來。
+    回傳格式化字串；無命中回傳空字串。
+    """
+    kws = [k.strip() for k in keywords if k and len(k.strip()) >= 2]
+    if not kws:
+        return ""
+    clauses = " OR ".join(["(topic LIKE ? OR content LIKE ?)"] * len(kws))
+    params: list = []
+    for k in kws:
+        params.extend([f"%{k}%", f"%{k}%"])
+    try:
+        async with get_db() as conn:
+            cursor = await conn.execute(
+                f"""SELECT timestamp, topic, content, context, user_name
+                    FROM memories WHERE {clauses}
+                    ORDER BY timestamp DESC LIMIT ?""",
+                (*params, limit),
+            )
+            rows = await cursor.fetchall()
+    except Exception as e:
+        print(f"[關鍵字召回] 搜尋失敗: {e}")
+        return ""
+    if not rows:
+        return ""
+    lines = ["（依關鍵字額外召回）"]
+    for timestamp, topic, content, ctx, uname in rows:
+        label = "【中之人】" if ctx == "ooc" else "【劇中】"
+        who = f"{uname} " if uname else ""
+        lines.append(f"- [{timestamp}] {who}{label} {topic}: {content}")
+    print(f"[關鍵字召回] 命中 {len(rows)} 條: {kws}")
+    return "\n".join(lines)
+
+
+def _extract_keywords(text: str, limit: int = 6) -> list[str]:
+    """從使用者訊息抽出適合做記憶檢索的關鍵字。
+
+    取中文字串片段與較長的英數詞；去常見虛詞。
+    """
+    if not text:
+        return []
+    stop = {"你記不記得", "記得嗎", "有沒有", "不是", "我說", "還有", "這個", "那個",
+            "就是", "可以", "還是", "怎樣", "對不對", "是不是", "什麼", "怎麼"}
+    words: list[str] = []
+    # 中文：以常見詞綴切出 2-4 字候選
+    cjk = re.findall(r"[一-鿿]{2,6}", text)
+    for seg in cjk:
+        if seg in stop:
+            continue
+        words.append(seg)
+    # 明顯專有名詞／關鍵片語：含標點包住的引號內容優先
+    for q in re.findall(r"[「『\"]([^」』\"]{2,12})[」』\"]", text):
+        words.insert(0, q)
+    # 去重並保留順序
+    seen = set()
+    out = []
+    for w in words:
+        if w in seen or w in stop:
+            continue
+        seen.add(w)
+        out.append(w)
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def resolve_and_fetch_memories(recall_user_ids: list, recall_candidates: list,
                                      channel_type: str) -> tuple[list, str]:
     """名稱→ID 解析 + 從 SQLite 撈使用者記憶。回傳 (resolved_ids, combined_memories)。"""
@@ -3014,6 +3620,11 @@ async def assemble_lore_text(phase1_supplement, lore_topics: list, lore_notes: l
                 supplement_lines.append(f"- [{e['category']}] {e['topic']}：{e['content']}")
         all_notes = []
         for n in lore_notes:
+            if isinstance(n, str):
+                # 模型有時把 lore_notes 回成純字串，別讓它被靜默丟棄
+                if n.strip():
+                    all_notes.append(f"# {n.strip()}")
+                continue
             if isinstance(n, dict):
                 note_text = n.get("note", "")
                 if note_text:
@@ -3046,6 +3657,68 @@ async def log_recalled_data(resolved_ids: list, recall_candidates: list,
     ) as f:
         await f.write("\n".join(lines))
     print(f"[DEBUG] 召回資料已寫入 {PROMPT_LOG_DIR}\\last_recalled_data.txt")
+
+
+async def _call_phase2_with_retry(
+    phase2_messages: list, *, label: str = "Phase 2"
+) -> str:
+    """呼叫 deepseek-v4-flash Phase 2；空內容時放大預算重試（最多 3 次）。"""
+    last = ""
+    for attempt in range(3):
+        budget = min(2048 * (2 ** attempt), 8192)
+        try:
+            resp = await client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=phase2_messages,
+                temperature=0.8,
+                max_tokens=budget,
+            )
+        except Exception as e:
+            print(f"[Phase 2] API 錯誤 attempt={attempt + 1}: {type(e).__name__}: {e}")
+            last = ""
+            await asyncio.sleep(0.5)
+            continue
+        content = (resp.choices[0].message.content or "").strip()
+        last = content
+        if content:
+            return content
+        print(
+            f"[Phase 2] 空內容 attempt={attempt + 1} budget={budget} "
+            f"finish={getattr(resp.choices[0], 'finish_reason', None)}"
+        )
+        await asyncio.sleep(0.5)
+
+    # ── 最後手段：精簡 prompt 兜底 ──
+    # 上面 3 次都空時（多半是完整 prompt 太長／模型偶發罷工），
+    # 丟掉記憶、世界觀、lore、上下文，只留「角色 + 當前訊息」再打一次。
+    # 短 prompt 失敗率極低，確保 bot 永遠不會沉默。
+    try:
+        user_txt = next(
+            (m["content"] for m in phase2_messages if m.get("role") == "user"), ""
+        )
+        minimal_system = (
+            "你是一個 Discord 角色扮演機器人，正在扮演設定檔中的角色。"
+            "用角色的口吻自然回應使用者，不要輸出 planning、不要解釋、"
+            "不要加任何標記，只輸出角色要說的話。"
+        )
+        minimal_user = user_txt[-1500:]
+        resp = await client.chat.completions.create(
+            model="deepseek-v4-flash",
+            messages=[
+                {"role": "system", "content": minimal_system},
+                {"role": "user", "content": minimal_user[-1500:]},
+            ],
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if content:
+            print(f"[Phase 2] 精簡 prompt 兜底成功（{len(content)} 字）")
+            return content
+    except Exception as e:
+        print(f"[Phase 2] 精簡 prompt 兜底也失敗: {type(e).__name__}: {e}")
+
+    return last
 
 
 async def build_and_call_phase2(message: discord.Message, *, channel_type: str, pcfg: dict,
@@ -3089,9 +3762,11 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
     if channel_type == "out_of_character":
         planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
         fmt_body = "2. 正文（自然對話）\n"
+        priming_suffix = "喔好，收到了，我現在會開始思考、開始回應："
     else:
         planning_instruction = "1. <planning>當前情況分析</planning>"
         fmt_body = f"2. {phase2_char_name}的台詞\n"
+        priming_suffix = f"開始回應： {phase2_char_name}的台詞"
 
     img_block = ""
     if image_description:
@@ -3116,7 +3791,7 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
     })
     phase2_messages.append({
         "role": "user",
-        "content": f"[{current_user_name}]: {clean_input_reply}",
+        "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
     })
 
     print("[LOG] [Phase 2] 生成角色回覆中...")
@@ -3131,13 +3806,10 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
         await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
+        await f.write(f"\n\n=== PRIMING ===\n{priming_suffix}")
     print(f"[DEBUG] Phase 2 完整提示詞已寫入 {PROMPT_LOG_DIR}\\last_prompt.txt")
 
-    phase2_resp = await client.chat.completions.create(
-        model="deepseek-v4-flash", messages=phase2_messages,
-        temperature=0.8, max_tokens=2048,
-    )
-    raw_content = phase2_resp.choices[0].message.content or ""
+    raw_content = await _call_phase2_with_retry(phase2_messages, label="Phase 2")
     raw_content = autopilot.strip_japanese_original(raw_content)
     print(f"[LOG] [Phase 2] 回傳長度={len(raw_content)}")
     if not raw_content.strip():
@@ -3188,9 +3860,11 @@ async def run_phase2_direct(
     if channel_type == "out_of_character":
         planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
         fmt_body = "2. 正文（自然對話）\n"
+        priming_suffix = "喔好，收到了，我現在會開始思考、開始回應："
     else:
         planning_instruction = "1. <planning>當前情況分析</planning>"
         fmt_body = f"2. {phase2_char_name}的台詞\n"
+        priming_suffix = f"開始回應： {phase2_char_name}的台詞"
 
     img_block = ""
     if image_description:
@@ -3215,7 +3889,7 @@ async def run_phase2_direct(
     })
     phase2_messages.append({
         "role": "user",
-        "content": f"[{current_user_name}]: {clean_input_reply}",
+        "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
     })
 
     print("[LOG] [Phase 2 direct] 生成角色回覆中...")
@@ -3230,12 +3904,10 @@ async def run_phase2_direct(
         await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
+        await f.write(f"\n\n=== PRIMING ===\n{priming_suffix}")
 
-    phase2_resp = await client.chat.completions.create(
-        model="deepseek-v4-flash", messages=phase2_messages,
-        temperature=0.8, max_tokens=2048,
-    )
-    raw_content = phase2_resp.choices[0].message.content or ""
+    phase2_resp = await _call_phase2_with_retry(phase2_messages, label="Phase 2 direct")
+    raw_content = phase2_resp or ""
     raw_content = autopilot.strip_japanese_original(raw_content)
     print(f"[LOG] [Phase 2 direct] 回傳長度={len(raw_content)}")
     if not raw_content.strip():
@@ -3330,6 +4002,7 @@ async def cleanup_response(raw_content: str, blocked_kw: list, phase2_char_name:
 
     bot_reply = strip_mem_learn_tags(cleaned_for_send)
     bot_reply = strip_html_tags(bot_reply)
+    bot_reply = strip_body_marker(bot_reply)
     if not bot_reply:
         bot_reply = "……"
 
@@ -3483,6 +4156,19 @@ async def on_message(message: discord.Message):
                 recall_user_ids, recall_candidates, channel_type,
             )
 
+            # Phase 1 失效（回空 {}）時的兜底：以使用者訊息關鍵字檢索記憶。
+            # 沒有這層時只會拿到觸發者最近幾條記憶，
+            # 使用者點名問的舊設定（例如「你記不記得我提過X」）會撈不到。
+            phase1_failed = not (phase1_supplement or lore_topics or lore_notes)
+            if phase1_failed:
+                kws = _extract_keywords(clean_input_reply)
+                if kws:
+                    kw_mem = await search_memories_by_keyword(kws)
+                    if kw_mem:
+                        combined_memories = (
+                            f"{combined_memories}\n\n{kw_mem}" if combined_memories else kw_mem
+                        )
+
             lore_text = await assemble_lore_text(phase1_supplement, lore_topics, lore_notes)
 
             await log_recalled_data(resolved_ids, recall_candidates, combined_memories, lore_text)
@@ -3503,7 +4189,7 @@ async def on_message(message: discord.Message):
 
             bot_reply = await cleanup_response(raw_content, blocked_kw, phase2_char_name, clean_input, clean_input_reply)
 
-            excerpt = re.sub(r'[\\/:*?"<>|]', "", clean_input[:20]) or "unknown"
+            excerpt = re.sub(r'[\\/:*?"<>|\r\n]', "", clean_input[:20]) or "unknown"
             session_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             session_dir = os.path.join(PROMPT_LOG_DIR, f"{session_ts}_{excerpt}")
             asyncio.create_task(_snapshot_prompt_logs(session_dir, wait=0.5))
@@ -3516,7 +4202,8 @@ async def on_message(message: discord.Message):
 
             self_memories_all = await get_self_memory(limit=200)
             asyncio.create_task(phase3_process(
-                message, raw_content, channel_type, lore_text, self_memories_all, session_dir,
+                message, raw_content, channel_type, lore_text, self_memories_all,
+                session_dir, all_context,
             ))
             asyncio.create_task(autopilot.process_autopilot_memories(message, raw_content))
             asyncio.create_task(_cleanup_old_sessions())
@@ -3546,14 +4233,26 @@ class ModifyModal(discord.ui.Modal, title="修改建議"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.followup.send("🔍 審查中…", ephemeral=True)
+            await self._do_edit(interaction)
+        except Exception as e:
+            print(f"[修改] 修改流程錯誤: {e}")
+            try:
+                await interaction.followup.send(f"❌ 修改失敗：{e}", ephemeral=True)
+            except Exception:
+                pass
+
+    async def _do_edit(self, interaction: discord.Interaction):
         original = self.target_message.content
         suggestion = self.suggestion.value.strip()
         if not original or not suggestion:
             await interaction.followup.send("❌ 訊息或建議為空", ephemeral=True)
             return
 
-        # 合理性審查
-        review = await _review_edit_suggestion(original, suggestion)
+        # 合理性審查（含前後文脈絡）
+        context_text = await _fetch_review_context(self.target_message)
+        review = await _review_edit_suggestion(original, suggestion, context_text)
         if not review.get("approved"):
             reason = review.get("reason", "AI 判定不建議修改")
             await interaction.followup.send(
@@ -3564,7 +4263,14 @@ class ModifyModal(discord.ui.Modal, title="修改建議"):
         # 執行修改
         modified = await _ai_edit_message(original, "", suggestion)
         if modified and modified != original:
-            await self.target_message.edit(content=modified)
+            try:
+                await self.target_message.edit(content=modified)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"⚠️ AI 已改好，但發送修改失敗：{e}\n```\n{modified[:1500]}\n```",
+                    ephemeral=True,
+                )
+                return
             await interaction.followup.send(
                 f"✅ 已根據建議修改\n**修改摘要**：{review.get('summary', '無')}",
                 ephemeral=True,
@@ -3594,66 +4300,204 @@ async def cmd_modify_context(
 async def cmd_delete_context(
     interaction: discord.Interaction, message: discord.Message
 ):
-    """右鍵機器人訊息 → 刪除訊息（需「管理訊息」權限或機器人擁有者）。"""
+    """右鍵機器人訊息 → 填寫理由提出刪除請求，通過 AI 合理性審查後才會真的刪除。"""
     if message.author != bot.user:
         await interaction.response.send_message(
             "❌ 只能刪除機器人發出的訊息", ephemeral=True
         )
         return
-    allowed = False
-    if interaction.guild:
-        perm = interaction.user.guild_permissions
-        allowed = bool(perm.manage_messages) or bool(perm.administrator)
-    if not allowed:
+    await interaction.response.send_modal(DeleteRequestModal(message))
+
+
+class DeleteRequestModal(discord.ui.Modal, title="要求澪刪除發言"):
+    reason = discord.ui.TextInput(
+        label="刪除理由",
+        style=discord.TextStyle.long,
+        placeholder="請描述這則訊息為什麼應該被刪除（將連同上下文交由 AI 審查）…",
+        max_length=500,
+    )
+
+    def __init__(self, target_message: discord.Message):
+        super().__init__()
+        self.target_message = target_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         try:
-            owner = (await bot.application_info()).owner
-            allowed = interaction.user.id == owner.id
-        except Exception:
-            pass
-    if not allowed:
-        await interaction.response.send_message(
-            "❌ 需要「管理訊息」權限才能刪除", ephemeral=True
+            await interaction.followup.send("🔍 審查中…", ephemeral=True)
+            await self._do_delete(interaction)
+        except Exception as e:
+            print(f"[刪除] 刪除流程錯誤: {e}")
+            try:
+                await interaction.followup.send(f"❌ 刪除失敗：{e}", ephemeral=True)
+            except Exception:
+                pass
+
+    async def _do_delete(self, interaction: discord.Interaction):
+        reason = self.reason.value.strip()
+        if not reason:
+            await interaction.followup.send("❌ 需要填寫刪除理由", ephemeral=True)
+            return
+
+        # 合理性審查
+        context_text = await _fetch_review_context(self.target_message)
+        review = await _review_delete_request(
+            self.target_message.content, reason, context_text
         )
-        return
+        if not review.get("approved"):
+            why = review.get("reason", "AI 判定不應刪除")
+            await interaction.followup.send(
+                f"❌ 刪除請求被拒絕：{why}", ephemeral=True
+            )
+            return
+
+        try:
+            await self.target_message.delete()
+        except Exception as e:
+            await interaction.followup.send(f"❌ 刪除失敗：{e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"✅ 已刪除訊息\n**審查意見**：{review.get('reason', '無')}",
+            ephemeral=True,
+        )
+        print(f"[刪除] 右鍵選單刪除完成: {self.target_message.content[:40]}")
+
+
+async def _flash_chat(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int,
+    temperature: float = 0.1,
+    json_mode: bool = False,
+) -> str:
+    """呼叫 deepseek-v4-flash；空 content（reasoning 吃光預算）時放大預算重試，最多 3 次。"""
+    last = ""
+    for attempt in range(3):
+        budget = min(max_tokens * (2 ** attempt), 32000)
+        kwargs = {
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": budget,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            resp = await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            print(f"[flash] API 錯誤 attempt={attempt + 1} budget={budget}: {type(e).__name__}: {e}")
+            last = ""
+            await asyncio.sleep(0.5)
+            continue
+        content = (resp.choices[0].message.content or "").strip()
+        last = content
+        if content:
+            return content
+        print(
+            f"[flash] 空內容 attempt={attempt + 1} budget={budget} "
+            f"finish={getattr(resp.choices[0], 'finish_reason', None)}"
+        )
+        await asyncio.sleep(0.5)
+    return last
+
+
+async def _fetch_review_context(
+    target_message: discord.Message, limit: int = 15
+) -> str:
+    """抓取目標訊息所在頻道的最近對話（含目標訊息本身），供合理性審查判斷劇情脈絡。"""
+    lines = []
     try:
-        await message.delete()
-        await interaction.response.send_message("✅ 已刪除訊息", ephemeral=True)
+        msgs = [m async for m in target_message.channel.history(limit=limit)]
+        msgs.reverse()
+        for m in msgs:
+            clean = re.sub(r"<@&?\d+>", "", m.content).strip()
+            if not clean:
+                continue
+            marker = "　←【審查目標】" if m.id == target_message.id else ""
+            lines.append(f"[{m.author.display_name}]: {clean[:200]}{marker}")
     except Exception as e:
-        await interaction.response.send_message(f"❌ 刪除失敗：{e}", ephemeral=True)
+        print(f"[審查] 讀取上下文失敗: {e}")
+    return "\n".join(lines) if lines else "（無法取得上下文）"
 
 
-async def _review_edit_suggestion(original: str, suggestion: str) -> dict:
-    """AI 審查修改建議的合理性"""
+async def _review_edit_suggestion(
+    original: str, suggestion: str, context_text: str = ""
+) -> dict:
+    """AI 審查修改建議的合理性
+
+    技術性失敗（AI 無回應／輸出無法解析）不擋使用者：改為放行（approved=True），
+    避免使用者想改卻被審查環節卡死；只有 AI 明確回覆 approved=false 才拒絕。
+    """
     cfg = await load_prompt_config()
     style_block = build_style_block(cfg)
 
     prompt = (
-        "你是一個內容審查員。請判斷以下修改建議是否合理，並輸出 JSON。\n\n"
+        "你是一個內容審查員。請結合上下文判斷以下修改建議是否合理，並輸出 JSON。\n\n"
         f"【文風規則（角色必須遵守）】\n{style_block}\n\n"
+        f"【訊息前後的頻道對話（舊→新，標記【審查目標】者為要修改的訊息）】\n{context_text}\n\n"
         f"【原文】\n{original}\n\n"
         f"【修改建議】\n{suggestion}\n\n"
         '輸出格式：{{"approved": true/false, "reason": "簡短理由（中文）", "summary": "修改摘要（一兩句話說明改了些什麼）"}}\n'
-        "approved=true 的合理理由：修正違反文風規則的地方（如否定前置句式、禁用詞彙、人稱錯誤）、語句不通順、補充細節、刪除矛盾設定。\n"
-        "approved=false 的例子：惡意內容、無意義修改（原文無任何問題且不違反文風規則）、要求刪除關鍵資訊、要求加入違規內容。"
+        "approved=true 的合理理由：修正違反文風規則的地方（如否定前置句式、禁用詞彙、人稱錯誤）、語句不通順、補充細節、刪除矛盾設定，且修改後與上下文劇情一致。\n"
+        "approved=false 的例子：惡意內容、無意義修改（原文無任何問題且不違反文風規則）、要求刪除關鍵資訊、要求加入違規內容、修改後會與上下文的劇情或他人發言明顯矛盾。"
     )
+    raw = await _flash_chat(
+        "你只輸出 JSON，不用加任何解釋。",
+        prompt,
+        max_tokens=500,
+        temperature=0.1,
+        json_mode=True,
+    )
+    if not raw.strip():
+        print("[修改] 審查 AI 無回應，放行")
+        return {"approved": True, "reason": "AI 無回應，已放行", "summary": "（審查未取得，直接套用建議）"}
     try:
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": "你只輸出 JSON，不用加任何解釋。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"},
-        )
-        raw = (
-            resp.choices[0].message.content or '{"approved":false,"reason":"AI 無回應"}'
-        )
-        return json.loads(raw)
+        data = json.loads(raw)
+        if not isinstance(data, dict) or "approved" not in data:
+            raise ValueError("缺少 approved 欄位")
+        return data
     except Exception as e:
-        print(f"[修改] 審查失敗: {e}")
-        return {"approved": False, "reason": "審查系統錯誤"}
+        print(f"[修改] 審查輸出無法解析，放行: {e}")
+        return {"approved": True, "reason": "AI 審查輸出異常，已放行", "summary": "（審查輸出異常，直接套用建議）"}
+
+
+async def _review_delete_request(content: str, reason: str, context_text: str) -> dict:
+    """AI 審查刪除請求的合理性
+
+    技術性失敗（AI 無回應／輸出無法解析）不擋使用者：改為放行（approved=True），
+    只有 AI 明確回覆 approved=false 才拒絕。
+    """
+    prompt = (
+        "你是一個內容審查員。有人想刪除機器人角色「澪」的一則發言，請結合上下文判斷這個刪除請求是否合理，並輸出 JSON。\n\n"
+        f"【訊息前後的頻道對話（舊→新，標記【審查目標】者為要刪除的訊息）】\n{context_text}\n\n"
+        f"【欲刪除的訊息全文】\n{content}\n\n"
+        f"【申請人給出的刪除理由】\n{reason}\n\n"
+        '輸出格式：{{"approved": true/false, "reason": "簡短理由（中文）"}}\n'
+        "approved=true 的合理例子：該訊息重複發送、是基於誤解的錯誤回覆、破壞當下劇情氛圍、內容已被後續劇情推翻而顯得突兀。\n"
+        "approved=false 的例子：理由空泛（只說不喜歡卻講不出具體問題）、刪掉會讓前後對話接不上、惡意或洗版式的刪除請求。"
+    )
+    raw = await _flash_chat(
+        "你只輸出 JSON，不用加任何解釋。",
+        prompt,
+        max_tokens=400,
+        temperature=0.1,
+        json_mode=True,
+    )
+    if not raw.strip():
+        print("[刪除] 審查 AI 無回應，放行")
+        return {"approved": True, "reason": "AI 無回應，已放行"}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or "approved" not in data:
+            raise ValueError("缺少 approved 欄位")
+        return data
+    except Exception as e:
+        print(f"[刪除] 審查輸出無法解析，放行: {e}")
+        return {"approved": True, "reason": "AI 審查輸出異常，已放行"}
 
 
 class DBPageView(discord.ui.View):
@@ -3890,6 +4734,7 @@ async def cmd_readimg(
     cleaned = strip_planning(raw_content)
     cleaned = strip_mem_learn_tags(cleaned)
     cleaned = strip_html_tags(cleaned)
+    cleaned = strip_body_marker(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         cleaned = "（...）"

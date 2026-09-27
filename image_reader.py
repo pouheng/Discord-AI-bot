@@ -66,7 +66,7 @@ async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dic
 
         host = ollama_cfg.get("host", "http://localhost:11434")
         model = ollama_cfg.get("model", "gemma4:12b")
-        timeout = ollama_cfg.get("timeout", 120)
+        timeout = ollama_cfg.get("timeout", 180)
 
         client = _ollama.Client(host=host)
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -93,6 +93,25 @@ async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dic
                     "images": [image_b64],
                 }],
             )
+
+        # 高解析度圖片容易超時，先縮小到 768px 以內並轉 JPEG 壓縮
+        # （gemma 的 vision 按 384px tile 切圖，768px 約 2x2＝4 tiles，比 1024px 的 3x3＝9 tiles 快近半）
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            _img = _PILImage.open(_io.BytesIO(image_bytes))
+            _max_side = max(_img.size)
+            if _max_side > 768:
+                _ratio = 768 / _max_side
+                _new_size = (int(_img.size[0] * _ratio), int(_img.size[1] * _ratio))
+                _img = _img.resize(_new_size, _PILImage.LANCZOS)
+                if _img.mode in ("RGBA", "P", "LA"):
+                    _img = _img.convert("RGB")
+                _buf = _io.BytesIO()
+                _img.save(_buf, format="JPEG", quality=80)
+                image_b64 = base64.b64encode(_buf.getvalue()).decode("utf-8")
+        except Exception:
+            pass  # resize 失敗就用原圖
 
         resp = await asyncio.wait_for(
             asyncio.to_thread(_call),
@@ -136,12 +155,20 @@ async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dic
             "error": "ollama 套件未安裝，請執行 pip install ollama",
             "elapsed": time.time() - start,
         }
+    except asyncio.TimeoutError:
+        return {
+            "success": False,
+            "description": "",
+            "thinking": "",
+            "error": f"圖片分析逾時（{timeout}s），圖片可能過大或 ollama 載入模型中，請稍後重試",
+            "elapsed": time.time() - start,
+        }
     except Exception as e:
         return {
             "success": False,
             "description": "",
             "thinking": "",
-            "error": f"圖片分析失敗: {e}",
+            "error": f"圖片分析失敗: {type(e).__name__}: {e}",
             "elapsed": time.time() - start,
         }
 

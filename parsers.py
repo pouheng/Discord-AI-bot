@@ -68,3 +68,14 @@ def strip_mem_learn_tags(text: str) -> str:
 def strip_html_tags(text: str) -> str:
     """移除意外產生的 HTML 標籤。"""
     return re.sub(r"</?(\w+)[^>]*>", "", text, flags=re.DOTALL).strip()
+
+
+def strip_body_marker(text: str) -> str:
+    """剝除模型從 prompt 模板（main.py 的（正文）區段標記）照抄進正文的字面「（正文）」。
+
+    成因：phase2/3 模板用字面「（正文）」標出「正文從這裡開始」，
+    模型在 recency bias 下會原樣抄進回覆開頭；這裡移除該字面與前後多餘換行。
+    """
+    text = re.sub(r"\s*[（(]正文[）)]\s*\n", "\n", text)
+    text = re.sub(r"^\s*[（(]正文[）)]\s*", "", text)
+    return text.strip()

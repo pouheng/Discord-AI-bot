@@ -171,3 +171,9 @@ def register_commands(bot):
         if len(msg) > 1900:
             msg = msg[:1850] + "..."
         await interaction.followup.send(msg, ephemeral=True)
+        try:
+            import sheets_sync
+            for r in result.get("entries", []):
+                sheets_sync.notify_write(r.get("type"))
+        except Exception:
+            pass

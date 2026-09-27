@@ -229,6 +229,134 @@ simulator_engine.js — 招式對撞模擬器的 JS 引擎
     return [VERDICT_FUSION, true, gap];
   }
 
+  // ── 招式效果（effect）機械套用 ─────────────────────────────
+  function fxFloat(effect, key, def) {
+    const v = Number(effect[key]);
+    return isFinite(v) ? pyRound(v, 2) : (def === undefined ? 0.0 : def);
+  }
+
+  function fxKindMatch(blocks, atkKind) {
+    const b = (blocks || "all").trim();
+    if (!b || b === "all") return true;
+    if (b === "magic" || b === "魔法") return atkKind === "magic" || atkKind === "manamelee";
+    if (b === "physical" || b === "物理") return atkKind === "melee";
+    return false;
+  }
+
+  function fxExempted(exempt, atkElement) {
+    if (!exempt || !atkElement) return false;
+    const list = Array.isArray(exempt) ? exempt : [exempt];
+    return list.some(function (e) { return String(e).trim() === String(atkElement).trim(); });
+  }
+
+  function applyEffects(atkBp, defBp, atkEffects, defEffects, atkKind, defKind, atkElement, defElement) {
+    atkEffects = atkEffects || [];
+    defEffects = defEffects || [];
+    if (atkKind === undefined) atkKind = "magic";
+    if (defKind === undefined) defKind = "magic";
+    if (atkElement === undefined) atkElement = "";
+    if (defElement === undefined) defElement = "";
+    const log = [];
+
+    // 1. 防禦方護盾
+    for (const fx of defEffects) {
+      if (String(fx.type || "").toLowerCase() !== "shield") continue;
+      const absorb = fxFloat(fx, "absorb");
+      if (absorb <= 0) continue;
+      if (fxExempted(fx.exempt, atkElement)) {
+        log.push("護盾「" + (fx.note || "?") + "」不生效：" + atkElement + "屬性的攻擊穿透，護盾被突破");
+        continue;
+      }
+      if (!fxKindMatch(fx.blocks || "", atkKind)) {
+        log.push("護盾「" + (fx.note || "?") + "」不生效（本次為" + atkKind + "攻擊，型別不符）");
+        continue;
+      }
+      const blocked = Math.min(absorb, atkBp);
+      atkBp = pyRound(atkBp - blocked, 2);
+      const name = fx.note || fx.type || "護盾";
+      if (blocked >= absorb) {
+        log.push("護盾「" + name + "」抵擋 " + blocked.toFixed(2) + " BP，完全吸收（氣泡破裂）");
+      } else {
+        log.push("護盾「" + name + "」抵擋 " + blocked.toFixed(2) + " BP，剩餘吸收 " + pyRound(absorb - blocked, 2).toFixed(2));
+      }
+    }
+
+    // 2. 平面加成
+    for (const fx of defEffects) {
+      if (String(fx.type || "").toLowerCase() === "dodge") {
+        const bonus = fxFloat(fx, "bonus");
+        if (bonus > 0) {
+          defBp = pyRound(defBp + bonus, 2);
+          log.push("替身/閃避「" + (fx.note || "?") + "」：有效防禦 +" + bonus.toFixed(2));
+        }
+      }
+    }
+    for (const fx of atkEffects) {
+      const t = String(fx.type || "").toLowerCase();
+      if (t === "summon" || t === "trap") {
+        const dmg = fxFloat(fx, "damage_bonus");
+        if (dmg > 0) {
+          atkBp = pyRound(atkBp + dmg, 2);
+          log.push("「" + (fx.note || t) + "」：威力 +" + dmg.toFixed(2));
+        }
+      }
+    }
+
+    // 3. 倍率（buff 自身 / debuff·bind 對方）
+    for (const fx of atkEffects) {
+      if (String(fx.type || "").toLowerCase() === "buff") {
+        const mult = fxFloat(fx, "mult");
+        if (mult > 0) {
+          atkBp = pyRound(atkBp * (1 + mult), 2);
+          log.push("增益「" + (fx.note || "?") + "」：自身威力 ×" + pyRound(1 + mult, 2).toFixed(2));
+        }
+      }
+    }
+    for (const fx of defEffects) {
+      if (String(fx.type || "").toLowerCase() === "buff") {
+        const mult = fxFloat(fx, "mult");
+        if (mult > 0) {
+          defBp = pyRound(defBp * (1 + mult), 2);
+          log.push("增益「" + (fx.note || "?") + "」：自身防禦 ×" + pyRound(1 + mult, 2).toFixed(2));
+        }
+      }
+    }
+    for (const fx of atkEffects) {
+      const t = String(fx.type || "").toLowerCase();
+      if (t === "debuff" || t === "bind") {
+        const penalty = fxFloat(fx, "penalty");
+        if (penalty > 0 && penalty < 1) {
+          defBp = pyRound(defBp * (1 - penalty), 2);
+          log.push("削弱「" + (fx.note || t) + "」：對方威力 ×" + pyRound(1 - penalty, 2).toFixed(2));
+        }
+      }
+    }
+    for (const fx of defEffects) {
+      const t = String(fx.type || "").toLowerCase();
+      if (t === "debuff" || t === "bind") {
+        const penalty = fxFloat(fx, "penalty");
+        if (penalty > 0 && penalty < 1) {
+          atkBp = pyRound(atkBp * (1 - penalty), 2);
+          log.push("削弱「" + (fx.note || t) + "」：對方威力 ×" + pyRound(1 - penalty, 2).toFixed(2));
+        }
+      }
+    }
+
+    // 4. heal 記錄
+    for (const fx of atkEffects) {
+      if (String(fx.type || "").toLowerCase() === "heal") {
+        log.push("治療「" + (fx.note || "?") + "」回復 " + fxFloat(fx, "amount").toFixed(0) + "（記帳，不影響本次勝負）");
+      }
+    }
+    for (const fx of defEffects) {
+      if (String(fx.type || "").toLowerCase() === "heal") {
+        log.push("治療「" + (fx.note || "?") + "」回復 " + fxFloat(fx, "amount").toFixed(0) + "（記帳，不影響本次勝負）");
+      }
+    }
+
+    return [atkBp, defBp, log];
+  }
+
   // ── 實戰經驗等級 ──────────────────────────────────────────
   function expTier(exp) {
     for (const t of EXP_TIERS) {
@@ -311,6 +439,7 @@ simulator_engine.js — 招式對撞模擬器的 JS 引擎
     expMod, proficiencyMod, variantSkillBase, domainMod,
     computeAtkBp, computeDomainBp, computeMeleeBp, computeManaMeleeBp, resolveMpInvested,
     decide, computeEvadeBp, computeGuardBp, decideNonaggressive, decideWithDomain,
+    applyEffects,
     expTier, villainCalibrationBaseline, hiddenOf, ratingForHidden,
     VERDICT_DECISIVE, VERDICT_SUPPRESS, VERDICT_STALEMATE, VERDICT_FUSION,
     STAT_KEYS, RATING_REVERSE,

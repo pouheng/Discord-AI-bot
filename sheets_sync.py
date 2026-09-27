@@ -105,6 +105,10 @@ def _skill_rows(conn):
     return collide_db.list_skills(conn)
 
 
+def _ability_rows(conn):
+    return collide_db.list_abilities(conn)
+
+
 def _domain_rows(conn):
     return collide_db.list_domains(conn)
 
@@ -120,6 +124,9 @@ _CHAR_COLUMNS = ["name", "affiliation", "race", "school_rank", "stats", "special
 
 _SKILL_COLUMNS = ["name", "ability", "owner", "application", "skill_type",
                   "magic_system", "element", "mp_cost", "power_base", "effect"]
+
+_ABILITY_COLUMNS = ["name", "owner", "category", "principle",
+                    "range_limit", "range_decay", "proficiency"]
 
 _DOMAIN_COLUMNS = ["name", "owner", "domain_type", "awakening", "precision",
                    "rule_self", "rule_enemy", "rule_environment", "cooldown", "sustain_mp"]
@@ -145,6 +152,7 @@ def _serialize_cells(row: dict, columns: list[str]) -> list:
 def build_sheet_specs() -> list[SheetSpec]:
     return [
         SheetSpec("角色檔案", _CHAR_COLUMNS, _char_rows),
+        SheetSpec("能力", _ABILITY_COLUMNS, _ability_rows),
         SheetSpec("招式", _SKILL_COLUMNS, _skill_rows),
         SheetSpec("結界", _DOMAIN_COLUMNS, _domain_rows),
         SheetSpec("對撞紀錄", _BATTLE_COLUMNS, _battle_rows),
@@ -296,9 +304,10 @@ def sync_now() -> dict:
 
 # ── 對外通知（寫入後標記 dirty）──────────────────────────
 
-# sheet_name 對照：character→角色檔案 / skill→招式 / domain→結界 / battle→對撞紀錄
+# sheet_name 對照：character→角色檔案 / ability→能力 / skill→招式 / domain→結界 / battle→對撞紀錄
 _NAME_MAP = {
     "character": "角色檔案",
+    "ability": "能力",
     "skill": "招式",
     "domain": "結界",
     "battle": "對撞紀錄",
@@ -317,3 +326,37 @@ def notify_write(kind: str) -> None:
     name = _NAME_MAP.get(kind)
     if name:
         buf.mark_dirty(name)
+
+
+# ── 背景自動同步（自我修復）──────────────────────────────
+
+def start_auto_flush(interval_seconds: float = 30.0) -> Optional[threading.Thread]:
+    """啟動背景執行緒：每 interval 秒檢查 dirty，有則立即同步。
+
+    用途：debounce 視窗可能因程序重啟而遺失（寫入後 5 秒內重啟會丟掉待同步標記），
+    或同步失敗後沒有重試觸發。長期運作的程序（bot / 管理頁）啟動時呼叫一次，
+    之後所有寫入都會在數秒內自動同步，且失敗會在下一輪自癒重試。
+    已啟動過則直接回傳既有執行緒（不重複建立）。
+    """
+    buf = get_buffer()
+    if not buf.sheet_id:
+        return None
+    existing = getattr(buf, "_auto_thread", None)
+    if existing and existing.is_alive():
+        return existing
+
+    def _loop():
+        while True:
+            time.sleep(interval_seconds)
+            with buf._lock:
+                dirty = bool(buf._dirty)
+            if dirty:
+                try:
+                    buf.flush_now()
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_loop, name="sheets-auto-flush", daemon=True)
+    t.start()
+    buf._auto_thread = t
+    return t

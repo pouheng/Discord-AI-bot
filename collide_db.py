@@ -87,6 +87,64 @@ def pending_review_races() -> list[str]:
         return []
 
 
+def _write_race_file(data: dict) -> bool:
+    """寫回 race_modifiers.json（先備份 .bak）。回傳是否成功。"""
+    try:
+        import shutil
+        if os.path.exists(RACE_MOD_FILE):
+            shutil.copy2(RACE_MOD_FILE, RACE_MOD_FILE + ".bak")
+        with open(RACE_MOD_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return False
+    invalidate_race_mods_cache()
+    return True
+
+
+def mark_race_reviewed(race: str) -> bool:
+    """把種族從待審查清單移除（管理員人工確認/修改後）。"""
+    race = str(race or "").strip()
+    if not race:
+        return False
+    try:
+        with open(RACE_MOD_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    pending = data.get("_pending_review") or []
+    if race not in pending:
+        return True
+    pending = [r for r in pending if r != race]
+    if pending:
+        data["_pending_review"] = pending
+    else:
+        data.pop("_pending_review", None)
+    return _write_race_file(data)
+
+
+def delete_race(race: str) -> bool:
+    """從種族表刪除一個種族（含自待審查清單移除）。回傳是否成功。"""
+    race = str(race or "").strip()
+    if not race:
+        return False
+    try:
+        with open(RACE_MOD_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    if race not in data:
+        return False
+    data.pop(race, None)
+    pending = data.get("_pending_review") or []
+    if race in pending:
+        pending = [r for r in pending if r != race]
+        if pending:
+            data["_pending_review"] = pending
+        else:
+            data.pop("_pending_review", None)
+    return _write_race_file(data)
+
+
 def save_race_mods(race: str, mods: dict, *, pending_review: bool = False) -> bool:
     """把種族的六維修正寫入 race_modifiers.json（立即生效）。
 
@@ -212,8 +270,10 @@ CREATE TABLE IF NOT EXISTS collide_battles (
     result TEXT,
     remaining_damage TEXT,
     phase_c TEXT,
+    skills_meta TEXT,
     domain_fusion INTEGER DEFAULT 0,
     chain_of_thought TEXT,
+    effects TEXT,
     confirmed INTEGER DEFAULT 0,
     status TEXT DEFAULT 'pending',
     undone_by TEXT,
@@ -250,7 +310,11 @@ def _migrate_collide_columns(conn: sqlite3.Connection) -> None:
         "collide_abilities": [("category", "TEXT DEFAULT ''"), ("proficiency", "INTEGER DEFAULT 0")],
         "collide_skills": [("range", "TEXT DEFAULT ''")],
         "collide_domains": [],
-        "collide_battles": [("phase_c", "TEXT DEFAULT ''")],
+        "collide_battles": [
+            ("phase_c", "TEXT DEFAULT ''"),
+            ("skills_meta", "TEXT DEFAULT '{}'"),
+            ("effects", "TEXT DEFAULT '{}'"),
+        ],
     }
     for table, cols in tables.items():
         existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -542,8 +606,8 @@ def insert_battle(conn: sqlite3.Connection, data: dict) -> dict:
             thread_id, battle_time, attacker, attacker_skill,
             defender, defender_skill, atk_output, def_output,
             element_mod, verdict, result, remaining_damage,
-            phase_c, domain_fusion, chain_of_thought, confirmed, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            phase_c, skills_meta, domain_fusion, chain_of_thought, effects, confirmed, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         """,
         (
             str(data.get("thread_id") or "").strip(),
@@ -559,8 +623,10 @@ def insert_battle(conn: sqlite3.Connection, data: dict) -> dict:
             _json_dumps(data.get("result") or {}),
             str(data.get("remaining_damage") or "").strip(),
             str(data.get("phase_c") or "").strip(),
+            _json_dumps(data.get("skills_meta") or {}),
             1 if data.get("domain_fusion") else 0,
             str(data.get("chain_of_thought") or "").strip(),
+            _json_dumps(data.get("effects") or {}),
             1 if data.get("confirmed") else 0,
             str(data.get("status") or "pending").strip(),
         ),
@@ -776,6 +842,17 @@ def make_db_lookup(conn: sqlite3.Connection):
                     "SELECT name, race, school_rank, is_villain FROM collide_characters ORDER BY name"
                 )
             ]
+        if table == "ability_skills":
+            rows = conn.execute(
+                "SELECT power_base FROM collide_skills WHERE ability = ?",
+                (char_name,),
+            ).fetchall()
+            return [{"power_base": float(r[0])} for r in rows]
+        if table == "abilities":
+            rows = conn.execute(
+                "SELECT name, owner, category, principle FROM collide_abilities ORDER BY owner, name"
+            ).fetchall()
+            return [dict(r) for r in rows]
         if table in _NAMED_GETTERS:
             return _resolve_named(table, char_name)
         return None

@@ -20,6 +20,7 @@ from discord import app_commands
 
 import collide_db
 import collide_growth
+import collide_parser
 import collide_pipeline
 import collide_rules
 import sheets_sync
@@ -155,22 +156,93 @@ def _add_button(view: discord.ui.View, label: str, style, custom_id: str, callba
 
 
 class ClashConfirmView(discord.ui.View):
-    """對撞結果確認/重試/取消按鈕。custom_id 編碼發送者 user_id。"""
+    """對撞結果確認/重試/取消 + 未登記招式一鍵記錄按鈕。custom_id 編碼發送者 user_id。"""
 
-    def __init__(self, sender_id: int, battle_id: int, thread_id: str):
+    def __init__(self, sender_id: int, battle_id: int, thread_id: str,
+                 unregistered: Optional[list] = None):
         super().__init__(timeout=300)
         self.sender_id = sender_id
         self.battle_id = battle_id
         self.thread_id = thread_id
+        self.unregistered = unregistered or []
         _add_button(self, "確認", discord.ButtonStyle.success,
                     _encode_cid("confirm", sender_id, battle_id), self._on_confirm)
         _add_button(self, "重試", discord.ButtonStyle.secondary,
                     _encode_cid("retry", sender_id, battle_id), self._on_retry)
         _add_button(self, "取消", discord.ButtonStyle.danger,
                     _encode_cid("cancel", sender_id, battle_id), self._on_cancel)
+        for info in self.unregistered:
+            side = info.get("side", "")
+            skill = info.get("skill", "")
+            _add_button(
+                self,
+                f"🗂 一鍵記錄「{skill}」",
+                discord.ButtonStyle.primary,
+                f"{_PREFIX}:record:{sender_id}:{battle_id}:{side}",
+                lambda i, s=side: self._on_record(i, s),
+            )
+            _add_button(
+                self,
+                f"📝 填表記錄「{skill}」",
+                discord.ButtonStyle.secondary,
+                f"{_PREFIX}:form:{sender_id}:{battle_id}:{side}",
+                lambda i, s=side: self._on_form(i, s),
+            )
 
     def _check_sender(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.sender_id
+
+    async def _on_form(self, interaction: discord.Interaction, side: str):
+        """開啟「當場填表」視窗手動記錄招式（不用猜，直接填）。"""
+        if interaction.user.id != self.sender_id:
+            await interaction.response.send_message("只有發送者可以操作此結果", ephemeral=True)
+            return
+        info = next((u for u in self.unregistered if u.get("side") == side), None)
+        if not info:
+            await interaction.response.send_message("沒有可記錄的招式", ephemeral=True)
+            return
+        await interaction.response.send_modal(SkillRecordModal(info))
+
+    async def _on_record(self, interaction: discord.Interaction, side: str):
+        """一鍵把未登記招式寫入招式庫（不詢問，直接記錄）。"""
+        if interaction.user.id != self.sender_id:
+            await interaction.response.send_message("只有發送者可以操作此結果", ephemeral=True)
+            return
+        info = next((u for u in self.unregistered if u.get("side") == side), None)
+        if not info:
+            await interaction.response.send_message("沒有可記錄的招式", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        skill = info.get("skill") or ""
+        desc = f"招式名稱：{skill}；所有者：{info.get('char') or ''}"
+        if info.get("ability"):
+            desc += f"；所屬能力：{info['ability']}"
+        if info.get("application"):
+            desc += f"；擴展應用：{info['application']}"
+        desc += "。請依此輸出該招式的完整招式資料（含威力基數、耗魔、元素、距離）。"
+        try:
+            result = await collide_parser.write_skill(desc)
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ 自動記錄失敗：{e}\n（可改用旁邊的「📝 填表記錄」手動填寫）",
+                ephemeral=True,
+            )
+            return
+        try:
+            sheets_sync.notify_write("skill")
+        except Exception:
+            pass
+        row = result.get("skill") or {}
+        status = "新增" if result.get("status") == "insert" else "更新"
+        deriv = result.get("derivation") or {}
+        lines = [
+            f"✅ 招式「{row.get('name', skill)}」已記錄（{status}）",
+            f"所屬能力：{row.get('ability', '（通用魔法）')}｜威力基數：{row.get('power_base', '')}｜耗魔：{row.get('mp_cost', 0)}｜元素：{row.get('element', '無')}",
+        ]
+        if deriv.get("valid") is not None:
+            mark = "✅ 合理" if deriv.get("valid") else "⚠️ 不符能力原理"
+            lines.append(f"擴展推導：{mark}（{str(deriv.get('reason', ''))[:100]}）")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     async def _on_confirm(self, interaction: discord.Interaction):
         if interaction.user.id != self.sender_id:
@@ -251,6 +323,126 @@ class ClashFinalConfirmView(discord.ui.View):
             await channel.send(text)
         else:
             await interaction.followup.send("⚠️ 無法找到原討論串發布正文。", ephemeral=True)
+
+
+class SkillRecordModal(discord.ui.Modal, title="記錄招式（當場填表）"):
+    """手動填寫未登記招式資料並寫入招式庫（不靠 LLM 猜，保證寫入）。"""
+
+    def __init__(self, info: dict):
+        super().__init__(timeout=300)
+        self.info = info or {}
+        skill = info.get("skill") or ""
+        ability = info.get("ability") or ""
+        application = info.get("application") or ""
+        est = info.get("estimate") if isinstance(info.get("estimate"), dict) else {}
+        power = est.get("power_base") or "5.0"
+        mp = est.get("mp_cost") or "10"
+        element = est.get("element") or ""
+        msys = est.get("magic_system") or ""
+        rng = est.get("range") or ""
+        stype = est.get("skill_type") or "個人魔法"
+        effect = est.get("effect") or ""
+        self.f1 = discord.ui.TextInput(
+            label="招式名稱／所屬能力（用／分隔；通常魔法能力留空）",
+            default=f"{skill}／{ability}",
+            max_length=100, required=True,
+        )
+        self.f2 = discord.ui.TextInput(
+            label="威力基數／耗魔（1.0~10.0／1~25）",
+            default=f"{power}／{mp}",
+            max_length=30, required=True,
+        )
+        self.f3 = discord.ui.TextInput(
+            label="元素／魔法體系（如 火／自然系；超能系或通常魔法元素留空）",
+            default=f"{element}／{msys}",
+            max_length=60, required=False,
+        )
+        self.f4 = discord.ui.TextInput(
+            label="有效距離／擴展應用（如 極限60公尺／擴展一：…）",
+            default=f"{rng}／{application}",
+            max_length=160, required=False,
+        )
+        self.f5 = discord.ui.TextInput(
+            label="技能類型／附加效果（個人魔法或通常魔法／效果描述）",
+            default=f"{stype}／{effect}",
+            max_length=160, required=True,
+        )
+        self.add_item(self.f1)
+        self.add_item(self.f2)
+        self.add_item(self.f3)
+        self.add_item(self.f4)
+        self.add_item(self.f5)
+
+    @staticmethod
+    def _split(v: str) -> tuple[str, str]:
+        for sep in ("／", "/", "|"):
+            if sep in (v or ""):
+                a, b = (v or "").split(sep, 1)
+                return a.strip(), b.strip()
+        return (v or "").strip(), ""
+
+    def _build(self) -> dict:
+        name, ability = self._split(self.f1.value)
+        power, mp = self._split(self.f2.value)
+        elem, msys = self._split(self.f3.value)
+        rng, app = self._split(self.f4.value)
+        stype, effect = self._split(self.f5.value)
+        if not name:
+            raise ValueError("招式名稱不可為空")
+        try:
+            power = round(float(power), 2)
+        except (TypeError, ValueError):
+            raise ValueError("威力基數不是有效數字")
+        if not (1.0 <= power <= 10.0):
+            raise ValueError("威力基數須在 1.0~10.0")
+        try:
+            mp = int(float(mp))
+        except (TypeError, ValueError):
+            raise ValueError("耗魔不是有效數字")
+        if not (1 <= mp <= 25):
+            raise ValueError("耗魔須在 1~25")
+        if not stype:
+            stype = "個人魔法"
+        if stype == "通常魔法":
+            ability, msys, elem = "", "", ""
+        return {
+            "name": name,
+            "ability": ability,
+            "owner": self.info.get("char") or "",
+            "application": app or "擴展一：自訂擴展",
+            "skill_type": stype,
+            "magic_system": msys,
+            "element": elem,
+            "range": rng,
+            "mp_cost": mp,
+            "power_base": power,
+            "effect": effect,
+        }
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            data = self._build()
+            conn = _conn()
+            row = collide_db.upsert_skill(conn, data)
+            conn.commit()
+            conn.close()
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ 記錄失敗：{e}", ephemeral=True)
+            return
+        try:
+            sheets_sync.notify_write("skill")
+        except Exception:
+            pass
+        await interaction.followup.send(
+            f"✅ 招式「{row.get('name')}」已記錄\n"
+            f"所屬能力：{row.get('ability') or '（通用魔法）'}｜威力基數：{row.get('power_base')}｜"
+            f"耗魔：{row.get('mp_cost')}｜元素：{row.get('element') or '無'}｜類型：{row.get('skill_type')}",
+            ephemeral=True,
+        )
 
 
 class ClashRetryModal(discord.ui.Modal, title="重試對撞"):
@@ -419,12 +611,35 @@ async def _scan_growth(history: str, thread_id: str) -> dict:
 
 # ── 對撞共用流程（/clash 與 重試 modal 共用）──────────────
 
-async def _read_clash_history(channel) -> str:
+async def _read_clash_history(channel, limit: int = 30, max_chars: int = 8000) -> str:
+    """讀取討論串尾部供對撞分析。
+
+    對撞只需最近幾則（雙方出招的動作），舊訊息是背景噪音；限制訊息數並壓縮
+    總長度，避免深色引擎收到過多資訊而思考過久。保留**最新訊息完整**，
+    預算超標時只截斷最舊的訊息。
+    """
     lines = []
     if channel and hasattr(channel, "history"):
-        async for msg in channel.history(limit=50):
-            lines.append(f"{msg.author.display_name}: {msg.content}")
-    return "\n".join(reversed(lines)) or "（無法讀取討論串）"
+        async for msg in channel.history(limit=limit):
+            content = (msg.content or "").strip()
+            if not content:
+                continue
+            lines.append(f"{msg.author.display_name}: {content}")
+    if not lines:
+        return "（無法讀取討論串）"
+    # channel.history 回傳「最新在前」；從最新開始保留完整，超預算時截斷最舊
+    kept: list[str] = []
+    total = 0
+    for line in lines:
+        if total + len(line) + 1 <= max_chars:
+            kept.append(line)
+            total += len(line) + 1
+        else:
+            remaining = max_chars - total - 1
+            if remaining > 20:
+                kept.append(line[:remaining] + "…")
+            break
+    return "\n".join(reversed(kept))
 
 
 async def _perform_clash(
@@ -468,18 +683,25 @@ async def _perform_clash(
     return result, conn
 
 
+def _parse_json_field(v):
+    """把 DB 欄位的 JSON 字串解析回 dict/list；空/壞檔回空 dict。"""
+    if isinstance(v, str) and v.strip():
+        try:
+            return json.loads(v)
+        except (ValueError, TypeError):
+            return {}
+    if isinstance(v, (dict, list)):
+        return v
+    return {}
+
+
 def _phase_b_from_battle(b: dict) -> dict:
     """由 collide_battles 一列重建 phase_b（供 Phase C 重新生成文風正文）。
 
     只含 Phase C 需要的判定結果欄位（不含計算細節）。result 以 JSON 字串存入 DB，
     這裡解析回 dict；解析失敗回空 dict（Phase C 仍可依 verdict/attacker 等欄位運作）。
     """
-    result = b.get("result")
-    if isinstance(result, str):
-        try:
-            result = json.loads(result) if result.strip() else {}
-        except (ValueError, TypeError):
-            result = {}
+    result = _parse_json_field(b.get("result"))
     if not isinstance(result, dict):
         result = {}
     return {
@@ -496,6 +718,7 @@ def _phase_b_from_battle(b: dict) -> dict:
         "domains": None,
         "fusion_effects": None,
         "remaining_damage": b.get("remaining_damage", ""),
+        "effects": _parse_json_field(b.get("effects")),
     }
 
 
@@ -524,6 +747,18 @@ def _clash_detail_lines(phase_b: dict) -> list[str]:
     if phase_b.get("remaining_damage"):
         lines.append("")
         lines.append(f"**剩餘衝擊：**{phase_b['remaining_damage']}")
+
+    fx = phase_b.get("effects") or {}
+    fx_applied = fx.get("applied") or []
+    if fx_applied:
+        lines.append("")
+        lines.append("**招式效果（機械套用）：**")
+        lines.extend(f"- {l}" for l in fx_applied)
+    for side, label in (("attacker", "攻擊方"), ("defender", "防禦方")):
+        effects = fx.get(side) or []
+        if effects:
+            names = "、".join(str(e.get("note") or e.get("type") or "?") for e in effects)
+            lines.append(f"- {label}效果：{names}")
 
     rng = phase_b.get("range") or {}
     for label, char in (("攻擊方", atk.get("char")), ("防禦方", def_.get("char"))):
@@ -566,9 +801,32 @@ async def _post_draft(
 ):
     """把對撞結果寫入 pending 紀錄並貼出草稿＋確認按鈕（會關閉 conn）。"""
     phase_b = result.get("phase_b") or {}
+    phase_a = result.get("phase_a") or {}
     comp = phase_b.get("computation") or {}
     atk = comp.get("attacker") or {}
     def_ = comp.get("defender") or {}
+
+    # 記錄雙方招式來源資訊（供「一鍵記錄」按鈕重建招式資料）
+    skills_meta = {}
+    unregistered = []
+    for side in ("attacker", "defender"):
+        cand = phase_a.get(f"{side}_candidate") or {}
+        est = (phase_a.get("skill_estimates") or {}).get(side)
+        info = {
+            "skill": (cand.get("skill") or "").strip(),
+            # 所有者以「出招的角色」為準（Phase A candidate），
+            # 不能用 comp（計算後會依威力交換攻守，導致持有者配錯）
+            "char": (cand.get("char") or "").strip()
+                    or (est.get("owner") if isinstance(est, dict) else "") or "",
+            "ability": (phase_a.get("abilities") or {}).get(side) or "",
+            "application": (phase_a.get("applications") or {}).get(side) or "",
+            "estimate": est if isinstance(est, dict) else None,
+        }
+        sname = info["skill"]
+        if sname and not collide_db.get_skill_named(conn, sname):
+            info["unregistered"] = True
+            unregistered.append({**info, "side": side})
+        skills_meta[side] = info
 
     battle = collide_db.insert_battle(conn, {
         "thread_id": thread_id,
@@ -582,8 +840,10 @@ async def _post_draft(
         "result": phase_b.get("result"),
         "remaining_damage": phase_b.get("remaining_damage", ""),
         "phase_c": result.get("phase_c", ""),
+        "skills_meta": skills_meta,
         "domain_fusion": phase_b.get("domain_fusion", False),
         "chain_of_thought": phase_b.get("chain_of_thought", ""),
+        "effects": phase_b.get("effects") or {},
         "status": "pending",
     })
     conn.close()
@@ -597,7 +857,7 @@ async def _post_draft(
     lines += _clash_detail_lines(phase_b)
     pages = _paginate("\n".join(lines))
 
-    view = ClashConfirmView(interaction.user.id, battle["id"], thread_id)
+    view = ClashConfirmView(interaction.user.id, battle["id"], thread_id, unregistered=unregistered)
     for i, page in enumerate(pages):
         await interaction.followup.send(page, view=view if i == 0 else None)
 

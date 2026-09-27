@@ -99,7 +99,7 @@
   "ollama": {
     "host": "http://localhost:11434",
     "model": "gemma4:12b",
-    "timeout": 120
+    "timeout": 180
   },
   "google_sheets": {
     "spreadsheet_id": "15ZRL5Hx6bIlkuNZ6xiTc56_GTBZrKRzizdm34tLaMjY"

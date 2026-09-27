@@ -206,7 +206,7 @@ def register_say(bot):
             await channel.send(reply)
             _log_say_usage(interaction, reply)
             user_content = last_user_msg.content if last_user_msg else "say指令"
-            excerpt = re.sub(r'[\\/:*?"<>|]', "", user_content[:20]) or "say"
+            excerpt = re.sub(r'[\\/:*?"<>|\r\n]', "", user_content[:20]) or "say"
             session_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             session_dir = os.path.join(PROMPT_LOG_DIR, f"{session_ts}_{excerpt}")
             asyncio.create_task(_snapshot_prompt_logs(session_dir, wait=0))
@@ -217,10 +217,18 @@ def register_say(bot):
                 lore_text,
                 self_mem_all,
                 session_dir,
+                all_context,
             )
             asyncio.create_task(_cleanup_old_sessions())
         except Exception as e:
+            import traceback
             print(f"[/say] 失敗: {e}")
+            print(traceback.format_exc())
+            try:
+                from main import _log_error
+                await _log_error("say_failure", str(e), traceback=traceback.format_exc()[:2500])
+            except Exception:
+                pass
             try:
                 await interaction.followup.send(
                     "（出了點問題，下次再試吧）", ephemeral=True

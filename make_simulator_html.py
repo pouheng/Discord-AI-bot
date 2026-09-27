@@ -172,6 +172,54 @@ def build_test_vectors() -> dict:
         "decideWithDomain(彌補恢復融合)": {
             "py": lambda: CE.decide_with_domain(15.0, 10.0, 1.5, 1.1, mp_invested=14),
             "js": "E.decideWithDomain(15.0,10.0,1.5,1.1,14)"},
+        "effects(護盾吸收+攻擊加成+防禦加成+削弱)": {
+            "py": lambda: CE.apply_effects(
+                20.0, 12.0,
+                [{"type": "buff", "mult": 0.15, "note": "燃火增幅"},
+                 {"type": "summon", "damage_bonus": 1.2, "note": "火焰分身"}],
+                [{"type": "shield", "absorb": 2.5, "blocks": "magic", "note": "水球氣泡"},
+                 {"type": "dodge", "bonus": 0.5, "note": "烈焰替身"},
+                 {"type": "debuff", "penalty": 0.1, "note": "水氣干擾"}],
+                atk_kind="magic", def_kind="magic"),
+            "js": "E.applyEffects(20.0, 12.0, "
+                  "[{type:'buff',mult:0.15,note:'燃火增幅'},{type:'summon',damage_bonus:1.2,note:'火焰分身'}], "
+                  "[{type:'shield',absorb:2.5,blocks:'magic',note:'水球氣泡'},{type:'dodge',bonus:0.5,note:'烈焰替身'},"
+                  "{type:'debuff',penalty:0.1,note:'水氣干擾'}], 'magic','magic')"},
+        "effects(物理護盾不擋魔法)": {
+            "py": lambda: CE.apply_effects(
+                20.0, 12.0, [],
+                [{"type": "shield", "absorb": 2.5, "blocks": "physical", "note": "岩壁"}],
+                atk_kind="magic"),
+            "js": "E.applyEffects(20.0, 12.0, [], "
+                  "[{type:'shield',absorb:2.5,blocks:'physical',note:'岩壁'}], 'magic','magic')"},
+        "effects(護盾未滿剩餘吸收)": {
+            "py": lambda: CE.apply_effects(
+                1.0, 12.0, [],
+                [{"type": "shield", "absorb": 2.5, "blocks": "all", "note": "氣泡"}],
+                atk_kind="magic"),
+            "js": "E.applyEffects(1.0, 12.0, [], "
+                  "[{type:'shield',absorb:2.5,blocks:'all',note:'氣泡'}], 'magic','magic')"},
+        "effects(無效盾擋暗)": {
+            "py": lambda: CE.apply_effects(
+                20.0, 12.0, [],
+                [{"type": "shield", "absorb": 999, "blocks": "all", "exempt": ["光"], "note": "暗影潛形"}],
+                atk_kind="magic", atk_element="暗"),
+            "js": "E.applyEffects(20.0, 12.0, [], "
+                  "[{type:'shield',absorb:999,blocks:'all',exempt:['光'],note:'暗影潛形'}], 'magic','magic','暗','')"},
+        "effects(無效盾被光穿透)": {
+            "py": lambda: CE.apply_effects(
+                20.0, 12.0, [],
+                [{"type": "shield", "absorb": 999, "blocks": "all", "exempt": ["光"], "note": "暗影潛形"}],
+                atk_kind="magic", atk_element="光"),
+            "js": "E.applyEffects(20.0, 12.0, [], "
+                  "[{type:'shield',absorb:999,blocks:'all',exempt:['光'],note:'暗影潛形'}], 'magic','magic','光','')"},
+        "effects(無 exempt 護盾正常擋光)": {
+            "py": lambda: CE.apply_effects(
+                20.0, 12.0, [],
+                [{"type": "shield", "absorb": 5.0, "blocks": "all", "note": "氣泡"}],
+                atk_kind="magic", atk_element="光"),
+            "js": "E.applyEffects(20.0, 12.0, [], "
+                  "[{type:'shield',absorb:5.0,blocks:'all',note:'氣泡'}], 'magic','magic','光','')"},
         "MP追逐": {
             "py": lambda: CE.resolve_mp_invested(manabp, opponent_bp=25.0),
             "js": "E.resolveMpInvested(mp=>E.computeManaMeleeBp(3.0,4.0,4.0,mp,60,50),{opponentBp:25.0})"},

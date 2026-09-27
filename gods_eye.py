@@ -19,14 +19,51 @@ from openai import AsyncOpenAI
 import os
 import datetime
 import json
+import traceback
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+PROMPT_LOG_DIR = os.path.join(SCRIPT_DIR, "prompt_logs")
+ERROR_LOG_DIR = os.path.join(SCRIPT_DIR, "error_logs")
 _client = (
-    AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
+    AsyncOpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com/v1",
+        timeout=120.0,
+    )
     if DEEPSEEK_API_KEY
     else None
 )
+
+
+def _log_error(event: str, detail: str, **extra):
+    """將錯誤紀錄寫入 error_logs/{date}.txt（與主 bot 日誌系統一致）"""
+    try:
+        os.makedirs(ERROR_LOG_DIR, exist_ok=True)
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        path = os.path.join(ERROR_LOG_DIR, f"{today}.txt")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        extra_str = " ".join(f"{k}={v}" for k, v in extra.items())
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{now}] [{event}] {detail[:800]} {extra_str}".rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def _append_gods_eye_log(label: str, system: str, user: str, output: str):
+    """把神之眼的 prompt 與輸出附加到 prompt_logs/gods_eye_log.txt"""
+    try:
+        os.makedirs(PROMPT_LOG_DIR, exist_ok=True)
+        path = os.path.join(PROMPT_LOG_DIR, "gods_eye_log.txt")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 70 + "\n")
+            f.write(f"[{now}] {label}\n")
+            f.write("-" * 70 + "\n【SYSTEM】\n" + system + "\n")
+            f.write("-" * 70 + "\n【USER】\n" + user + "\n")
+            f.write("-" * 70 + "\n【OUTPUT】\n" + output + "\n")
+    except Exception:
+        pass
 
 _GODS_EYE_SYSTEM = """你是一個「神之眼」解說員。你的職責是在戰鬥或關鍵劇情中，提供一個介於客觀敘述與主觀洞察之間的視角。
 
@@ -87,7 +124,15 @@ def register_commands(bot: commands.Bot):
         討論串: discord.Thread = None,
         補充說明: str = "",
     ):
-        await interaction.response.defer(ephemeral=False)
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except Exception as e:
+            _log_error(
+                "gods_eye_defer",
+                f"互動 defer 失敗：{e}",
+                user=str(interaction.user),
+                tb=traceback.format_exc()[:500],
+            )
 
         if not _client:
             await interaction.followup.send("❌ DeepSeek API 未設定")
@@ -112,6 +157,7 @@ def register_commands(bot: commands.Bot):
 請以神之眼視角輸出旁白，解讀當前局勢、能力原理、角色心境。"""
 
         try:
+            _append_gods_eye_log("請求（已送出，等待回應）", _GODS_EYE_SYSTEM, prompt, "(尚未回應)")
             resp = await _client.chat.completions.create(
                 model="deepseek-v4-flash",
                 messages=[
@@ -124,6 +170,7 @@ def register_commands(bot: commands.Bot):
             result = (resp.choices[0].message.content or "").strip()
             if not result:
                 result = "旁白：（神之眼未能捕捉到值得解讀的場面。）"
+            _append_gods_eye_log("回應（成功）", _GODS_EYE_SYSTEM, prompt, result)
 
             embed = discord.Embed(
                 title="👁️ 神之眼",
@@ -135,4 +182,20 @@ def register_commands(bot: commands.Bot):
             await interaction.followup.send(embed=embed)
 
         except Exception as e:
-            await interaction.followup.send(f"❌ 神之眼失效：{e}")
+            tb = traceback.format_exc()
+            _append_gods_eye_log("錯誤（未受回應）", _GODS_EYE_SYSTEM, prompt, tb)
+            _log_error(
+                "gods_eye",
+                f"神之眼呼叫失敗：{e}",
+                channel=str(getattr(target, "name", "?")),
+                user=str(interaction.user),
+                tb=tb[:800],
+            )
+            try:
+                await interaction.followup.send(f"❌ 神之眼失效：{e}")
+            except Exception as fe:
+                _log_error(
+                    "gods_eye_reply",
+                    f"互動已失效，無法回覆：{fe}",
+                    user=str(interaction.user),
+                )

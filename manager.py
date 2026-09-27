@@ -10,6 +10,7 @@ DB_VIEWER = os.path.join(SCRIPT_DIR, "db_viewer.py")
 
 bot_proc = None
 monitor_running = True
+root = None
 
 
 def get_pid() -> int | None:
@@ -45,7 +46,6 @@ def start_bot():
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         log("Bot started.")
-        update_status()
     except Exception as e:
         log(f"Start failed: {e}")
 
@@ -71,7 +71,6 @@ def stop_bot():
             os.remove(PID_FILE)
         except OSError:
             pass
-    update_status()
     log("Bot stopped.")
 
 
@@ -166,26 +165,60 @@ def show_memory_count():
         log(f"DB error: {e}")
 
 
-def update_status():
-    pid = get_pid()
-    alive = is_running()
-    if alive:
-        status_label.config(text=f"RUNNING (PID {pid})", foreground="#00ff00")
-    else:
-        status_label.config(text="STOPPED", foreground="#ff4444")
-
-
 def monitor_loop():
+    """背景監控執行緒：只做狀態探測，把 UI 更新丟回 tkinter 主執行緒執行。
+
+    tkinter 不是 thread-safe，background thread 直接碰 widget（config/insert）
+    會拋 SystemError/WinError 87 並讓監控執行緒崩潰，導致狀態欄停在舊值。
+    """
     while monitor_running:
-        update_status()
-        update_autopilot_status()
+        try:
+            pid = get_pid()
+            alive = is_running()
+            ap_on = get_autopilot_status()
+        except Exception:
+            time.sleep(2)
+            continue
+        # 透過 after 排程到主執行緒更新 UI（確保 widget 只被主執行緒觸碰）
+        try:
+            root.after(0, _apply_status, pid, alive, ap_on)
+        except Exception:
+            pass
         time.sleep(2)
 
 
+def _apply_status(pid, alive, ap_on):
+    try:
+        if alive:
+            status_label.config(text=f"RUNNING (PID {pid})", foreground="#00ff00")
+        else:
+            status_label.config(text="STOPPED", foreground="#ff4444")
+        if ap_on:
+            ap_status_label.config(text="ON", foreground="#00ff00")
+        else:
+            ap_status_label.config(text="OFF", foreground="#ff4444")
+    except Exception as e:
+        print(f"[manager] 狀態更新失敗: {e}")
+
+
 def log(msg: str):
+    """thread-safe 紀錄：背景執行緒也能安全呼叫（透過 after 排程到主執行緒）。"""
     now = time.strftime("%H:%M:%S")
-    console.insert(tk.END, f"[{now}] {msg}\n")
-    console.see(tk.END)
+
+    def _do(m=msg, n=now):
+        try:
+            console.insert(tk.END, f"[{n}] {m}\n")
+            console.see(tk.END)
+        except tk.TclError:
+            pass
+
+    try:
+        if root is not None:
+            root.after(0, _do)
+        else:
+            _do()
+    except Exception:
+        pass
 
 
 def get_autopilot_status() -> bool:
@@ -229,7 +262,9 @@ def update_autopilot_status():
 
 class BotManagerGUI:
     def __init__(self):
+        global root
         self.root = tk.Tk()
+        root = self.root
         self.root.title("Bot Manager")
         self.root.geometry("520x480")
         self.root.resizable(False, False)
@@ -348,8 +383,13 @@ class BotManagerGUI:
         self.monitor_thread.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        update_status()
-        update_autopilot_status()
+        try:
+            pid = get_pid()
+            alive = is_running()
+            ap_on = get_autopilot_status()
+            _apply_status(pid, alive, ap_on)
+        except Exception:
+            pass
         log("Bot Manager ready.")
 
     def _thread_action(self, action: str):

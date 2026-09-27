@@ -99,11 +99,118 @@ def api_skills():
         conn.close()
 
 
+@app.get("/api/tables/abilities")
+def api_abilities():
+    conn = _conn()
+    try:
+        return collide_db.list_abilities(conn)
+    finally:
+        conn.close()
+
+
+class SkillUpdateBody(BaseModel):
+    name: str = ""
+    ability: str = ""
+    owner: str = ""
+    application: str = ""
+    skill_type: str = ""
+    magic_system: str = ""
+    element: str = ""
+    range: str = ""
+    mp_cost: int = 0
+    power_base: float = 1.0
+    effect: str = ""
+
+
+@app.put("/api/tables/skills/{name}/{owner}")
+def api_skill_update(name: str, owner: str, body: SkillUpdateBody):
+    """更新一筆招式（欄位以 body 為準；name/owner 改變時搬移資料列）。
+
+    用於管理頁「招式表格修改」；改 key 時會先刪舊列再以新 key 重建，避免 UNIQUE 衝突。
+    """
+    conn = _conn()
+    try:
+        row = collide_db.get_skill(conn, name, owner)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"招式「{name}（{owner}）」不存在")
+        data = dict(row)
+        for k in ("name", "ability", "owner", "application", "skill_type",
+                  "magic_system", "element", "range", "mp_cost", "power_base", "effect"):
+            data[k] = getattr(body, k)
+        new_name = str(data.get("name") or "").strip()
+        new_owner = str(data.get("owner") or "").strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="招式名稱不可為空")
+        if (new_name, new_owner) != (name, owner):
+            conn.execute(
+                "DELETE FROM collide_skills WHERE name = ? AND owner = ?",
+                (name, owner),
+            )
+        data["name"] = new_name
+        updated = collide_db.upsert_skill(conn, data)
+        conn.commit()
+        try:
+            sheets_sync.notify_write("skill")
+        except Exception:
+            pass
+        return {"ok": True, "skill": updated}
+    finally:
+        conn.close()
+
+
 @app.get("/api/tables/domains")
 def api_domains():
     conn = _conn()
     try:
         return collide_db.list_domains(conn)
+    finally:
+        conn.close()
+
+
+class DomainUpdateBody(BaseModel):
+    name: str = ""
+    owner: str = ""
+    domain_type: str = ""
+    awakening: str = ""
+    precision: float = 0.0
+    rule_self: str = ""
+    rule_enemy: str = ""
+    rule_environment: str = ""
+    cooldown: str = ""
+    sustain_mp: float = 0.0
+
+
+@app.put("/api/tables/domains/{name}/{owner}")
+def api_domain_update(name: str, owner: str, body: DomainUpdateBody):
+    """更新一筆結界（欄位以 body 為準；name/owner 改變時搬移資料列）。
+
+    用於管理頁「結界表格修改」；改 key 時會先刪舊列再以新 key 重建，避免 UNIQUE 衝突。
+    """
+    conn = _conn()
+    try:
+        row = collide_db.get_domain(conn, name, owner)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"結界「{name}（{owner}）」不存在")
+        data = dict(row)
+        for k in ("name", "owner", "domain_type", "awakening", "precision",
+                  "rule_self", "rule_enemy", "rule_environment", "cooldown", "sustain_mp"):
+            data[k] = getattr(body, k)
+        new_name = str(data.get("name") or "").strip()
+        new_owner = str(data.get("owner") or "").strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="結界名稱不可為空")
+        if (new_name, new_owner) != (name, owner):
+            conn.execute(
+                "DELETE FROM collide_domains WHERE name = ? AND owner = ?",
+                (name, owner),
+            )
+        updated = collide_db.upsert_domain(conn, data)
+        conn.commit()
+        try:
+            sheets_sync.notify_write("domain")
+        except Exception:
+            pass
+        return {"ok": True, "domain": updated}
     finally:
         conn.close()
 
@@ -151,6 +258,107 @@ def api_battle_delete(battle_id: int):
 class TagBody(BaseModel):
     tag: str
     action: str = "add"
+
+
+class FormBody(BaseModel):
+    form: str
+    multiplier: float = 1.0
+    action: str = "add"
+
+
+@app.get("/api/races")
+def api_races():
+    """種族修正表（race_modifiers.json）：種族 × 六維修正 + 待審查標記。"""
+    from collide_engine import STAT_KEYS
+    mods = collide_db.load_race_modifiers()
+    pending = set(collide_db.pending_review_races())
+    races = []
+    for race, m in mods.items():
+        if not isinstance(m, dict):
+            continue
+        races.append({
+            "race": race,
+            "mods": {s: m.get(s, 1.0) for s in STAT_KEYS},
+            "pending_review": race in pending,
+        })
+    return {"races": races, "stat_keys": STAT_KEYS}
+
+
+class RaceBody(BaseModel):
+    mods: dict = {}
+
+
+@app.put("/api/races/{race}")
+def api_race_upsert(race: str, body: RaceBody):
+    """新增或修改種族的六維修正。修改後自動清除待審查標記。"""
+    from collide_engine import STAT_KEYS
+    race = race.strip()
+    if not race:
+        raise HTTPException(status_code=400, detail="種族名不可為空")
+    if not body.mods:
+        raise HTTPException(status_code=400, detail="缺少六維修正")
+    mods = {}
+    for s in STAT_KEYS:
+        if s not in body.mods:
+            raise HTTPException(status_code=400, detail=f"缺少六維修正「{s}」")
+        try:
+            v = round(float(body.mods[s]), 1)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"「{s}」不是有效數字")
+        if not (collide_db.RACE_MOD_MIN <= v <= collide_db.RACE_MOD_MAX):
+            raise HTTPException(
+                status_code=400,
+                detail=f"「{s}」倍率須在 {collide_db.RACE_MOD_MIN}~{collide_db.RACE_MOD_MAX}",
+            )
+        mods[s] = v
+    if not collide_db.save_race_mods(race, mods):
+        raise HTTPException(status_code=500, detail="種族表寫入失敗")
+    collide_db.mark_race_reviewed(race)
+    return {"ok": True, "race": race, "mods": mods, "pending_review": False}
+
+
+@app.delete("/api/races/{race}")
+def api_race_delete(race: str):
+    """刪除種族（含自待審查清單移除）。"""
+    race = race.strip()
+    if not race:
+        raise HTTPException(status_code=400, detail="種族名不可為空")
+    if not collide_db.delete_race(race):
+        raise HTTPException(status_code=404, detail=f"種族「{race}」不存在或刪除失敗")
+    return {"ok": True}
+
+
+@app.post("/api/characters/{name}/special_forms")
+def api_character_forms(name: str, body: FormBody):
+    """新增／移除／改倍率的特殊型態（special_forms）。逐個 form 獨立操作。
+
+    倍率須在 1.1~1.5（與寫入規範一致）；action 為 add / remove。
+    """
+    conn = _conn()
+    try:
+        ch = collide_db.get_character(conn, name)
+        if not ch:
+            raise HTTPException(status_code=404, detail=f"角色「{name}」不存在")
+        form = body.form.strip()
+        if not form:
+            raise HTTPException(status_code=400, detail="型態名稱不可為空")
+        if body.action not in ("add", "remove"):
+            raise HTTPException(status_code=400, detail="action 只能是 add / remove")
+        forms = {k: float(v) for k, v in (ch.get("special_forms") or {}).items()}
+        if body.action == "remove":
+            forms.pop(form, None)
+        else:
+            mult = round(float(body.multiplier), 2)
+            if not (1.1 <= mult <= 1.5):
+                raise HTTPException(status_code=400, detail="型態倍率須在 1.1~1.5")
+            forms[form] = mult
+        data = dict(ch)
+        data["special_forms"] = forms
+        updated = collide_db.upsert_character(conn, data)
+        conn.commit()
+        return {"ok": True, "special_forms": updated["special_forms"]}
+    finally:
+        conn.close()
 
 
 @app.post("/api/characters/{name}/tags")
@@ -294,6 +502,15 @@ def main():
 
     port = args.port
     url = f"http://127.0.0.1:{port}"
+
+    # 啟動背景自動同步（每 30 秒檢查 dirty，自我修復）
+    try:
+        if sheets_sync.get_spreadsheet_id():
+            sheets_sync.start_auto_flush()
+            sheets_sync.mark_all_dirty()
+            print("✅ Google Sheets 自動同步已啟動（30 秒檢查一次）")
+    except Exception as e:
+        print(f"⚠️ Sheets 自動同步啟動失敗: {e}")
 
     server = threading.Thread(
         target=lambda: uvicorn.run(app, host="127.0.0.1", port=port, log_level="info"),

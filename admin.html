@@ -41,6 +41,13 @@ tr.battle-row{cursor:context-menu}
 .tag-add{margin-left:.3rem}
 .tag-input{width:6rem;font-size:.8rem;padding:.15rem .3rem;border:1px solid #ccc;border-radius:4px}
 .tag-btn{padding:.1rem .5rem;font-size:.8rem}
+.dt-bar{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:.6rem 0 .2rem}
+.dt-search{flex:1;min-width:200px;padding:.35rem .6rem;border:1px solid #ccc;border-radius:5px}
+.dt-filter{padding:.3rem .5rem;border:1px solid #ccc;border-radius:5px;max-width:200px}
+.dt-count{color:#888;font-size:.8rem;white-space:nowrap}
+th.dt-th{cursor:pointer;user-select:none}
+th.dt-th:hover{background:#e3edff}
+th.dt-th.sorted{background:#dbe6ff}
 </style>
 </head>
 <body>
@@ -70,14 +77,19 @@ tr.battle-row{cursor:context-menu}
   <h2>資料表查閱</h2>
   <div class="tabs" style="margin-top:0">
     <div class="tab active" data-panel="dt-char">角色</div>
+    <div class="tab" data-panel="dt-ability">能力</div>
     <div class="tab" data-panel="dt-skill">招式</div>
     <div class="tab" data-panel="dt-domain">結界</div>
     <div class="tab" data-panel="dt-battle">對撞紀錄</div>
+    <div class="tab" data-panel="dt-race">種族</div>
   </div>
+
   <div id="dt-char" class="panel active"><table id="char-table"><thead></thead><tbody></tbody></table></div>
+  <div id="dt-ability" class="panel"><table id="ability-table"><thead></thead><tbody></tbody></table></div>
   <div id="dt-skill" class="panel"><table id="skill-table"><thead></thead><tbody></tbody></table></div>
   <div id="dt-domain" class="panel"><table id="domain-table"><thead></thead><tbody></tbody></table></div>
   <div id="dt-battle" class="panel"><table id="battle-table"><thead></thead><tbody></tbody></table></div>
+  <div id="dt-race" class="panel"><table id="race-table"><thead></thead><tbody></tbody></table></div>
 </div>
 
 <div id="panel-logs" class="panel">
@@ -189,36 +201,157 @@ async function submitReview(){
   }catch(e){ toast(e.message, false); }
 }
 
-// ── data tables ──
-function renderTable(sel, rows, cols){
+// ── Excel 風資料表控制器：點表頭排序、關鍵字搜尋、欄位篩選 ──
+// config = { columns:[{key,label,filter?,cell?}], renderRow(row,idx), appendHTML? }
+// 回傳 { setRows, render }。cell(row) 可自訂搜尋/排序/篩選用的文字。
+function makeDataTable(sel, config){
   const tbl = $(sel);
-  if(!rows.length){ tbl.querySelector('tbody').innerHTML='<tr><td>無資料</td></tr>'; return; }
-  const keys = cols || Object.keys(rows[0]);
-  tbl.querySelector('thead').innerHTML = '<tr>'+keys.map(k=>`<th>${esc(k)}</th>`).join('')+'</tr>';
-  tbl.querySelector('tbody').innerHTML = rows.map(r=>'<tr>'+keys.map(k=>{
-    let v = r[k];
-    if(typeof v==='object' && v!==null) v = JSON.stringify(v);
-    return `<td>${esc(short(v))}</td>`;
-  }).join('')+'</tr>').join('');
+  const state = { sortKey:null, sortDir:1, query:'', filters:{}, rows:[] };
+  const byKey = k => config.columns.find(c=>c.key===k);
+
+  const bar = document.createElement('div');
+  bar.className = 'dt-bar';
+  const search = document.createElement('input');
+  search.className = 'dt-search';
+  search.placeholder = '搜尋全部欄位…';
+  const count = document.createElement('span');
+  count.className = 'dt-count';
+  const clearBtn = document.createElement('button');
+  clearBtn.className = 'btn gray';
+  clearBtn.textContent = '✕ 清除';
+  clearBtn.style.display = 'none';
+  bar.appendChild(search);
+  config.columns.forEach(col=>{
+    if(!col.filter) return;
+    const f = document.createElement('select');
+    f.className = 'dt-filter';
+    f.dataset.col = col.key;
+    f.appendChild(opt('', `${col.label}：全部`));
+    bar.appendChild(f);
+    f.addEventListener('change', ()=>{
+      state.filters[col.key] = f.value;
+      refreshBar(); render();
+    });
+  });
+  bar.appendChild(clearBtn);
+  bar.appendChild(count);
+  tbl.before(bar);
+
+  function opt(v,label){ const o=document.createElement('option'); o.value=v; o.textContent=label; return o; }
+  function hasFilter(){ if(state.query) return true; return Object.keys(state.filters).some(k=>state.filters[k]); }
+  function refreshBar(){ clearBtn.style.display = hasFilter() ? 'inline-block' : 'none'; }
+  clearBtn.addEventListener('click', ()=>{
+    state.query=''; state.filters={}; state.sortKey=null; state.sortDir=1;
+    search.value='';
+    bar.querySelectorAll('.dt-filter').forEach(s=>s.value='');
+    refreshBar(); render();
+  });
+  search.addEventListener('input', ()=>{
+    state.query = search.value.trim().toLowerCase();
+    refreshBar(); render();
+  });
+
+  function cellText(row, col){
+    if(col.cell) return String(col.cell(row) ?? '');
+    let v = row[col.key];
+    if(v===null||v===undefined) return '';
+    if(typeof v==='object') v = JSON.stringify(v);
+    return String(v);
+  }
+  function keep(row){
+    if(state.query){
+      const hay = config.columns.map(c=>cellText(row,c).toLowerCase()).join('\n');
+      if(!hay.includes(state.query)) return false;
+    }
+    for(const k in state.filters){
+      if(state.filters[k] && cellText(row, byKey(k)) !== state.filters[k]) return false;
+    }
+    return true;
+  }
+  function compare(a,b){
+    if(!state.sortKey) return 0;
+    const col = byKey(state.sortKey);
+    const av = cellText(a.row,col), bv = cellText(b.row,col);
+    const na = parseFloat(av), nb = parseFloat(bv);
+    let c;
+    if(av.trim()!=='' && bv.trim()!=='' && !isNaN(na) && !isNaN(nb)) c = na - nb;
+    else c = av.localeCompare(bv, 'zh-Hant');
+    return c * state.sortDir;
+  }
+  function visible(){
+    const items = [];
+    state.rows.forEach((row,idx)=>{ if(keep(row)) items.push({row,idx}); });
+    if(state.sortKey) items.sort(compare);
+    return items;
+  }
+  function render(){
+    const sorted = state.sortKey;
+    tbl.querySelector('thead').innerHTML = '<tr>' + config.columns.map(c=>{
+      const on = sorted===c.key;
+      const arrow = on ? (state.sortDir>0?' ▲':' ▼') : '';
+      return `<th class="dt-th${on?' sorted':''}" data-col="${esc(c.key)}">${esc(c.label)}${arrow}</th>`;
+    }).join('') + '</tr>';
+    const items = visible();
+    count.textContent = `${items.length} / ${state.rows.length} 筆`;
+    const tbody = tbl.querySelector('tbody');
+    if(!items.length){
+      tbody.innerHTML = `<tr><td colspan="${config.columns.length}">無資料</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = items.map(it=>config.renderRow(it.row, it.idx)).join('');
+    if(config.appendHTML && !hasFilter() && items.length){
+      tbody.innerHTML += typeof config.appendHTML==='function' ? config.appendHTML() : config.appendHTML;
+    }
+  }
+  tbl.querySelector('thead').addEventListener('click', e=>{
+    const th = e.target.closest('th[data-col]');
+    if(!th) return;
+    const key = th.dataset.col;
+    if(state.sortKey===key) state.sortDir = -state.sortDir;
+    else { state.sortKey = key; state.sortDir = 1; }
+    render();
+  });
+  function setRows(data){
+    state.rows = data;
+    config.columns.forEach(col=>{
+      const f = bar.querySelector(`.dt-filter[data-col="${CSS.escape(col.key)}"]`);
+      if(!f) return;
+      const cur = f.value;
+      const vals = [...new Set(data.map(r=>cellText(r,col)).filter(v=>v!==''))]
+        .sort((a,b)=>a.localeCompare(b,'zh-Hant'));
+      f.innerHTML = '';
+      f.appendChild(opt('', `${col.label}：全部`));
+      vals.forEach(v=>{ const o=opt(v, v.length>24 ? v.slice(0,24)+'…' : v); o.title=v; f.appendChild(o); });
+      f.value = cur;
+    });
+    render();
+  }
+  return { setRows, render, state, config };
 }
 
 // ── 角色表（含隱藏分顯示 + 特殊標籤編輯）──
 const STAT_KEYS = ['力量','敏捷','智力','體質','魅力','幸運'];
+let RACE_KEYS = STAT_KEYS;
 let charRows = [];
 function safeJson(s, fallback){
   if(typeof s === 'object' && s !== null) return s;
   if(typeof s === 'string' && s.trim()){ try{ return JSON.parse(s); }catch(e){} }
   return fallback;
 }
-function renderCharacters(chars){
-  charRows = chars;
-  const tbl = $('#char-table');
-  tbl.querySelector('thead').innerHTML = '<tr>' +
-    ['名稱','種族','學校評級','六維（評級／隱藏分）','特殊標籤','特殊型態','武器','MP','武藝','經驗']
-    .map(h=>`<th>${h}</th>`).join('') + '</tr>';
-  const tbody = tbl.querySelector('tbody');
-  if(!chars.length){ tbody.innerHTML='<tr><td colspan="10">無資料</td></tr>'; return; }
-  tbody.innerHTML = chars.map((c,ridx)=>{
+const charDT = makeDataTable('#char-table', {
+  columns: [
+    {key:'name', label:'名稱', filter:true},
+    {key:'race', label:'種族', filter:true},
+    {key:'school_rank', label:'學校評級', filter:true},
+    {key:'stats', label:'六維（評級／隱藏分）', cell:c=>Object.entries(safeJson(c.stats,{})).map(([k,v])=>`${k}${v}`).join(' ')},
+    {key:'special_tags', label:'特殊標籤', cell:c=>safeJson(c.special_tags,[]).join('、')},
+    {key:'special_forms', label:'特殊型態', cell:c=>Object.keys(safeJson(c.special_forms,{})).join('、')},
+    {key:'weapon', label:'武器'},
+    {key:'max_mp', label:'MP'},
+    {key:'martial', label:'武藝'},
+    {key:'exp', label:'經驗'},
+  ],
+  renderRow: (c, ridx)=>{
     const stats = safeJson(c.stats, {});
     const forms = safeJson(c.special_forms, {});
     const tags = safeJson(c.special_tags, []);
@@ -228,8 +361,12 @@ function renderCharacters(chars){
       const hv = h[s];
       return `<div>${s} <b>${esc(r)}</b>${hv!=null?` <span class="hd">${hv}</span>`:''}</div>`;
     }).join('');
-    const tagCell = tags.map((t,ti)=>`<span class="tag">${esc(t)}<button class="tag-x" data-ridx="${ridx}" data-tidx="${ti}" title="移除">×</button></span>`).join(' ') +
+    const tagCell = tags.map((t,ti)=>`<span class="tag">${esc(t)}<button class="tag-x" data-id="${ridx}" data-tidx="${ti}" title="移除">×</button></span>`).join(' ') +
       `<span class="tag-add"><input class="tag-input" placeholder="新標籤"><button class="btn tag-btn" data-addtag="${ridx}">＋</button></span>`;
+    const formCell = Object.entries(forms).map(([k,v])=>`
+      <span class="tag">${esc(k)}×${v}<button class="tag-x sf-x" data-id="${ridx}" data-sfname="${esc(k)}" title="移除">×</button></span>
+    `).join(' ') +
+      `<span class="tag-add"><input class="tag-input sf-name" placeholder="型態名"><input class="tag-input sf-mult" placeholder="倍率 1.1~1.5" style="width:5rem"><button class="btn tag-btn" data-addform="${ridx}">＋</button></span>`;
     const badges = [
       c.is_teacher ? '教師' : '',
       c.is_villain ? '反派' : '',
@@ -241,23 +378,32 @@ function renderCharacters(chars){
       <td>${esc(c.school_rank)}</td>
       <td>${statCell}</td>
       <td>${tagCell}</td>
-      <td>${Object.entries(forms).map(([k,v])=>`${esc(k)}×${v}`).join('<br>')||'—'}</td>
+      <td>${formCell || '—'}</td>
       <td>${esc(c.weapon)}</td>
       <td>${c.max_mp}</td>
       <td>${c.martial}</td>
       <td>${c.exp}</td>
     </tr>`;
-  }).join('');
-}
+  },
+});
+function renderCharacters(chars){ charRows = chars; charDT.setRows(chars); }
 $('#char-table').addEventListener('click', e=>{
   const delBtn = e.target.closest('.tag-x');
   if(delBtn){
-    const row = charRows[+delBtn.dataset.ridx];
-    const tag = safeJson(row.special_tags, [])[+delBtn.dataset.tidx];
-    api('/api/characters/'+encodeURIComponent(row.name)+'/tags', {
-      method:'POST', body: JSON.stringify({tag, action:'remove'})
-    }).then(()=>{ toast(`已移除標籤「${tag}」`); loadDataTables(); })
-      .catch(err=>toast(err.message, false));
+    const row = charRows[+delBtn.dataset.id];
+    if(delBtn.classList.contains('sf-x')){
+      const form = delBtn.dataset.sfname;
+      api('/api/characters/'+encodeURIComponent(row.name)+'/special_forms', {
+        method:'POST', body: JSON.stringify({form, action:'remove'})
+      }).then(()=>{ toast(`已移除型態「${form}」`); loadDataTables(); })
+        .catch(err=>toast(err.message, false));
+    }else{
+      const tag = safeJson(row.special_tags, [])[+delBtn.dataset.tidx];
+      api('/api/characters/'+encodeURIComponent(row.name)+'/tags', {
+        method:'POST', body: JSON.stringify({tag, action:'remove'})
+      }).then(()=>{ toast(`已移除標籤「${tag}」`); loadDataTables(); })
+        .catch(err=>toast(err.message, false));
+    }
     return;
   }
   const addBtn = e.target.closest('[data-addtag]');
@@ -271,19 +417,288 @@ $('#char-table').addEventListener('click', e=>{
     }).then(()=>{ toast(`已新增標籤「${tag}」`); loadDataTables(); })
       .catch(err=>toast(err.message, false));
   }
+  const addForm = e.target.closest('[data-addform]');
+  if(addForm){
+    const row = charRows[+addForm.dataset.addform];
+    const td = addForm.closest('td');
+    const name = (td.querySelector('.sf-name').value || '').trim();
+    const mult = parseFloat(td.querySelector('.sf-mult').value);
+    if(!name){ toast('請輸入型態名稱', false); return; }
+    if(!mult || isNaN(mult)){ toast('請輸入倍率（1.1~1.5）', false); return; }
+    api('/api/characters/'+encodeURIComponent(row.name)+'/special_forms', {
+      method:'POST', body: JSON.stringify({form:name, multiplier:mult, action:'add'})
+    }).then(()=>{ toast(`已新增型態「${name}×${mult}」`); loadDataTables(); })
+      .catch(err=>toast(err.message, false));
+  }
 });
+// ── 招式表（可編輯）──
+let skillRows = [];
+const skillDT = makeDataTable('#skill-table', {
+  columns: [
+    {key:'name', label:'招式', filter:true},
+    {key:'ability', label:'所屬能力', filter:true},
+    {key:'owner', label:'擁有者', filter:true},
+    {key:'application', label:'應用'},
+    {key:'skill_type', label:'型別', filter:true},
+    {key:'magic_system', label:'體系', filter:true},
+    {key:'element', label:'元素', filter:true},
+    {key:'mp_cost', label:'MP'},
+    {key:'power_base', label:'威力'},
+    {key:'range', label:'射程'},
+    {key:'effect', label:'效果'},
+    {key:'op', label:'操作', cell:()=>''},
+  ],
+  renderRow: (s,ridx)=>`
+    <tr>
+      <td><b>${esc(s.name)}</b></td>
+      <td>${esc(s.ability)}</td>
+      <td>${esc(s.owner)}</td>
+      <td>${esc(s.application)}</td>
+      <td>${esc(s.skill_type)}</td>
+      <td>${esc(s.magic_system)}</td>
+      <td>${esc(s.element)}</td>
+      <td>${s.mp_cost}</td>
+      <td>${s.power_base}</td>
+      <td>${esc(s.range)}</td>
+      <td>${short(s.effect)}</td>
+      <td><button class="btn" data-edit-skill="${ridx}">編輯</button></td>
+    </tr>`,
+});
+function renderSkills(skills){ skillRows = skills; skillDT.setRows(skills); }
+let skillEditOldKey = null;
+function openSkillEdit(ridx){
+  const s = skillRows[ridx];
+  skillEditOldKey = {name:s.name, owner:s.owner};
+  $('#sk-name').value = s.name ?? '';
+  $('#sk-ability').value = s.ability ?? '';
+  $('#sk-owner').value = s.owner ?? '';
+  $('#sk-application').value = s.application ?? '';
+  $('#sk-skill_type').value = s.skill_type ?? '';
+  $('#sk-magic_system').value = s.magic_system ?? '';
+  $('#sk-element').value = s.element ?? '';
+  $('#sk-range').value = s.range ?? '';
+  $('#sk-mp_cost').value = s.mp_cost ?? 0;
+  $('#sk-power_base').value = s.power_base ?? 1.0;
+  $('#sk-effect').value = s.effect ?? '';
+  $('#skill-dialog').showModal();
+}
+function closeSkillEdit(){ $('#skill-dialog').close(); }
+async function submitSkillEdit(){
+  const oldKey = skillEditOldKey;
+  const data = {
+    name: $('#sk-name').value.trim(),
+    ability: $('#sk-ability').value.trim(),
+    owner: $('#sk-owner').value.trim(),
+    application: $('#sk-application').value.trim(),
+    skill_type: $('#sk-skill_type').value.trim(),
+    magic_system: $('#sk-magic_system').value.trim(),
+    element: $('#sk-element').value.trim(),
+    range: $('#sk-range').value.trim(),
+    mp_cost: parseInt($('#sk-mp_cost').value) || 0,
+    power_base: parseFloat($('#sk-power_base').value) || 0,
+    effect: $('#sk-effect').value.trim(),
+  };
+  if(!data.name){ toast('招式名稱不可為空', false); return; }
+  try{
+    await api('/api/tables/skills/'+encodeURIComponent(oldKey.name)+'/'+encodeURIComponent(oldKey.owner), {
+      method:'PUT', body: JSON.stringify(data)
+    });
+    toast(`已更新招式「${data.name}」`);
+    closeSkillEdit();
+    loadDataTables();
+  }catch(e){ toast(e.message, false); }
+}
+$('#skill-table').addEventListener('click', e=>{
+  const btn = e.target.closest('[data-edit-skill]');
+  if(btn) openSkillEdit(+btn.dataset.editSkill);
+});
+
+// ── 結界表（可編輯）──
+let domainRows = [];
+const domainDT = makeDataTable('#domain-table', {
+  columns: [
+    {key:'name', label:'結界', filter:true},
+    {key:'owner', label:'擁有者', filter:true},
+    {key:'domain_type', label:'類型', filter:true},
+    {key:'awakening', label:'覺醒程度', filter:true},
+    {key:'precision', label:'精度'},
+    {key:'rule_self', label:'固有規則_自身'},
+    {key:'rule_enemy', label:'固有規則_敵方'},
+    {key:'rule_environment', label:'固有規則_環境'},
+    {key:'cooldown', label:'冷卻'},
+    {key:'sustain_mp', label:'維持MP'},
+    {key:'op', label:'操作', cell:()=>''},
+  ],
+  renderRow: (d,ridx)=>`
+    <tr>
+      <td><b>${esc(d.name)}</b></td>
+      <td>${esc(d.owner)}</td>
+      <td>${esc(d.domain_type)}</td>
+      <td>${esc(d.awakening)}</td>
+      <td>${d.precision}</td>
+      <td>${short(d.rule_self)}</td>
+      <td>${short(d.rule_enemy)}</td>
+      <td>${short(d.rule_environment)}</td>
+      <td>${esc(d.cooldown)}</td>
+      <td>${d.sustain_mp}</td>
+      <td><button class="btn" data-edit-domain="${ridx}">編輯</button></td>
+    </tr>`,
+});
+function renderDomains(domains){ domainRows = domains; domainDT.setRows(domains); }
+let domainEditOldKey = null;
+function openDomainEdit(ridx){
+  const d = domainRows[ridx];
+  domainEditOldKey = {name:d.name, owner:d.owner};
+  $('#dm-name').value = d.name ?? '';
+  $('#dm-owner').value = d.owner ?? '';
+  $('#dm-domain_type').value = d.domain_type ?? '';
+  $('#dm-awakening').value = d.awakening ?? '';
+  $('#dm-precision').value = d.precision ?? 0;
+  $('#dm-rule_self').value = d.rule_self ?? '';
+  $('#dm-rule_enemy').value = d.rule_enemy ?? '';
+  $('#dm-rule_environment').value = d.rule_environment ?? '';
+  $('#dm-cooldown').value = d.cooldown ?? '';
+  $('#dm-sustain_mp').value = d.sustain_mp ?? 0;
+  $('#domain-dialog').showModal();
+}
+function closeDomainEdit(){ $('#domain-dialog').close(); }
+async function submitDomainEdit(){
+  const oldKey = domainEditOldKey;
+  const data = {
+    name: $('#dm-name').value.trim(),
+    owner: $('#dm-owner').value.trim(),
+    domain_type: $('#dm-domain_type').value.trim(),
+    awakening: $('#dm-awakening').value.trim(),
+    precision: parseFloat($('#dm-precision').value) || 0,
+    rule_self: $('#dm-rule_self').value.trim(),
+    rule_enemy: $('#dm-rule_enemy').value.trim(),
+    rule_environment: $('#dm-rule_environment').value.trim(),
+    cooldown: $('#dm-cooldown').value.trim(),
+    sustain_mp: parseFloat($('#dm-sustain_mp').value) || 0,
+  };
+  if(!data.name){ toast('結界名稱不可為空', false); return; }
+  try{
+    await api('/api/tables/domains/'+encodeURIComponent(oldKey.name)+'/'+encodeURIComponent(oldKey.owner), {
+      method:'PUT', body: JSON.stringify(data)
+    });
+    toast(`已更新結界「${data.name}」`);
+    closeDomainEdit();
+    loadDataTables();
+  }catch(e){ toast(e.message, false); }
+}
+$('#domain-table').addEventListener('click', e=>{
+  const btn = e.target.closest('[data-edit-domain]');
+  if(btn) openDomainEdit(+btn.dataset.editDomain);
+});
+
+// ── 能力表 ──
+const abilityDT = makeDataTable('#ability-table', {
+  columns: [
+    {key:'name', label:'能力', filter:true},
+    {key:'owner', label:'擁有者', filter:true},
+    {key:'category', label:'類別', filter:true},
+    {key:'principle', label:'原理'},
+    {key:'range_limit', label:'射程限制'},
+    {key:'range_decay', label:'距離衰減'},
+  ],
+  renderRow: a=>'<tr>'+['name','owner','category','principle','range_limit','range_decay'].map(k=>{
+    let v = a[k];
+    if(typeof v==='object' && v!==null) v = JSON.stringify(v);
+    return `<td>${esc(short(v))}</td>`;
+  }).join('')+'</tr>',
+});
+
 async function loadDataTables(){
   try{
-    const [chars, skills, domains, battles] = await Promise.all([
-      api('/api/tables/characters'), api('/api/tables/skills'),
-      api('/api/tables/domains'), api('/api/tables/battles'),
+    const [chars, abilities, skills, domains, battles] = await Promise.all([
+      api('/api/tables/characters'), api('/api/tables/abilities'),
+      api('/api/tables/skills'), api('/api/tables/domains'), api('/api/tables/battles'),
     ]);
     renderCharacters(chars);
-    renderTable('#skill-table', skills);
-    renderTable('#domain-table', domains);
-    renderBattles(battles);
+    abilityDT.setRows(abilities);
+    renderSkills(skills);
+    renderDomains(domains);
+    battleDT.setRows(battles);
   }catch(e){ toast('資料表載入失敗：'+e.message, false); }
+  // 種族表獨立載入：任一其他表掛掉不影響，舊版後端沒有 /api/races 時也不擋主表
+  try{
+    const data = await api('/api/races');
+    if(data && data.stat_keys) RACE_KEYS = data.stat_keys;
+    raceDT.config.columns = raceColumns(RACE_KEYS);
+    raceDT.setRows((data && data.races) || []);
+  }catch(e){
+    const tb = $('#race-table');
+    tb.querySelector('thead').innerHTML = '<tr><th>種族</th><th>狀態</th></tr>';
+    tb.querySelector('tbody').innerHTML = `<tr><td colspan="8">種族表載入失敗（後端可能需重啟 collide_ui.py）：${esc(e.message)}</td></tr>`;
+  }
 }
+
+// ── 種族修正表（可編輯）──
+function raceColumns(keys){
+  return [
+    {key:'race', label:'種族', filter:true},
+    ...keys.map(k=>({key:'mod_'+k, label:k, cell:r=>(r.mods||{})[k] ?? 1.0})),
+    {key:'status', label:'狀態', filter:true, cell:r=>r.pending_review?'待審查':'已定案'},
+    {key:'op', label:'操作', cell:()=>''},
+  ];
+}
+const raceDT = makeDataTable('#race-table', {
+  columns: raceColumns(STAT_KEYS),
+  renderRow: (r)=>{
+    return `<tr data-race="${esc(r.race)}">
+      <td><b>${esc(r.race)}</b></td>
+      ${RACE_KEYS.map(k=>`<td><input class="race-mod" data-race="${esc(r.race)}" data-stat="${k}" type="number" step="0.1" min="0.8" max="1.5" value="${(r.mods||{})[k] ?? 1.0}"></td>`).join('')}
+      <td>${r.pending_review ? '<span class="status warn">待審查</span>' : '<span class="status ok">已定案</span>'}</td>
+      <td>
+        <button class="btn green" data-saverace="${esc(r.race)}">儲存</button>
+        <button class="btn danger" data-delrace="${esc(r.race)}">刪除</button>
+      </td>
+    </tr>`;
+  },
+  appendHTML: ()=>`
+    <tr>
+      <td><input class="tag-input race-name" placeholder="新種族名"></td>
+      ${RACE_KEYS.map(k=>`<td><input class="race-mod-new" data-stat="${k}" type="number" step="0.1" min="0.8" max="1.5" value="1.0"></td>`).join('')}
+      <td></td>
+      <td><button class="btn primary" data-addrace="1">新增</button></td>
+    </tr>`,
+});
+function raceModsFromRow(race){
+  const mods = {};
+  document.querySelectorAll('#race-table .race-mod').forEach(inp=>{
+    if(inp.dataset.race === race) mods[inp.dataset.stat] = inp.value;
+  });
+  return mods;
+}
+$('#race-table').addEventListener('click', e=>{
+  const save = e.target.closest('[data-saverace]');
+  if(save){
+    const race = save.dataset.saverace;
+    api('/api/races/'+encodeURIComponent(race), {method:'PUT', body: JSON.stringify({mods: raceModsFromRow(race)})})
+      .then(()=>{ toast(`已儲存種族「${race}」`); loadDataTables(); })
+      .catch(err=>toast(err.message, false));
+    return;
+  }
+  const del = e.target.closest('[data-delrace]');
+  if(del){
+    const race = del.dataset.delrace;
+    if(!confirm(`確定要刪除種族「${race}」？\n（使用此種族的角色會改以 1.0 計算）`)) return;
+    api('/api/races/'+encodeURIComponent(race), {method:'DELETE'})
+      .then(()=>{ toast(`已刪除種族「${race}」`); loadDataTables(); })
+      .catch(err=>toast(err.message, false));
+    return;
+  }
+  const add = e.target.closest('[data-addrace]');
+  if(add){
+    const name = (document.querySelector('.race-name').value || '').trim();
+    if(!name){ toast('請輸入種族名', false); return; }
+    const mods = {};
+    document.querySelectorAll('.race-mod-new').forEach(inp=>{ mods[inp.dataset.stat] = inp.value; });
+    api('/api/races/'+encodeURIComponent(name), {method:'PUT', body: JSON.stringify({mods})})
+      .then(()=>{ toast(`已新增種族「${name}」`); loadDataTables(); })
+      .catch(err=>toast(err.message, false));
+  }
+});
 
 // ── action log / floors ──
 async function loadActionLog(){
@@ -338,16 +753,19 @@ $('#sheets-sync-btn').addEventListener('click', async ()=>{
 
 // ── 對撞紀錄表（含刪除按鈕 + 右鍵選單）──
 let battleRows = [];
-function renderBattles(battles){
-  battleRows = battles;
-  const tbl = $('#battle-table');
-  tbl.querySelector('thead').innerHTML = '<tr>' +
-    ['ID','狀態','攻擊方','防禦方','BP 攻→守','判定','時間','操作']
-    .map(h=>`<th>${h}</th>`).join('') + '</tr>';
-  const tbody = tbl.querySelector('tbody');
-  if(!battles.length){ tbody.innerHTML='<tr><td colspan="8">無對撞紀錄</td></tr>'; return; }
-  tbody.innerHTML = battles.map(b=>`
-    <tr class="battle-row" data-battle="${b.id}" title="右鍵：刪除對撞紀錄">
+const battleDT = makeDataTable('#battle-table', {
+  columns: [
+    {key:'id', label:'ID'},
+    {key:'status', label:'狀態', filter:true},
+    {key:'attacker', label:'攻擊方', filter:true},
+    {key:'defender', label:'防禦方', filter:true},
+    {key:'bp', label:'BP 攻→守', cell:b=>`${b.atk_output??''} ${b.def_output??''}`},
+    {key:'verdict', label:'判定', filter:true},
+    {key:'created_at', label:'時間'},
+    {key:'op', label:'操作', cell:()=>''},
+  ],
+  renderRow: b=>`
+    <tr class="battle-row" data-id="${b.id}" title="右鍵：刪除對撞紀錄">
       <td>${b.id}</td>
       <td>${esc(b.status)}${b.undone_by?`<br><span class="hd">${esc(b.undone_by)}</span>`:''}</td>
       <td>${esc(b.attacker)}${b.attacker_skill?`<br><span class="hd">${esc(b.attacker_skill)}</span>`:''}</td>
@@ -356,8 +774,9 @@ function renderBattles(battles){
       <td>${esc(b.verdict||'')}</td>
       <td class="hd">${esc(b.created_at||'')}</td>
       <td><button class="btn danger" data-delbattle="${b.id}">刪除</button></td>
-    </tr>`).join('');
-}
+    </tr>`,
+});
+function renderBattles(battles){ battleRows = battles; battleDT.setRows(battles); }
 function confirmDeleteBattle(id){
   if(!confirm(`確定要永久刪除對撞紀錄 #${id}？\n（此動作不可復原；關聯的成長/動作紀錄不會被刪除）`)) return;
   api('/api/tables/battles/'+id, {method:'DELETE'})
@@ -371,11 +790,11 @@ $('#battle-table').addEventListener('click', e=>{
 let _ctxMenu = null;
 function hideCtxMenu(){ if(_ctxMenu){ _ctxMenu.remove(); _ctxMenu = null; } }
 $('#battle-table').addEventListener('contextmenu', e=>{
-  const tr = e.target.closest('tr[data-battle]');
+  const tr = e.target.closest('tr[data-id]');
   if(!tr){ return; }
   e.preventDefault();
   hideCtxMenu();
-  const id = +tr.dataset.battle;
+  const id = +tr.dataset.id;
   _ctxMenu = document.createElement('div');
   _ctxMenu.className = 'ctx-menu';
   _ctxMenu.style.left = e.clientX+'px';
@@ -402,6 +821,52 @@ document.body.insertAdjacentHTML('beforeend', `
     <p style="text-align:right;margin-top:.6rem">
       <button class="btn gray" onclick="closeReview()">取消</button>
       <button class="btn primary" onclick="submitReview()">送出</button>
+    </p>
+  </dialog>`);
+
+// ── skill edit dialog ──
+document.body.insertAdjacentHTML('beforeend', `
+  <dialog id="skill-dialog" style="border-radius:8px;border:1px solid #ccc;padding:1.2rem;min-width:640px;max-height:90vh;overflow:auto">
+    <h3 style="margin-top:0">編輯招式</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem .8rem">
+      <label>招式名稱<input id="sk-name" style="width:100%"></label>
+      <label>擁有者<input id="sk-owner" style="width:100%"></label>
+      <label>所屬能力<input id="sk-ability" style="width:100%"></label>
+      <label>型別（個人魔法/通常魔法/武技…）<input id="sk-skill_type" style="width:100%"></label>
+      <label>體系（自然系/超能系…）<input id="sk-magic_system" style="width:100%"></label>
+      <label>元素（自然系才填）<input id="sk-element" style="width:100%"></label>
+      <label>應用<input id="sk-application" style="width:100%"></label>
+      <label>射程<input id="sk-range" style="width:100%"></label>
+      <label>MP 消耗<input id="sk-mp_cost" type="number" min="0" max="25" style="width:100%"></label>
+      <label>威力基數（1.0~10.0）<input id="sk-power_base" type="number" step="0.1" min="1" max="10" style="width:100%"></label>
+      <label style="grid-column:1 / -1">效果（機械效果請寫明數值：抵擋 X／防禦 +X／自身威力 ×X／對方威力 ×X／威力 +X）</label>
+      <textarea id="sk-effect" rows="3" style="grid-column:1 / -1;width:100%"></textarea>
+    </div>
+    <p style="text-align:right;margin-top:.6rem">
+      <button class="btn gray" onclick="closeSkillEdit()">取消</button>
+      <button class="btn primary" onclick="submitSkillEdit()">儲存</button>
+    </p>
+  </dialog>`);
+
+// ── domain edit dialog ──
+document.body.insertAdjacentHTML('beforeend', `
+  <dialog id="domain-dialog" style="border-radius:8px;border:1px solid #ccc;padding:1.2rem;min-width:640px;max-height:90vh;overflow:auto">
+    <h3 style="margin-top:0">編輯結界</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem .8rem">
+      <label>結界名稱<input id="dm-name" style="width:100%"></label>
+      <label>擁有者<input id="dm-owner" style="width:100%"></label>
+      <label>類型（封閉式/開放式/壓迫式…）<input id="dm-domain_type" style="width:100%"></label>
+      <label>覺醒程度（未覺醒/初期/中期/後期/完全覺醒）<input id="dm-awakening" style="width:100%"></label>
+      <label>精度（0~1.5）<input id="dm-precision" type="number" step="0.1" min="0" max="1.5" style="width:100%"></label>
+      <label>維持MP<input id="dm-sustain_mp" type="number" step="0.1" min="0" style="width:100%"></label>
+      <label style="grid-column:1 / -1">固有規則_自身增益<textarea id="dm-rule_self" rows="2" style="width:100%"></textarea></label>
+      <label style="grid-column:1 / -1">固有規則_敵方限制<textarea id="dm-rule_enemy" rows="2" style="width:100%"></textarea></label>
+      <label style="grid-column:1 / -1">固有規則_環境改變<textarea id="dm-rule_environment" rows="2" style="width:100%"></textarea></label>
+      <label style="grid-column:1 / -1">冷卻<textarea id="dm-cooldown" rows="1" style="width:100%"></textarea></label>
+    </div>
+    <p style="text-align:right;margin-top:.6rem">
+      <button class="btn gray" onclick="closeDomainEdit()">取消</button>
+      <button class="btn primary" onclick="submitDomainEdit()">儲存</button>
     </p>
   </dialog>`);
 

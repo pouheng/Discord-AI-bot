@@ -11,13 +11,17 @@ Phase C：文風輸出（確認後，依文風規則生成對撞文本）
 import asyncio
 import json
 import os
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from collide_engine import (
+    VERDICT_DECISIVE,
     VERDICT_FUSION,
+    VERDICT_SUPPRESS,
+    apply_effects,
     compute_atk_bp,
     compute_domain_bp,
     compute_manamelee_bp,
@@ -25,9 +29,11 @@ from collide_engine import (
     decide_with_domain,
     domain_fusion_effects,
     domain_mod,
+    element_mod,
     hidden_score,
 )
 from collide_rules import (
+    CLASH_EFFECT_SYSTEM,
     CLASH_PHASE_A_SYSTEM,
     CLASH_PHASE_B_SYSTEM,
     CLASH_PHASE_C_SYSTEM,
@@ -50,7 +56,14 @@ class ClashError(Exception):
     pass
 
 
-async def _call_llm(system: str, user: str, *, temperature: float = 0.0, max_tokens: int = 6000) -> str:
+async def _call_llm(
+    system: str,
+    user: str,
+    *,
+    temperature: float = 0.0,
+    max_tokens: int = 6000,
+    label: str = "",
+) -> str:
     if not _client:
         raise ClashError("AI 服務未啟用，請檢查 DEEPSEEK_API_KEY 設定")
     # deepseek-v4-flash 為 reasoning 型，reasoning_content 吃 token 預算，
@@ -70,9 +83,28 @@ async def _call_llm(system: str, user: str, *, temperature: float = 0.0, max_tok
         content = (resp.choices[0].message.content or "").strip()
         last = content
         if content:
+            _append_clash_log(label or "Phase", system, user, content)
             return content
         await asyncio.sleep(0.5)
+    if last:
+        _append_clash_log(label or "Phase", system, user, last)
     return last
+
+
+def _append_clash_log(label: str, system: str, user: str, response: str) -> None:
+    """把對撞 LLM 呼叫的 prompt 與輸出附加到 prompt_logs/clash_log.txt（供除錯）。"""
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "clash_log.txt")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 70 + "\n")
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {label}\n")
+            f.write("-" * 70 + "\n【SYSTEM】\n" + system + "\n")
+            f.write("-" * 70 + "\n【USER】\n" + user + "\n")
+            f.write("-" * 70 + "\n【OUTPUT】\n" + response + "\n")
+    except Exception:
+        pass
 
 
 async def _call_json(
@@ -92,7 +124,7 @@ async def _call_json(
     last_raw = ""
     for attempt in range(retries + 1):
         raw = await _call_llm(
-            system, user, temperature=temperature, max_tokens=max_tokens * (2 ** attempt)
+            system, user, temperature=temperature, max_tokens=max_tokens * (2 ** attempt), label=label
         )
         try:
             return _json_or_raise(raw, label)
@@ -124,6 +156,16 @@ async def phase_a(history: str, db_lookup: Optional[DbLookup] = None) -> dict:
                     for r in roster
                 ]
                 prompt += "\n\n【登記角色表（供判斷玩家/NPC，不得更改招式內容）】\n" + "\n".join(lines)
+        except Exception:
+            pass
+        try:
+            abilities = await db_lookup("", "abilities")
+            if abilities:
+                lines = [
+                    f"- {a.get('name') or '?'}（{a.get('owner') or '通用'}｜{a.get('category') or '未分類'}）"
+                    for a in abilities
+                ]
+                prompt += "\n\n【已登記能力表（供判斷未登記招式屬於哪個能力的擴展應用，不得更改招式內容）】\n" + "\n".join(lines)
         except Exception:
             pass
     return await _call_json(
@@ -160,11 +202,17 @@ def _resolve_action(
     char = cand.get("char")
     if not char:
         raise ClashError(f"Phase A 未判斷出{side}方角色")
+    abilities = phase_a.get("abilities") or {}
+    applications = phase_a.get("applications") or {}
+    estimates = phase_a.get("skill_estimates") or {}
     return {
         "char": char,
         "skill": cand.get("skill"),
         "action_type": cand.get("action_type") or "skill",
         "is_player": cand.get("is_player", False),
+        "ability": (abilities.get(side) or "").strip() or None,
+        "application": (applications.get(side) or "").strip() or None,
+        "skill_estimate": estimates.get(side) or None,
     }
 
 
@@ -206,7 +254,48 @@ async def _resolve_skill_or_domain(
         if ability_row:
             sd["_ability_range_limit"] = ability_row.get("range_limit") or ""
             sd["_ability_range_decay"] = ability_row.get("range_decay") or ""
+            # 繼承所屬能力熟練度（Proficiency_Mod = 1 + 熟練度/100）
+            sd["proficiency_mod"] = round(1.0 + int(ability_row.get("proficiency") or 0) / 100.0, 3)
         out["skill_data"] = sd
+    elif actor.get("ability"):
+        # 未登記招式但 Phase A 判定屬於某已登記能力的合理擴展：
+        # 優先使用 Phase A 估算的完整數值（第一次對撞就能用真實威力）；
+        # 估算缺失/異常時退回「變體」規則（繼承熟練度 + 該能力最低 power_base）。
+        est = actor.get("skill_estimate")
+        ability_row = (await db_lookup(actor["ability"], "ability")) if db_lookup else None
+        prof_mod = 1.0
+        if ability_row:
+            prof_mod = round(1.0 + int(ability_row.get("proficiency") or 0) / 100.0, 3)
+        if (
+            isinstance(est, dict)
+            and est.get("power_base") is not None
+            and 1.0 <= float(est.get("power_base") or 0) <= 10.0
+        ):
+            sd = {k: est.get(k) for k in (
+                "name", "ability", "owner", "application", "skill_type",
+                "magic_system", "element", "mp_cost", "power_base", "effect", "range",
+            )}
+            sd["proficiency_mod"] = prof_mod
+            elem = str(sd.get("element") or "").strip()
+            msys = str(sd.get("magic_system") or "").strip()
+            stype = str(sd.get("skill_type") or "").strip()
+            sd["kind"] = "magic" if (elem or msys or stype in ("個人魔法", "通常魔法", "術式")) else "melee"
+            out["skill_data"] = sd
+            out["_unregistered"] = True
+        elif ability_row:
+            from collide_engine import variant_skill_base
+            bases = [float(r["power_base"]) for r in (await db_lookup(actor["ability"], "ability_skills") or [])] if db_lookup else []
+            sd = {
+                "name": skill_name,
+                "power_base": variant_skill_base(bases),
+                "proficiency_mod": prof_mod,
+                "kind": "magic",
+                "_unregistered_variant": True,
+            }
+            out["skill_data"] = sd
+            out["_unregistered"] = True
+        else:
+            out["skill_data"] = {}
     else:
         out["skill_data"] = {}
     return out
@@ -248,6 +337,69 @@ async def _resolve_range_mods(atk: dict, def_: dict, distance: dict) -> tuple[di
     return atk, def_
 
 
+# ── 招式效果解析（Phase A2，全機械套用）────────────────────
+
+async def parse_effects(
+    atk_actor: dict,
+    def_actor: dict,
+    statuses: dict,
+) -> dict:
+    """把雙方招式 effect 文字與討論串宣告的殘存狀態解析成結構化效果。
+
+    回傳 {"attacker": [...], "defender": [...]}（依 Phase A 側別）。
+    快速路徑：雙方 effect 皆空且無殘存狀態 → 不呼叫 LLM，直接回空陣列。
+    """
+    def side_info(actor: dict) -> dict:
+        sd = actor.get("skill_data") or {}
+        return {
+            "char": actor.get("char") or actor.get("name") or "",
+            "skill": actor.get("skill") or "",
+            "action_type": actor.get("action_type") or "skill",
+            "kind": sd.get("kind") or "magic",
+            "effect_text": str(sd.get("effect") or "").strip(),
+        }
+
+    ctx = {
+        "attacker": side_info(atk_actor),
+        "defender": side_info(def_actor),
+        "statuses": {
+            side: [s for s in (statuses.get(side) or []) if isinstance(s, str) and s.strip()]
+            for side in ("attacker", "defender")
+        },
+    }
+    has_text = bool(ctx["attacker"]["effect_text"] or ctx["defender"]["effect_text"])
+    has_status = bool(ctx["statuses"]["attacker"] or ctx["statuses"]["defender"])
+    if not has_text and not has_status:
+        return {"attacker": [], "defender": []}
+    parsed = await _call_json(
+        CLASH_EFFECT_SYSTEM,
+        json.dumps(ctx, ensure_ascii=False, indent=2),
+        max_tokens=3000,
+        label="效果解析",
+    )
+    return {
+        side: [e for e in (parsed.get(side) or []) if isinstance(e, dict)]
+        for side in ("attacker", "defender")
+    }
+
+
+def _effects_by_char(phase_a: dict, effects_by_side: dict, atk_actor: dict, def_actor: dict) -> dict:
+    """把 Phase A 側別的效果依角色名重新對應（以解析後的完整角色名為鍵）。
+
+    優先取解析後 actor 的 char/name（模糊匹配後的全名），退回 Phase A candidate 名。
+    """
+    out: dict[str, list[dict]] = {}
+    for side, fx in effects_by_side.items():
+        actor = atk_actor if side == "attacker" else def_actor
+        char = (actor.get("name") or actor.get("char") or "").strip()
+        if not char:
+            cand = phase_a.get(f"{side}_candidate") or {}
+            char = (cand.get("char") or "").strip()
+        if char:
+            out[char] = [e for e in fx if isinstance(e, dict)]
+    return out
+
+
 def compute_sides(
     atk: dict,
     def_: dict,
@@ -266,6 +418,12 @@ def compute_sides(
     """
     a_skill = atk.get("skill_data") or {}
     d_skill = def_.get("skill_data") or {}
+    # 元素相剋機械計算：本方攻擊元素 vs 對方招式元素
+    # （例：水剋火 → 火攻水 0.8、水攻火 1.2；任一方無元素則 1.0）
+    a_elem = str(a_skill.get("element") or "").strip()
+    d_elem = str(d_skill.get("element") or "").strip()
+    a_elem_m = element_mod(a_elem, d_elem)
+    d_elem_m = element_mod(d_elem, a_elem)
 
     def _one(
         actor: dict,
@@ -274,6 +432,7 @@ def compute_sides(
         form_m: float,
         variant_m: float,
         ambush_m: float,
+        elem_m: float,
     ) -> dict:
         from collide_engine import weapon_base as _wb
         weapon_cat = actor.get("weapon_category") or "bare"
@@ -330,7 +489,7 @@ def compute_sides(
             )
             return {
                 "char": actor.get("name"), "skill": skill.get("name") if skill else "普通攻擊",
-                "bp": bp, "kind": "melee",
+                "bp": bp, "kind": "melee", "element": "",
                 "breakdown": {
                     **_base, "weapon_base": weapon, "str_hidden": str_h,
                     "martial": int(actor.get("martial") or 0),
@@ -345,7 +504,7 @@ def compute_sides(
                 float(skill.get("mp_invested") or 0.0),
                 int(actor.get("martial") or 0),
                 exp,
-                element_m=float(skill.get("element_mod") or 1.0),
+                element_m=elem_m,
                 proficiency_m=float(skill.get("proficiency_mod") or 1.0),
                 status_m=status_m,
                 form_m=form_m,
@@ -355,11 +514,11 @@ def compute_sides(
             )
             return {
                 "char": actor.get("name"), "skill": skill.get("name"), "bp": bp,
-                "kind": "manamelee",
+                "kind": "manamelee", "element": str(skill.get("element") or "").strip(),
                 "breakdown": {
                     **_base, "weapon_base": weapon, "str_hidden": str_h,
                     "int_hidden": int_h, "mp_invested": float(skill.get("mp_invested") or 0.0),
-                    "element_mod": float(skill.get("element_mod") or 1.0),
+                    "element_mod": elem_m,
                     "proficiency_mod": float(skill.get("proficiency_mod") or 1.0),
                     "martial": int(actor.get("martial") or 0),
                 },
@@ -370,7 +529,7 @@ def compute_sides(
                 float(skill.get("power_base") or 1.0),
                 int_h,
                 exp,
-                element_m=float(skill.get("element_mod") or 1.0),
+                element_m=elem_m,
                 domain_m=float(actor.get("domain_mod") or 1.0),
                 proficiency_m=float(skill.get("proficiency_mod") or 1.0),
                 status_m=status_m,
@@ -381,18 +540,18 @@ def compute_sides(
             )
             return {
                 "char": actor.get("name"), "skill": skill.get("name"), "bp": bp,
-                "kind": "magic",
+                "kind": "magic", "element": str(skill.get("element") or "").strip(),
                 "breakdown": {
                     **_base, "skill_base": float(skill.get("power_base") or 1.0),
                     "stat_hidden": int_h,
-                    "element_mod": float(skill.get("element_mod") or 1.0),
+                    "element_mod": elem_m,
                     "domain_mod": float(actor.get("domain_mod") or 1.0),
                     "proficiency_mod": float(skill.get("proficiency_mod") or 1.0),
                 },
             }
 
-    a = _one(atk, a_skill, status_a, form_a, variant_a, ambush_a)
-    d = _one(def_, d_skill, status_d, form_d, variant_d, ambush_d)
+    a = _one(atk, a_skill, status_a, form_a, variant_a, ambush_a, a_elem_m)
+    d = _one(def_, d_skill, status_d, form_d, variant_d, ambush_d, d_elem_m)
     if d["bp"] > a["bp"]:
         a, d = d, a  # 威力大者為攻
     return a, d
@@ -451,10 +610,53 @@ async def phase_b(
         ambush_d=ambush_d,
     )
 
+    # 招式效果（Phase A2 解析 → 全機械套用，數值決定勝負）
+    status_declared = phase_a.get("statuses") or {}
+    try:
+        effects_by_side = await parse_effects(atk_actor, def_actor, status_declared)
+    except ClashError as _e:
+        effects_by_side = {"attacker": [], "defender": []}
+        phase_a.setdefault("warnings", []).append(f"招式效果解析失敗，本次以無效果計算：{_e}")
+    effects_by_char = _effects_by_char(phase_a, effects_by_side, atk_actor, def_actor)
+    atk_fx = effects_by_char.get(a["char"], [])
+    def_fx = effects_by_char.get(d["char"], [])
+    a_bp, d_bp, fx_log = apply_effects(
+        a["bp"], d["bp"], atk_fx, def_fx,
+        atk_kind=a.get("kind", "magic"), def_kind=d.get("kind", "magic"),
+        atk_element=a.get("element") or "", def_element=d.get("element") or "",
+    )
+    flipped = d_bp > a_bp
+    if flipped:
+        a, d = d, a
+        a_bp, d_bp = d_bp, a_bp
+    a["bp"] = a_bp
+    d["bp"] = d_bp
+
     domain_a = float(atk_actor.get("domain_mod") or 1.0)
     domain_d = float(def_actor.get("domain_mod") or 1.0)
     mp_invested = int((atk_actor.get("mp_invested") or 0) + (def_actor.get("mp_invested") or 0))
     verdict, fusion, gap = decide_with_domain(a["bp"], d["bp"], domain_a, domain_d, mp_invested)
+
+    # 留手規則：贏方若主張「留手」（只想擊退/點到為止/不傷性命），
+    # 即使數值足以碾壓，判定降為優勢壓制——出招者成功留手，達成其主張的目標。
+    # 反向（誇大戰果）不成立：機械數值為準。
+    intended = phase_a.get("intended_outcomes") or {}
+    winner_force = None
+    winner_desc = ""
+    _resolved_side_char = {
+        "attacker": atk_actor.get("name") or atk_actor.get("char"),
+        "defender": def_actor.get("name") or def_actor.get("char"),
+    }
+    for side in ("attacker", "defender"):
+        if _resolved_side_char.get(side) == a["char"]:
+            wi = intended.get(side) or {}
+            winner_force = str(wi.get("force") or "").strip()
+            winner_desc = str(wi.get("desc") or "").strip()
+            break
+    holding_back = False
+    if winner_force == "留手" and verdict == VERDICT_DECISIVE:
+        verdict = VERDICT_SUPPRESS
+        holding_back = True
 
     fusion_effects = None
     domains_view = None
@@ -468,12 +670,20 @@ async def phase_b(
         atk_actor["char"]: {"mod": atk_actor.get("range_mod", 1.0), "reason": atk_actor.get("range_reason", "")},
         def_actor["char"]: {"mod": def_actor.get("range_mod", 1.0), "reason": def_actor.get("range_reason", "")},
     }
+    _tags_map = {}
+    for _ch in (atk_char, def_char):
+        if _ch:
+            _tags_map[_ch.get("name")] = [t for t in (_ch.get("special_tags") or []) if isinstance(t, str) and t]
     result = {
         "computation": {"attacker": a, "defender": d},
         "attacker": a["char"],
         "defender": d["char"],
         "verdict": verdict,
         "domain_fusion": fusion,
+        "special_tags": {
+            "attacker": _tags_map.get(a["char"], []),
+            "defender": _tags_map.get(d["char"], []),
+        },
         "ambush": {"active": ambush_active, "target": (ambush.get("target") if ambush_active else None),
                     "desc": (ambush.get("desc") if ambush_active else None)},
         "distance": {"desc": distance.get("desc"), "range_mod": distance_rm},
@@ -490,6 +700,19 @@ async def phase_b(
         "domains": domains_view,
         "fusion_effects": fusion_effects,
         "chain_of_thought": "",
+        "intended_outcomes": intended,
+        "holding_back": holding_back,
+        "winner_intent": {"force": winner_force or "", "desc": winner_desc or ""},
+        "effects": {
+            "attacker": effects_by_char.get(a["char"], []),
+            "defender": effects_by_char.get(d["char"], []),
+            "applied": fx_log,
+            "flipped": flipped,
+            "declared_statuses": {
+                side: [s for s in (status_declared.get(side) or []) if isinstance(s, str) and s]
+                for side in ("attacker", "defender")
+            },
+        },
         "warnings": phase_a.get("warnings") or [],
     }
 
@@ -523,11 +746,13 @@ def _clash_result_view(computation: dict) -> dict:
         "result": computation.get("result") or {},
         "attacker": pick("attacker"),
         "defender": pick("defender"),
+        "special_tags": computation.get("special_tags") or {},
         "domain_fusion": bool(computation.get("domain_fusion")),
         "domain_override": computation.get("domain_override"),
         "domains": computation.get("domains"),
         "fusion_effects": computation.get("fusion_effects"),
         "remaining_damage": computation.get("remaining_damage", ""),
+        "effects": computation.get("effects") or {},
     }
 
 
@@ -537,7 +762,7 @@ async def phase_c(computation: dict, style_rules: str) -> str:
         f"【對撞計算結果】\n{json.dumps(_clash_result_view(computation), ensure_ascii=False, indent=2)}\n\n"
         f"【文風規則】\n{style_rules}"
     )
-    return await _call_llm(CLASH_PHASE_C_SYSTEM, prompt, temperature=0.9, max_tokens=6000)
+    return await _call_llm(CLASH_PHASE_C_SYSTEM, prompt, temperature=0.9, max_tokens=6000, label="Phase C")
 
 
 # ── 主流程 ─────────────────────────────────────────────────
