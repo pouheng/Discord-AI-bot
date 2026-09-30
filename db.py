@@ -104,6 +104,15 @@ def init_db():
             updated_at TEXT DEFAULT ''
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS person_aliases (
+            alias TEXT PRIMARY KEY,
+            canonical TEXT,
+            note TEXT DEFAULT '',
+            updated_at TEXT DEFAULT ''
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_canonical ON person_aliases(canonical)")
     conn.commit()
     conn.close()
     print(f"[資料庫] SQLite 初始化成功，檔案：{DB_FILE}")
