@@ -51,6 +51,10 @@ async def mocked_format_character_profile(name):
     return f"📋 {name} 的角色檔案\n  性別/年齡：女\n  外貌特徵：深藍髮"
 
 
+async def mocked_format_person_alias_map():
+    return "【角色身份對照表】\n  甲：又稱 草莓姊（同一個人，非不同角色）"
+
+
 async def mocked_config():
     return {
         "dialogue_ratio": "對白約占 40%",
@@ -75,6 +79,7 @@ PATCHES = [
     patch.object(main, "get_character_identity", mocked_get_character_identity),
     patch.object(main, "load_prompt_config", mocked_config),
     patch.object(main, "format_character_profile", mocked_format_character_profile),
+    patch.object(main, "format_person_alias_map", mocked_format_person_alias_map),
 ]
 
 for p in PATCHES:

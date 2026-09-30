@@ -47,6 +47,8 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 STATE_FILE = os.path.join(SCRIPT_DIR, "last_state.json")
 PROMPT_LOG_DIR = os.path.join(SCRIPT_DIR, "prompt_logs")
 ERROR_LOG_DIR = os.path.join(SCRIPT_DIR, "error_logs")
+# 每人帶入的「角色自身記憶」筆數上限。原本硬編碼 3，且只比對單一顯示名。
+PERSON_BOT_ROW_LIMIT = 6
 
 
 async def _log_error(event: str, detail: str, **extra):
@@ -353,10 +355,27 @@ async def get_user_memory(
             short_name = _re.sub(r"[（(].*?[）)]", "", user_name).strip()
             short_name = "".join(ch for ch in short_name if ord(ch) < 0x10000)
             short_name = short_name.strip()
-            cursor2 = await conn.execute(
-                "SELECT timestamp, topic, content FROM memories WHERE user_id = '__BOT__' AND (topic LIKE '%' || ? || '%' OR content LIKE '%' || ? || '%') ORDER BY timestamp DESC LIMIT 3",
-                (short_name, short_name),
-            )
+            # 別名也要一起比對：玩家飾演的角色與其 Discord 顯示名未必相同
+            # （例如顯示名『吳神月』飾演『甲（草莓姊）』），只比對顯示名會撈不到。
+            needles = {short_name} if short_name else set()
+            _canon = await resolve_person_name(short_name) if short_name else short_name
+            if _canon and _canon != short_name:
+                needles.add(_canon)
+                needles.update(await get_person_aliases(_canon))
+            needles = {n for n in needles if n and len(n) >= 2}
+            if needles:
+                clause = " OR ".join(
+                    ["(topic LIKE ? OR content LIKE ?)"] * len(needles)
+                )
+                params = []
+                for n in needles:
+                    params.extend([f"%{n}%", f"%{n}%"])
+                cursor2 = await conn.execute(
+                    f"SELECT timestamp, topic, content FROM memories "
+                    f"WHERE user_id = '__BOT__' AND ({clause}) "
+                    f"ORDER BY timestamp DESC LIMIT ?",
+                    params + [PERSON_BOT_ROW_LIMIT],
+                )
             bot_rows = await cursor2.fetchall()
 
     if not rows and not bot_rows:
@@ -373,6 +392,70 @@ async def get_user_memory(
             memory_list.append(f"- [{timestamp}] {topic}: {content}")
 
     return "\n".join(memory_list)
+
+
+async def get_person_memory(canonical: str, limit: int = 8) -> str:
+    """撈某個 NPC 角色的記憶。
+
+    以 person_aliases 收斂出該人的所有稱呼，全部拿去比對 topic / content，
+    如此『人物:甲（草莓姊）』與『人物:甲』不會變成兩個人。
+    找不到別名時退回單一正名比對。
+
+    不限制 user_id：同一個人的知識會散在多個擁有者底下
+    （Phase 3 的 learn 寫 __BOT__、mem 寫玩家 id），實測甲有 吳神月 4 筆、
+    澪 15 筆，若只撈 __BOT__ 就會漏掉一半。mem 是玩家私人資訊，
+    但與 learn 一起餵給 Phase 2 時有上下文可分辨。
+
+    分兩段取：先取 topic 開頭就是正名／別名的（那些是真正屬於此人的設定，
+    也是被拆組的核心記憶），不足 limit 才用全文提及的補齊。
+    否則 ORDER BY timestamp DESC 會讓高頻提及者的舊記憶擠掉本體
+    （實測凌空有 147 筆，獨立的『人物:煙霧之神』被擠在 50 名之外）。
+    """
+    canonical = (canonical or "").strip()
+    if not canonical:
+        return "（無記錄）"
+    needles = {canonical}
+    needles.update(await get_person_aliases(canonical))
+    needles = {n for n in needles if n and len(n) >= 2}
+    if not needles:
+        return "（無記錄）"
+
+    async with get_db() as conn:
+        clause = " OR ".join(["(topic LIKE ? OR content LIKE ?)"] * len(needles))
+        params = []
+        for n in needles:
+            params.extend([f"%{n}%", f"%{n}%"])
+        # 第一段：topic 直接命中某人（人物:甲 / 角色能力:甲（草莓姊）的水柱）
+        own_clause = " OR ".join(["topic LIKE ?"] * len(needles))
+        own_params = [f"%{n}%" for n in needles]
+        cur = await conn.execute(
+            f"SELECT timestamp, topic, content, user_name FROM memories "
+            f"WHERE {own_clause} ORDER BY timestamp DESC LIMIT ?",
+            own_params + [limit],
+        )
+        rows = await cur.fetchall()
+        seen = {(r[1], r[2]) for r in rows}
+        # 第二段：不足則用全文提及的補齊
+        if len(rows) < limit:
+            cur2 = await conn.execute(
+                f"SELECT timestamp, topic, content, user_name FROM memories "
+                f"WHERE {clause} ORDER BY timestamp DESC LIMIT ?",
+                params + [limit * 3],
+            )
+            for r in await cur2.fetchall():
+                if len(rows) >= limit:
+                    break
+                if (r[1], r[2]) not in seen:
+                    seen.add((r[1], r[2]))
+                    rows.append(r)
+
+    if not rows:
+        return "（無記錄）"
+    lines = []
+    for ts, topic, content, uname in rows:
+        who = f"（{uname}）" if uname and uname not in ("澪", "__BOT__") else ""
+        lines.append(f"- [{ts}] {topic}{who}: {content}")
+    return "\n".join(lines)
 
 
 async def save_user_memory(
@@ -2971,7 +3054,7 @@ async def run_phase1(
 
 【輸出格式】
 純 JSON（不加 ```）。
-- recall：陣列，每個元素是 {"id": "使用者ID數字"}
+- recall：陣列，每個元素是 {"id": "使用者ID數字"}；也可填 NPC 正名（如 "甲"），系統會依身份對照表解析
 - lore_topics：字串陣列，只要 topic 名稱（不加 [分類] 前綴）
 - recall_threads：討論串名稱陣列（如 ["時間:2月1號"]），無則空陣列
 - load_plot：布林值
@@ -2998,9 +3081,14 @@ async def run_phase1(
     # 動態資料區（底部）：完整資料庫內容
     # 靜態指令在上面，動態資料在下面。
     # ──────────────────────────────────────────────
+    # 身份對照表：讓模型知道哪些稱呼是同一人，recall 才不會漏掉 NPC
+    # （【可查詢的參與者】只有 Discord 使用者，NPC 不在其中）。
+    _p1_alias = await format_person_alias_map()
+    phase1_alias_block = (_p1_alias + "\n\n") if _p1_alias else ""
     dynamic_data = f"""【目前日期】
 {datetime.datetime.now().strftime("%Y-%m-%d")}
 
+{phase1_alias_block}
 【完整世界觀資料庫】
 {lore_full}
 
@@ -3276,6 +3364,9 @@ async def build_phase2_system_prompt(
 （以上是世界觀資料。當你們討論劇情時可以參考這些內容。）"""
         phase2_system += f"""
 
+【角色身份對照表 — 同一個人，不是不同角色】
+{await format_person_alias_map() or "（無）"}
+
 【你對眼前人物的已知資訊】  
 {combined_memories}
 
@@ -3365,7 +3456,13 @@ async def build_phase2_system_prompt(
         ic_self_profile = ""
         if char_name:
             ic_self_profile = await format_character_profile(char_name)
+        # 身份對照表緊接在人物記憶之前：模型讀到「人物:甲」時，
+        # 已經知道草莓姊是同一人，不會當成兩個角色。
+        _p2_alias = await format_person_alias_map()
         phase2_system += f"""
+
+【角色身份對照表 — 同一個人，不是不同角色】
+{_p2_alias if _p2_alias else "（無）"}
 
 【你對眼前人物的已知資訊】  
 {combined_memories}
@@ -3784,8 +3881,14 @@ def _extract_keywords(text: str, limit: int = 6) -> list[str]:
 
 async def resolve_and_fetch_memories(recall_user_ids: list, recall_candidates: list,
                                      channel_type: str) -> tuple[list, str]:
-    """名稱→ID 解析 + 從 SQLite 撈使用者記憶。回傳 (resolved_ids, combined_memories)。"""
+    """名稱→ID 解析 + 從 SQLite 撈使用者記憶。回傳 (resolved_ids, combined_memories)。
+
+    解析順序：純數字 ID → Discord 顯示名（精確／包含）→ person_aliases 別名。
+    最後一步是關鍵：recall_candidates 永遠只有 Discord 使用者，NPC 不在其中，
+    若不查別名表，Phase 1 回的 NPC 名（例如「草莓姊」）會被整個丟棄。
+    """
     resolved_ids = []
+    npc_names = []   # 解析不到 Discord id、但認得出是誰的 NPC
     for raw_id in recall_user_ids[:3]:
         try:
             int(raw_id)
@@ -3804,6 +3907,12 @@ async def resolve_and_fetch_memories(recall_user_ids: list, recall_candidates: l
                         break
             if matched:
                 resolved_ids.append(matched["id"])
+                continue
+            # Discord 對不上 → 試別名表（NPC 走這條）
+            canonical = await resolve_person_name(raw_id)
+            if canonical and canonical != raw_id:
+                npc_names.append((raw_id, canonical))
+                print(f"[Phase 1] '{raw_id}' 解析為角色 {canonical}（別名對照）")
             else:
                 print(f"[Phase 1] 無法解析 '{raw_id}' 為有效 ID，跳過。")
 
@@ -3819,6 +3928,12 @@ async def resolve_and_fetch_memories(recall_user_ids: list, recall_candidates: l
         )
         recalled_memories.append(f"【{name}】\n{mem}")
         print(f"[召回] {name} (id={uid})")
+
+    for raw, canonical in npc_names:
+        mem = await get_person_memory(canonical)
+        if mem and mem != "（無記錄）":
+            recalled_memories.append(f"【{canonical}】（{raw}）\n{mem}")
+            print(f"[召回] {canonical} via 別名 '{raw}'")
 
     combined_memories = "\n\n".join(recalled_memories)
     return resolved_ids, combined_memories
