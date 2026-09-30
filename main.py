@@ -21,6 +21,8 @@ from profiles import (
     PROFILE_FIELDS, PROFILE_LABELS,
     get_character_profile, update_character_profile,
     format_character_profile, list_character_names,
+    set_person_alias, ensure_person_canonical, resolve_person_name,
+    get_person_aliases, format_person_alias_map,
 )
 from prompts import build_style_block, build_banned_str, build_expr_str, build_safety_str
 import image_reader
@@ -1595,6 +1597,10 @@ async def phase3_process(
     # 若直接取前 8000 字元會只剩最舊記憶，導致 AI 看不見剛寫入的新記憶、
     # 每次都把近期話題當全新主題重複 learn。改取最後 8000 字元＝最新記憶。
     self_mem_snippet = self_memories[-8000:] if len(self_memories) > 8000 else self_memories
+    # 別名對照表：讓模型知道哪些稱呼是同一人，避免把一個人記成兩條 topic。
+    # 沒有任何別名時回空字串，該區塊不注入。
+    _alias_map = await format_person_alias_map()
+    alias_map_block = _alias_map if _alias_map else "（目前沒有已知的別名對照）"
     detect_prompt = f"""# ── 靜態指令區（上方）：規則說明 ──
 
 逐條比對【bot回覆】與【角色已知記憶】中的每條記憶，找出所有需要新增或更新之處。
@@ -1605,6 +1611,22 @@ async def phase3_process(
 - 記住：【使用者輸入】和【bot回覆】中出現的人物名稱，一定就是正確的名稱。不要懷疑它、不要改寫它、不要「覺得它應該是某個更合理的詞」。
 - topic 和 content 中的人物名稱必須與原文完全一致。
 
+【⚠️ 別名 vs 誤字 — 兩者處置相反】
+上面那條規則防的是「誤字」，但同一個人有時會有多種**合法稱呼**（甲／草莓姊、雪糕／雪風鈴奈、凌空／空米）。
+判斷方法：
+  · 使用者明確說過兩個稱呼是同一人（「甲＝草莓姊」「草莓就是甲」），或對話中自然切換稱呼 → 這是【別名】
+  · 只是字形／讀音相似、沒有任何同一人宣示 → 這是【誤字】，按上一條規則原樣保留
+【別名】的處置（與誤字相反，務必遵守）：
+  1. topic 一律用【正名】，括號別名寫進 content 說明，不要開成兩個 topic
+     正確：topic「人物:甲」，content「甲被稱呼為草莓姊，…」
+     錯誤：topic「人物:甲（草莓姊）」與 topic「人物:甲」各開一條 → 會被當成兩個人
+  2. 額外輸出 alias 欄位記錄對應關係：{{"action":"learn","alias":"草莓姊","canonical":"甲",…}}
+  3. 判斷不出正名時（兩種稱呼誰是本名不確定）→ topic 照原樣寫，不要猜，並在 note 標記待確認
+【子主題不是別名】——括號裡是屬性或狀態時不要當別名：
+  「人物:凌空（狐族）」「人物:凌空（貓爸行為）」「人物:鴨嘴獸（凌空設計中）」這些括號是子主題，
+  正名是『凌空』『鴨嘴獸』，括號內容照常留在 topic，不要輸出 alias。
+
+{alias_map_block}
 【輸出格式】
 {{"planning":"簡短分析過程","actions":[{{"action":"類型","topic":"主題","type":"真實或玩笑","content":"內容"}}]}}
 只有在確實有新資訊、矛盾或狀態變更時才輸出 action。若 bot 回覆僅在確認或重述既有記憶，輸出空陣列是可接受的。
@@ -1612,7 +1634,7 @@ async def phase3_process(
 所有資訊統一用以下動作：
 
 1. learn — 任何值得記錄的資訊（人物、能力、世界觀、場景、事件、物品、任務、角色背景、中之人經歷等）
-    用 topic 前綴分類：人物:名稱 / 角色能力:名稱 / 世界觀:名稱 / 場景:名稱 / 事件:名稱 / 物品:名稱 / 任務:名稱 / 角色背景:名稱 / 中之人經歷:名稱
+    用 topic 前綴分類：人物:名稱 / 角色能力:名稱 / 世界觀:名稱 / 場景:名稱 / 事件:名稱 / 物品:名稱 / 任務:名稱 / 角色背景:名稱 / 中之人經歷:名稱 / 場景與人物:名稱
     ⚠️ topic 一定要具體，禁用「新人物」「新能力」「新地點」等泛用詞。
     開玩笑/反諷/誇飾 → type 用「玩笑」。
     角色背景: 僅用於 IC 角色的正式設定。中之人（現實玩家）的真實經歷請用 中之人經歷: 前綴。
@@ -1793,6 +1815,14 @@ async def phase3_process(
 
             if act_type == "learn":
                 topic = act.get("topic", "未分類")
+                # 別名對應：模型確認兩個稱呼是同一人時，寫入 person_aliases，
+                # 之後召回與 prompt 注入都靠這張表收斂，不靠字串猜測。
+                _al = (act.get("alias") or "").strip()
+                _cn = (act.get("canonical") or "").strip()
+                if _al and _cn:
+                    if await set_person_alias(_al, _cn, note="Phase 3 learn"):
+                        await ensure_person_canonical(_cn)
+                        log_lines.append(f"  [別名] {_al} -> {_cn}")
                 if topic in learned_topics:
                     continue
                 learned_topics.add(topic)
