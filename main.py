@@ -2932,6 +2932,13 @@ async def run_phase1(
 - ⚠️ 單純提到角色能力或設定細節（如「你的能力可以做到」「這把武器很強」）不算創作任務
 - 不確定時 → enable_ic_style: false
 
+【日期區間召回規則 - recall_date_range】
+- 當使用者要求回顧／總結／整理某個「日期或期間」的內容時（例如「總結今天」「9月28號聊了什麼」「整理上週的劇情」「回顧 9/20 到 9/25」），把該範圍填入 recall_date_range。系統會直接附上該區間的全部記憶，你不需要靠挑選來涵蓋。
+- 格式：{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}；單日則 from 與 to 相同；跨日區間兩端都填。
+- 「今天」「昨天」「前天」「本週」「上週」等相對日期，依下方【目前日期】換算成絕對日期。
+- 使用者未指定日期或期間時，recall_date_range 設為 null。
+- ⚠️ 只是問「你還記得 X 嗎」這類點名查詢不算日期區間召回，不要填。
+
 【輸出格式】
 純 JSON（不加 ```）。
 - recall：陣列，每個元素是 {"id": "使用者ID數字"}
@@ -2939,6 +2946,7 @@ async def run_phase1(
 - recall_threads：討論串名稱陣列（如 ["時間:2月1號"]），無則空陣列
 - load_plot：布林值
 - enable_ic_style：布林值
+- recall_date_range：物件 {"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}，無則 null
 - lore_notes：陣列，每個元素可以是：
   - 關聯到某個 topic 的註釋：{"topic":"條目名稱","note":"註釋內容"}
   - 或自由註釋（無 topic）：{"note":"自由註釋內容"}
@@ -2960,7 +2968,10 @@ async def run_phase1(
     # 動態資料區（底部）：完整資料庫內容
     # 靜態指令在上面，動態資料在下面。
     # ──────────────────────────────────────────────
-    dynamic_data = f"""【完整世界觀資料庫】
+    dynamic_data = f"""【目前日期】
+{datetime.datetime.now().strftime("%Y-%m-%d")}
+
+【完整世界觀資料庫】
 {lore_full}
 
 【完整角色自我記憶】
@@ -3083,6 +3094,7 @@ async def run_phase1(
     load_plot = False
     enable_ic_style = False
     supplement = ""
+    phase1_json = {}
     try:
         cleaned = extract_json(phase1_raw)
         phase1_json = json.loads(cleaned)
@@ -3602,6 +3614,109 @@ async def search_memories_by_keyword(keywords: list[str], limit: int = 6) -> str
         who = f"{uname} " if uname else ""
         lines.append(f"- [{timestamp}] {who}{label} {topic}: {content}")
     print(f"[關鍵字召回] 命中 {len(rows)} 條: {kws}")
+    return "\n".join(lines)
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$")
+
+
+def _norm_date(value) -> str | None:
+    """把 '2026-9-28' / '2026/09/28' 正規化為 '2026-09-28'；不成格式回 None。"""
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip().replace("/", "-").replace(".", "-")
+    if not _DATE_RE.match(s):
+        return None
+    try:
+        y, m, d = (int(p) for p in s.split("-"))
+        return datetime.date(y, m, d).isoformat()
+    except ValueError:
+        return None
+
+
+def parse_date_range(range_obj) -> tuple[str, str] | None:
+    """從 Phase 1 的 recall_date_range 解析出 (from, to)；無法解析回 None。
+
+    容忍 'to' 缺漏（單日錨點），也容忍 from/to 顛倒（自動對調）。
+    """
+    if not range_obj:
+        return None
+    if isinstance(range_obj, str):
+        # 模型常把物件回成字串（lore_notes 也有同型問題），先試著解回 dict
+        s = range_obj.strip()
+        if s.startswith("{"):
+            try:
+                range_obj = json.loads(s)
+            except (ValueError, TypeError):
+                return None
+        else:
+            range_obj = {"from": s}
+    if not isinstance(range_obj, dict):
+        return None
+    d_from = _norm_date(range_obj.get("from") or range_obj.get("start"))
+    d_to = _norm_date(range_obj.get("to") or range_obj.get("end"))
+    if d_from and d_to and d_from > d_to:
+        d_from, d_to = d_to, d_from
+    if d_from and not d_to:
+        d_to = d_from
+    if d_to and not d_from:
+        d_from = d_to
+    if not d_from or not d_to:
+        return None
+    return d_from, d_to
+
+
+async def fetch_memories_by_date_range(
+    date_from: str, date_to: str, max_entries: int = 60, content_limit: int = 0
+) -> str:
+    """依日期／區間撈出記憶全文，供「總結某日」這類整段回顧請求使用。
+
+    一般召迴只給每個參與者最近幾條 + Phase 1 挑的 supplement，覆蓋率取決於
+    模型挑選；要求「總結某天」時使用者要的是「那天全部」，不能靠挑選。
+    故此路徑直接撈時間範圍內的記憶，略過 supplement 篩選。
+
+    date_from/date_to 為 YYYY-MM-DD（含起訖兩天）。max_entries 為保險絲，
+    content_limit > 0 時逐條截斷 content，寬區間用它控制注入量。
+    """
+    span_days = (
+        datetime.date.fromisoformat(date_to) - datetime.date.fromisoformat(date_from)
+    ).days + 1
+    if content_limit <= 0:
+        # 單日或兩天以內：內容不截斷，確保摘要不會漏掉細節
+        content_limit = 600 if span_days <= 2 else 300
+    try:
+        async with get_db() as conn:
+            cursor = await conn.execute(
+                "SELECT timestamp, topic, content, context, user_id FROM memories "
+                "WHERE timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp ASC LIMIT ?",
+                (f"{date_from} 00:00:00", f"{date_to} 23:59:59", max_entries),
+            )
+            rows = await cursor.fetchall()
+            total = (
+                await (await conn.execute(
+                    "SELECT COUNT(*) FROM memories "
+                    "WHERE timestamp >= ? AND timestamp <= ?",
+                    (f"{date_from} 00:00:00", f"{date_to} 23:59:59"),
+                )).fetchone()
+            )[0]
+    except Exception as e:
+        print(f"[日期召回] 搜尋失敗: {e}")
+        return ""
+
+    if not rows:
+        return ""
+
+    label = date_from if date_from == date_to else f"{date_from} ~ {date_to}"
+    lines = [f"（{label} 全期間記憶，共 {total} 筆）"]
+    for timestamp, topic, content, ctx, uid in rows:
+        c_label = "【中之人】" if ctx == "ooc" else "【劇中】"
+        who = "" if uid == "__BOT__" else "使用者 "
+        body = content if len(content) <= content_limit else content[:content_limit] + "…"
+        lines.append(f"- [{timestamp}] {who}{c_label} {topic}: {body}")
+    if total > len(rows):
+        lines.append(f"（僅列出前 {len(rows)} 筆，共 {total} 筆）")
+    print(f"[日期召回] {date_from}~{date_to} 命中 {len(rows)}/{total} 筆")
     return "\n".join(lines)
 
 
@@ -4216,7 +4331,7 @@ async def on_message(message: discord.Message):
                 if q:
                     quests_text = q + "\n\n（請在劇情中自然地引導角色往任務目標前進。不要突兀地讓角色突然想到任務，而是透過環境或對話自然觸發。）"
 
-            (_, recall_user_ids, lore_topics, lore_notes, recall_threads,
+            (phase1_json, recall_user_ids, lore_topics, lore_notes, recall_threads,
              load_plot, enable_ic_style, phase1_supplement) = await run_phase1(
                 recall_candidates, chain_text, thread_catalog, quests_text,
                 clean_input_reply, all_context, self_memories_full, user_memories_full, lore_full,
@@ -4242,6 +4357,20 @@ async def on_message(message: discord.Message):
                         combined_memories = (
                             f"{combined_memories}\n\n{kw_mem}" if combined_memories else kw_mem
                         )
+
+            # 「總結某天／某段期間」：撈該區間的記憶全文，不依賴 supplement 挑選。
+            # 一般召迴只給每個參與者最近 8 條 + Phase 1 挑的 supplement，
+            # 使用者要「那天全部」時靠挑選必然漏（例如 9/28 的 20 筆只有 15 筆進 prompt）。
+            parsed_range = parse_date_range(
+                phase1_json.get("recall_date_range")
+                if isinstance(phase1_json, dict) else None
+            )
+            if parsed_range:
+                date_mem = await fetch_memories_by_date_range(*parsed_range)
+                if date_mem:
+                    combined_memories = (
+                        f"{combined_memories}\n\n{date_mem}" if combined_memories else date_mem
+                    )
 
             lore_text = await assemble_lore_text(phase1_supplement, lore_topics, lore_notes)
 
