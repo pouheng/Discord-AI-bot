@@ -1,5 +1,4 @@
 import asyncio
-import io
 import sys
 import discord
 from discord.ext import commands
@@ -4620,26 +4619,37 @@ async def cmd_readimg(
     # 取得圖片 bytes
     image_bytes = None
     filename = "unknown"
+    user_id = interaction.user.id
+    # 圖片來源：'attachment' = 用戶在指令上直接附的，
+    #            'history'    = 從頻道歷史撈的上一張（該圖早已顯示在頻道裡）
+    image_source = None
+    source_message = None
     if image:
         image_bytes = await image.read()
         filename = image.filename
+        image_source = "attachment"
+        source_message = interaction.message
     elif interaction.channel:
-        # 嘗試從最近訊息找圖片
-        async for msg in interaction.channel.history(limit=10):
+        # 只找「發起者自己」的圖片：他人發的圖不算，機器人自己發的圖
+        # （例如 /tarot 抽到的塔羅牌）也不算。
+        async for msg in interaction.channel.history(limit=20):
+            if msg.author.id != user_id:
+                continue
             if msg.attachments:
                 image_bytes = await msg.attachments[0].read()
                 filename = msg.attachments[0].filename
+                image_source = "history"
+                source_message = msg
                 break
 
     if not image_bytes:
         await interaction.followup.send(
-            "❌ 找不到圖片。請直接附帶圖片，或在有圖片的訊息上使用此指令。",
+            "❌ 找不到你的圖片。請直接附帶圖片，或在你最近發過圖的訊息上使用此指令。",
             ephemeral=True,
         )
         return
 
     # 檢查 cache
-    user_id = interaction.user.id
     channel_id = interaction.channel_id or 0
     cached = image_reader.get_cached_description(image_bytes)
     if cached:
@@ -4696,8 +4706,9 @@ async def cmd_readimg(
             all_context.append({"role": role, "content": f"[{name}]: {msg.content}"})
     all_context.reverse()
 
-    clean_input = message or "（用戶分享了一張圖片）"
     user_name = interaction.user.display_name
+    # 只讀發起者自己的圖，所以出處必然是同一人。
+    clean_input = message.strip() if (message and message.strip()) else "（用戶分享了一張圖片）"
 
     # 呼叫 Phase 2
     try:
@@ -4739,21 +4750,26 @@ async def cmd_readimg(
     if not cleaned:
         cleaned = "（...）"
 
-    # 把用戶的 message 顯示在回覆裡（讓其他用戶看到指令內容）
-    user_msg_text = message if message else "分享了一張圖片"
-    cleaned = f"**{user_name}**：{user_msg_text}\n\n{cleaned}"
+    # 出處標示：只讀發起者自己的圖，所以直接標記使用者本人。
+    lead = f"**{user_name}** 分享了一張圖片"
+    if message and message.strip():
+        lead += f"，並說道：{message.strip()}"
+    cleaned = f"{lead}\n\n{cleaned}"
 
     # 編碼限制 + 截斷
     encoded = cleaned.encode("utf-8")
     if len(encoded) > 1900:
         cleaned = encoded[:1850].decode("utf-8", errors="ignore") + "..."
 
-    # 重新上傳圖片 + 回覆（讓其他人看到圖片）
-    discord_file = discord.File(io.BytesIO(image_bytes), filename=filename) if image_bytes else None
-    if interaction.message:
-        await interaction.channel.send(cleaned, reference=interaction.message, file=discord_file)
+    # 回覆。刻意不重新上傳圖片：無論是「指令上附的圖」還是「從歷史撈的上一張」，
+    # 該圖早已顯示在頻道裡了，再貼一次等於重複洗版。
+    # history 來源時改引用「原本那則有圖的訊息」，讓回覆直接接在圖下面。
+    if image_source == "history" and source_message is not None:
+        await interaction.channel.send(cleaned, reference=source_message)
+    elif interaction.message:
+        await interaction.channel.send(cleaned, reference=interaction.message)
     else:
-        await interaction.followup.send(cleaned, file=discord_file)
+        await interaction.followup.send(cleaned)
 
 
 # 啟動前註冊外置指令模組

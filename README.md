@@ -146,6 +146,7 @@
 | `/reload_config` | `main.py` | 重新載入設定 |
 | `/summaries` | `main.py` | 查看所有頻道摘要 |
 | `/read` | `main.py` | 角色閱讀討論串（批次記憶） |
+| `/readimg` | `main.py` | 用本地 Gemma4 分析圖片並以角色身分回應（[使用指南](docs/USER_GUIDE_readimg.md)） |
 | **修改建議** (右鍵選單) | `main.py` | AI 輔助修改 Bot 已發送的訊息 |
 | `/autopilot_on` | `autopilot.py` | 啟用 NPC 托管模式 |
 | `/autopilot_off` | `autopilot.py` | 停用 NPC 托管模式 |
