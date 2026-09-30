@@ -21,7 +21,8 @@ from profiles import (
     PROFILE_FIELDS, PROFILE_LABELS,
     get_character_profile, update_character_profile,
     format_character_profile, list_character_names,
-    set_person_alias, ensure_person_canonical, resolve_person_name,
+    set_person_alias, ensure_person_canonical,     resolve_person_name,
+    is_known_person,
     get_person_aliases, format_person_alias_map,
 )
 from prompts import build_style_block, build_banned_str, build_expr_str, build_safety_str
@@ -3910,7 +3911,7 @@ async def resolve_and_fetch_memories(recall_user_ids: list, recall_candidates: l
                 continue
             # Discord 對不上 → 試別名表（NPC 走這條）
             canonical = await resolve_person_name(raw_id)
-            if canonical and canonical != raw_id:
+            if await is_known_person(raw_id):
                 npc_names.append((raw_id, canonical))
                 print(f"[Phase 1] '{raw_id}' 解析為角色 {canonical}（別名對照）")
             else:

@@ -78,6 +78,51 @@ async def format_character_profile(char_name: str) -> str:
     return "\n".join(lines)
 
 
+async def format_person_profiles(canonical: str) -> str:
+    """格式化某人在場時的完整身分卡，供 Phase 2 注入。
+
+    包含別名關係，讓模型在同一段裡同時知道『這個人叫什麼』與
+    『他還叫什麼』。若 canonical 有對應的別名，改用正名去撈 profile，
+    避免 profile 建在別名下而撈不到。
+
+    找 profile 時不只比對別名表字串，而是把 character_profiles 裡的
+    每個 char_name 都丟去解析，看解析結果是否等於本正名。因為舊資料
+    常把 profile 建在『雪風れいな（雪糕）』『謝黛君（代謝君）』這種
+    帶括號的複合名下，而那些字串不在別名表中，字串比對會漏掉。
+
+    只有真的有內容的欄位才輸出，空殼列回空字串以免浪費 token。
+    """
+    canonical = (canonical or "").strip()
+    if not canonical:
+        return ""
+    aliases = await get_person_aliases(canonical)
+    accepted = {canonical} | set(aliases)
+    # 候選名：正名 → 別名字串 → 舊的括號複合名
+    # 括號複合名只認『去掉括號後剛好等於正名或別名』，或『括號內就是
+    # 正名或別名』（雪風れいな（雪糕）、謝黛君（代謝君））。不用模糊比對：
+    # 模糊比對會把『凌空的哥哥』判成凌空本人（它包含『凌空』），
+    # 那是另一個人，profile 掛錯人比撈不到更糟。
+    candidates = [canonical] + list(aliases)
+    for name in await list_character_names():
+        if name in accepted:
+            continue
+        base = re.sub(r"[（(].*?[）)].*$", "", name).strip()
+        inner = " ".join(re.findall(r"[（(](.*?)[）)]", name))
+        inner = inner.split()[-1] if inner.split() else ""
+        if (base and base in accepted) or (inner and inner in accepted):
+            candidates.append(name)
+
+    for name in candidates:
+        text = await format_character_profile(name)
+        if text:
+            header = f"📋 {canonical} 的角色檔案"
+            others = [a for a in aliases if a != canonical]
+            if others:
+                header += f"（又稱 {'、'.join(others)}）"
+            return text.replace(text.split("\n")[0], header, 1)
+    return ""
+
+
 async def list_character_names() -> list[str]:
     """回傳所有角色檔案的角色名稱列表"""
     async with get_db() as conn:
@@ -163,6 +208,24 @@ async def resolve_person_name(name: str) -> str:
         if len(hits) == 1:
             return next(iter(hits.values()))
     return name
+
+
+async def is_known_person(name: str) -> bool:
+    """判斷某個名稱是否已登記在 person_aliases（含正名本身）。
+
+    呼叫端需要這個判斷，因為 resolve_person_name 對「正名回正名」與
+    「完全沒這個人」都會原樣回傳同一個字串，無法區分：
+    已知角色『甲』回『甲』，不該被當成查無此人的雜訊丟掉。
+    """
+    name = (name or "").strip()
+    if not name:
+        return False
+    async with get_db() as conn:
+        cursor = await conn.execute(
+            "SELECT 1 FROM person_aliases WHERE alias = ? OR canonical = ? LIMIT 1",
+            (name, name),
+        )
+        return await cursor.fetchone() is not None
 
 
 async def get_person_aliases(canonical: str) -> list[str]:
