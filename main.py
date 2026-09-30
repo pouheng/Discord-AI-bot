@@ -824,37 +824,40 @@ async def _update_memory(
         return
     try:
         conn = await aiosqlite.connect(DB_FILE, timeout=10)
+        # 內容／topic 被改動時必須同步刷新 timestamp，否則修正後的記憶仍帶著
+        # 舊時間，召回時的 ORDER BY timestamp DESC 會把它當成陳舊資料。
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if new_topic and new_topic != topic:
             # 重新命名 topic（同時可更新內容與類型）
             if new_content and new_type:
                 await conn.execute(
-                    "UPDATE memories SET topic = ?, content = ?, mem_type = ? WHERE user_id = ? AND topic = ?",
-                    (new_topic, new_content, new_type, user_id, topic),
+                    "UPDATE memories SET topic = ?, content = ?, mem_type = ?, timestamp = ? WHERE user_id = ? AND topic = ?",
+                    (new_topic, new_content, new_type, now_str, user_id, topic),
                 )
             elif new_content:
                 await conn.execute(
-                    "UPDATE memories SET topic = ?, content = ? WHERE user_id = ? AND topic = ?",
-                    (new_topic, new_content, user_id, topic),
+                    "UPDATE memories SET topic = ?, content = ?, timestamp = ? WHERE user_id = ? AND topic = ?",
+                    (new_topic, new_content, now_str, user_id, topic),
                 )
             elif new_type:
                 await conn.execute(
-                    "UPDATE memories SET topic = ?, mem_type = ? WHERE user_id = ? AND topic = ?",
-                    (new_topic, new_type, user_id, topic),
+                    "UPDATE memories SET topic = ?, mem_type = ?, timestamp = ? WHERE user_id = ? AND topic = ?",
+                    (new_topic, new_type, now_str, user_id, topic),
                 )
             else:
                 await conn.execute(
-                    "UPDATE memories SET topic = ? WHERE user_id = ? AND topic = ?",
-                    (new_topic, user_id, topic),
+                    "UPDATE memories SET topic = ?, timestamp = ? WHERE user_id = ? AND topic = ?",
+                    (new_topic, now_str, user_id, topic),
                 )
         elif new_content and new_type:
             await conn.execute(
-                "UPDATE memories SET content = ?, mem_type = ? WHERE user_id = ? AND topic = ?",
-                (new_content, new_type, user_id, topic),
+                "UPDATE memories SET content = ?, mem_type = ?, timestamp = ? WHERE user_id = ? AND topic = ?",
+                (new_content, new_type, now_str, user_id, topic),
             )
         elif new_content:
             await conn.execute(
-                "UPDATE memories SET content = ? WHERE user_id = ? AND topic = ?",
-                (new_content, user_id, topic),
+                "UPDATE memories SET content = ?, timestamp = ? WHERE user_id = ? AND topic = ?",
+                (new_content, now_str, user_id, topic),
             )
         elif new_type:
             await conn.execute(
@@ -1303,8 +1306,8 @@ async def maintain_self_memories():
                             f"  ✏️ 簡化 id={mid} [{info[0]}]\n     舊：{info[1][:80]}\n     新：{new_content[:80]}"
                         )
                     await conn.execute(
-                        "UPDATE memories SET content = ? WHERE id = ? AND user_id = '__BOT__'",
-                        (new_content, int(mid)),
+                        "UPDATE memories SET content = ?, timestamp = ? WHERE id = ? AND user_id = '__BOT__'",
+                        (new_content, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), int(mid)),
                     )
                     print(f"[記憶維護] 簡化 id={mid}")
             elif action_type == "merge":
