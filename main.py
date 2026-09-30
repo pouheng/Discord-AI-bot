@@ -38,6 +38,7 @@ load_dotenv()
 # --- 設定區 ---
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(SCRIPT_DIR, "rp_memory.db")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
@@ -221,6 +222,97 @@ client = AsyncOpenAI(
     base_url="https://api.deepseek.com/v1",
     timeout=60.0,
 )
+
+
+# ──────────────────────────────────────────────
+# 思考強度（reasoning_effort / thinking）
+#
+# DeepSeek 思考模式預設開啟、effort 預設 high，會把 max_tokens 預算吃掉一大塊。
+# 實測（prompt_logs 2026-09-28_23-49-20 兩份真實 prompt）：
+#
+#   Phase 1（召回分析, max_tokens=2000）
+#     預設 high : completion 2000 全被 reasoning 吃掉 → finish_reason=length,
+#                 content 為空或截斷，supplement 產不出來
+#     low       : reasoning 反而更長（4777 chars），一樣 length，沒有省到
+#     off       : completion 1644、reasoning 0、supplement 7 條、finish=stop ✅
+#
+#   Phase 2（角色扮演, max_tokens=4000）
+#     預設 high : completion 2166 → 實際回覆 890 chars（約 6 成 token 花在 reasoning）
+#     low       : completion 687  → 實際回覆 631 chars ✅
+#     max       : completion 4000 全被 reasoning 吃掉 → content 為空 ❌
+#
+# 結論：抽取／分類型任務關掉思考最划算；生成型任務用 low；
+#       max 在任何場景都會炸（reasoning 吃光預算），不要用。
+# ──────────────────────────────────────────────
+EFFORT_OFF = "off"      # extra_body thinking=disabled
+EFFORT_LOW = "low"      # reasoning_effort=low
+EFFORT_HIGH = "high"    # reasoning_effort=high
+
+
+def llm_effort(effort: str) -> dict:
+    """把思考強度設定轉成 API kwargs。
+
+    off → extra_body={"thinking":{"type":"disabled"}}（此時 temperature 才會生效）
+    low/high → reasoning_effort=<level>
+    """
+    if effort == EFFORT_OFF:
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    if effort in (EFFORT_LOW, EFFORT_HIGH):
+        return {"reasoning_effort": effort}
+    raise ValueError(f"未知的思考強度: {effort!r}（可用 off/low/high）")
+
+
+async def call_llm(effort: str, messages: list, *, temperature=None,
+                   max_tokens=None, response_format=None, model=None, label: str = "",
+                   empty_retries: int = 1):
+    """統一呼叫 DeepSeek，帶入思考強度設定。
+
+    全專案只有這裡碰 reasoning_effort / thinking，避免各呼叫點各自為政。
+
+    同時處理「思考強度吃掉預算導致空回」：思考模式會把 max_tokens 花在
+    reasoning_content 上，正文還沒寫完就 finish_reason=length，content 變空字串。
+    這裡統一偵測「空正文 + 預算用完」並放大預算重試，
+    讓任何 effort 設定都不會靜默回空。
+    """
+    kwargs = {"model": model or DEEPSEEK_MODEL, "messages": messages}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    kwargs.update(llm_effort(effort))
+
+    budget = max_tokens
+    resp = None
+    for attempt in range(empty_retries + 1):
+        call_kwargs = dict(kwargs)
+        if budget is not None:
+            call_kwargs["max_tokens"] = budget
+        resp = await client.chat.completions.create(**call_kwargs)
+        choice = resp.choices[0]
+        content = (choice.message.content or "").strip()
+        if label:
+            usage = getattr(resp, "usage", None)
+            reasoning = getattr(choice.message, "reasoning_content", None) or ""
+            print(
+                f"[LLM] {label} effort={effort} completion="
+                f"{usage.completion_tokens if usage else '?'} "
+                f"reasoning={len(reasoning)} finish={choice.finish_reason} "
+                f"content={len(content)}"
+            )
+        if content:
+            return resp
+        # 正文空：預算被思考吃光（finish_reason=length）就放大預算再試
+        if attempt < empty_retries:
+            if budget is None:
+                # 沒有預算上限可放大，只能直接放棄重試
+                break
+            grew = min(budget * 4, 32000)
+            print(
+                f"[LLM] {label} 正文為空（finish={choice.finish_reason}），"
+                f"預算 {budget} → {grew} 重試"
+            )
+            budget = grew
+    return resp
 
 
 _db_init()
@@ -1135,15 +1227,14 @@ async def maintain_self_memories():
             actions = []
             raw = '{"actions":[]}'
         else:
-            resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
-                messages=[
+            resp = await call_llm(
+                EFFORT_HIGH, [
                     {"role": "system", "content": "你只輸出 JSON，不要加任何解釋。"},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.2,
-                max_tokens=8000,
+                temperature=0.2, max_tokens=8000,
                 response_format={"type": "json_object"},
+                label="maintain",
             )
             raw = resp.choices[0].message.content or '{"actions":[]}'
 
@@ -1315,14 +1406,12 @@ async def summarize_plot(channel, limit: int = 30) -> str | None:
 只輸出摘要文字，不加任何標記。"""
 
     try:
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
+        resp = await call_llm(
+            EFFORT_OFF, [
                 {"role": "system", "content": "你只輸出摘要文字，不添加任何格式。"},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,
-            max_tokens=300,
+            temperature=0.3, max_tokens=300, label="summarize_plot",
         )
         summary = resp.choices[0].message.content or ""
         return summary.strip()
@@ -1364,17 +1453,15 @@ async def update_channel_summary(
 
 請輸出更新後的完整摘要，3-8 句話，包含所有重要細節。只輸出摘要文字。"""
     try:
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
+        resp = await call_llm(
+            EFFORT_OFF, [
                 {
                     "role": "system",
                     "content": "你只輸出摘要文字，無格式。增量更新，保留所有舊細節並加入新內容。",
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,
-            max_tokens=500,
+            temperature=0.3, max_tokens=500, label="update_channel_summary",
         )
         new_summary = (resp.choices[0].message.content or "").strip()
         if not new_summary:
@@ -1608,14 +1695,12 @@ async def phase3_process(
         model = models[attempt]
         temp = temps[attempt] if attempt < len(temps) else 0.3
         try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=[
+            resp = await call_llm(
+                EFFORT_OFF, [
                     {"role": "system", "content": "你只輸出指定格式，不加多餘解釋。"},
                     {"role": "user", "content": detect_prompt},
                 ],
-                temperature=temp,
-                max_tokens=8000,
+                temperature=temp, max_tokens=8000, model=model, label="phase3_detect",
             )
         except Exception as e:
             log_lines.append(f"  [檢測API失敗] attempt={attempt + 1} {model} {e}")
@@ -2301,17 +2386,15 @@ async def cmd_read(
 {chunk}"""
 
         try:
-            resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
-                messages=[
+            resp = await call_llm(
+                EFFORT_OFF, [
                     {
                         "role": "system",
                         "content": "你認真閱讀並提取重點，只輸出摘要和LEARN標籤。",
                     },
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.4,
-                max_tokens=600,
+                temperature=0.4, max_tokens=600, label="cmd_read_learn",
             )
             raw = resp.choices[0].message.content or ""
             for lm in re.findall(r"\[LEARN:(\{.*?\})\]", raw, re.DOTALL):
@@ -2337,17 +2420,15 @@ async def cmd_read(
 請用自然聊天的語氣，寫一段讀後感想。像在跟朋友分享：「我剛讀完了XXX，覺得...」"""
 
     try:
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
+        resp = await call_llm(
+            EFFORT_LOW, [
                 {
                     "role": "system",
                     "content": f"你是{char_name}，用自然的語氣分享閱讀心得。",
                 },
                 {"role": "user", "content": summary_prompt},
             ],
-            temperature=0.7,
-            max_tokens=400,
+            temperature=0.7, max_tokens=400, label="cmd_read_impression",
         )
         impression = (
             resp.choices[0].message.content or f"{char_name}讀完了，但還在消化中..."
@@ -2419,17 +2500,15 @@ async def cmd_readfile(interaction: discord.Interaction, file: discord.Attachmen
 {chunk}"""
 
         try:
-            resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
-                messages=[
+            resp = await call_llm(
+                EFFORT_OFF, [
                     {
                         "role": "system",
                         "content": "你認真閱讀文件並提取重點，輸出LEARN標籤。",
                     },
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.4,
-                max_tokens=500,
+                temperature=0.4, max_tokens=500, label="cmd_readfile_learn",
             )
             raw = resp.choices[0].message.content or ""
             for lm in re.findall(r"\[LEARN:(\{.*?\})\]", raw, re.DOTALL):
@@ -2920,18 +2999,17 @@ async def run_phase1(
     for attempt in range(3):
         budget = 2000 * (attempt + 1)
         try:
-            phase1_resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
-                messages=[
+            phase1_resp = await call_llm(
+                EFFORT_OFF, [
                     {
                         "role": "system",
                         "content": "你只輸出 JSON，不要加任何解釋或 markdown。",
                     },
                     {"role": "user", "content": phase1_prompt},
                 ],
-                temperature=0.3,
-                max_tokens=budget,
+                temperature=0.3, max_tokens=budget,
                 response_format={"type": "json_object"},
+                label="phase1",
             )
             phase1_raw = phase1_resp.choices[0].message.content or ""
         except Exception as e:
@@ -2970,15 +3048,14 @@ async def run_phase1(
 
 輸出格式：{{"recall":[{{"id":"使用者ID"}}],"lore_topics":[],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_notes":[],"supplement":[]}}"""
         try:
-            resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
-                messages=[
+            resp = await call_llm(
+                EFFORT_OFF, [
                     {"role": "system", "content": "你只輸出 JSON，不要加任何解釋或 markdown。"},
                     {"role": "user", "content": minimal_prompt},
                 ],
-                temperature=0.3,
-                max_tokens=1024,
+                temperature=0.3, max_tokens=1024,
                 response_format={"type": "json_object"},
+                label="phase1_minimal",
             )
             minimal_raw = resp.choices[0].message.content or ""
             if _phase1_is_usable(minimal_raw):
@@ -3666,11 +3743,9 @@ async def _call_phase2_with_retry(
     for attempt in range(3):
         budget = min(2048 * (2 ** attempt), 8192)
         try:
-            resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
-                messages=phase2_messages,
-                temperature=0.8,
-                max_tokens=budget,
+            resp = await call_llm(
+                EFFORT_LOW, phase2_messages,
+                temperature=0.8, max_tokens=budget, label="phase2",
             )
         except Exception as e:
             print(f"[Phase 2] API 錯誤 attempt={attempt + 1}: {type(e).__name__}: {e}")
@@ -3701,14 +3776,12 @@ async def _call_phase2_with_retry(
             "不要加任何標記，只輸出角色要說的話。"
         )
         minimal_user = user_txt[-1500:]
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
+        resp = await call_llm(
+            EFFORT_LOW, [
                 {"role": "system", "content": minimal_system},
                 {"role": "user", "content": minimal_user[-1500:]},
             ],
-            temperature=0.8,
-            max_tokens=2048,
+            temperature=0.8, max_tokens=2048, label="phase2_minimal",
         )
         content = (resp.choices[0].message.content or "").strip()
         if content:
@@ -3947,13 +4020,12 @@ async def style_self_check(raw_content: str, channel_type: str, enable_ic_style:
 
 請直接輸出修正後的完整回覆（含 <planning> 區塊），不要加任何解釋。若無需修正則輸出原文。"""
     try:
-        sr_resp = await client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
+        sr_resp = await call_llm(
+            EFFORT_OFF, [
                 {"role": "system", "content": "你只輸出修正後的完整回覆，不加任何解釋。"},
                 {"role": "user", "content": sr_prompt},
             ],
-            temperature=0.3, max_tokens=2048,
+            temperature=0.3, max_tokens=2048, label="style_self_check",
         )
         reviewed = sr_resp.choices[0].message.content or ""
         if reviewed.strip():
@@ -4369,13 +4441,18 @@ async def _flash_chat(
     max_tokens: int,
     temperature: float = 0.1,
     json_mode: bool = False,
+    effort: str = EFFORT_OFF,
 ) -> str:
-    """呼叫 deepseek-v4-flash；空 content（reasoning 吃光預算）時放大預算重試，最多 3 次。"""
+    """呼叫 deepseek-v4-flash；空 content 時放大預算重試，最多 3 次。
+
+    預設關閉思考：這些都是審查／分類用途，思考模式會把預算吃掉卻不增加判斷力。
+    真要開回思考請傳 effort=EFFORT_LOW/EFFORT_HIGH。
+    """
     last = ""
     for attempt in range(3):
         budget = min(max_tokens * (2 ** attempt), 32000)
         kwargs = {
-            "model": "deepseek-v4-flash",
+            "model": DEEPSEEK_MODEL,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -4385,6 +4462,7 @@ async def _flash_chat(
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        kwargs.update(llm_effort(effort))
         try:
             resp = await client.chat.completions.create(**kwargs)
         except Exception as e:
