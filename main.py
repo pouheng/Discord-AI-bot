@@ -23,6 +23,7 @@ from profiles import (
     format_character_profile, list_character_names,
     set_person_alias, ensure_person_canonical,     resolve_person_name,
     is_known_person,
+    format_person_profiles,
     get_person_aliases, format_person_alias_map,
 )
 from prompts import build_style_block, build_banned_str, build_expr_str, build_safety_str
@@ -3259,6 +3260,26 @@ async def run_phase1(
     )
 
 
+async def _present_persons_from_memories(combined_memories: str, limit: int = 4) -> list[str]:
+    """從召回記憶的區塊標題推斷本輪在場的角色正名。
+
+    combined_memories 的每個區塊標題就是召回對象：
+      【吳神月】            → Discord 使用者（飾演某角色，交給既有流程）
+      【甲】（草莓姊）      → NPC 正名
+    只取 NPC 標題，避免跟使用者自己的記憶重複注入。
+    """
+    names = []
+    for m in re.finditer(r"^【([^】]+)】", combined_memories or "", re.M):
+        label = m.group(1).strip()
+        if not label or label == "澪" or label.isdigit():
+            continue
+        if label not in names:
+            names.append(label)
+        if len(names) >= limit:
+            break
+    return names
+
+
 async def build_phase2_system_prompt(
     channel_type: str,
     pcfg: dict,
@@ -3363,11 +3384,18 @@ async def build_phase2_system_prompt(
             phase2_system += f"""
 {lore_text}
 （以上是世界觀資料。當你們討論劇情時可以參考這些內容。）"""
+        _p2_alias_ooc = await format_person_alias_map()
+        _ooc_blocks = []
+        for _p in await _present_persons_from_memories(combined_memories):
+            _txt = await format_person_profiles(_p)
+            if _txt:
+                _ooc_blocks.append(_txt)
+        _ooc_present = "\n".join(_ooc_blocks)
         phase2_system += f"""
 
 【角色身份對照表 — 同一個人，不是不同角色】
-{await format_person_alias_map() or "（無）"}
-
+{_p2_alias_ooc if _p2_alias_ooc else "（無）"}
+{("" if not _ooc_present else chr(10) + chr(10) + "【在場角色檔案】" + chr(10) + _ooc_present)}
 【你對眼前人物的已知資訊】  
 {combined_memories}
 
@@ -3460,11 +3488,19 @@ async def build_phase2_system_prompt(
         # 身份對照表緊接在人物記憶之前：模型讀到「人物:甲」時，
         # 已經知道草莓姊是同一人，不會當成兩個角色。
         _p2_alias = await format_person_alias_map()
+        # 在場角色的正式 profile（含別名）。只有真的有內容才會輸出，
+        # 空殼 profile 會回空字串，不會在這裡堆雜訊。
+        _present_blocks = []
+        for _p in await _present_persons_from_memories(combined_memories):
+            _txt = await format_person_profiles(_p)
+            if _txt:
+                _present_blocks.append(_txt)
+        _present_text = "\n".join(_present_blocks)
         phase2_system += f"""
 
 【角色身份對照表 — 同一個人，不是不同角色】
 {_p2_alias if _p2_alias else "（無）"}
-
+{("" if not _present_text else chr(10) + chr(10) + "【在場角色檔案】" + chr(10) + _present_text)}
 【你對眼前人物的已知資訊】  
 {combined_memories}
 
