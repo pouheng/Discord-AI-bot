@@ -367,7 +367,7 @@ async def get_user_memory(
                     f"SELECT timestamp, topic, content, context FROM memories "
                     f"WHERE user_id = ?{ctx_sql} AND ({clause}) "
                     f"ORDER BY timestamp DESC LIMIT ?",
-                    (str(user_id),) + ctx_args + params + [limit],
+                    [str(user_id)] + list(ctx_args) + params + [limit],
                 )
                 rows = await cursor0.fetchall()
                 seen = {(r[1], r[2]) for r in rows}
@@ -376,7 +376,7 @@ async def get_user_memory(
                         f"SELECT timestamp, topic, content, context FROM memories "
                         f"WHERE user_id = ?{ctx_sql} "
                         f"ORDER BY timestamp DESC LIMIT ?",
-                        (str(user_id),) + ctx_args + [limit * 3],
+                        [str(user_id)] + list(ctx_args) + [limit * 3],
                     )
                     for r in await cursor1.fetchall():
                         if len(rows) >= limit:
