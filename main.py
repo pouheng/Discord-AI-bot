@@ -335,22 +335,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def get_user_memory(
     user_id: int, limit: int = 8, context_filter: str = None, user_name: str = None
 ) -> str:
-    """從 SQLite 召回該使用者的記憶 + 角色自身關於此人的記憶"""
-    async with get_db() as conn:
-        if context_filter:
-            cursor = await conn.execute(
-                "SELECT timestamp, topic, content, context FROM memories WHERE user_id = ? AND context = ? ORDER BY timestamp DESC LIMIT ?",
-                (str(user_id), context_filter, limit),
-            )
-        else:
-            cursor = await conn.execute(
-                "SELECT timestamp, topic, content, context FROM memories WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
-                (str(user_id), limit),
-            )
-        rows = await cursor.fetchall()
+    """從 SQLite 召回該使用者的記憶 + 角色自身關於此人的記憶
 
-        # 也撈角色自身記憶中關於此人的內容（透過名字匹配）
-        bot_rows = []
+    個人記憶分兩段取：先取 topic 直接命中此人的（那些是真正屬於他的
+    設定），不足 limit 才用一般最新記憶補齊。否則重度使用者的
+    一般閒聊會把『人物:甲（草莓姊）』擠出窗口——吳神月有 41 筆，
+    而甲的設定只佔其中 4 筆。
+    """
+    async with get_db() as conn:
+        ctx_sql = " AND context = ?" if context_filter else ""
+        ctx_args = (context_filter,) if context_filter else ()
+        rows = []
         if user_name:
             import re as _re
 
@@ -361,23 +356,60 @@ async def get_user_memory(
             # （例如顯示名『吳神月』飾演『甲（草莓姊）』），只比對顯示名會撈不到。
             needles = {short_name} if short_name else set()
             _canon = await resolve_person_name(short_name) if short_name else short_name
-            if _canon and _canon != short_name:
+            if _canon:
                 needles.add(_canon)
                 needles.update(await get_person_aliases(_canon))
             needles = {n for n in needles if n and len(n) >= 2}
             if needles:
-                clause = " OR ".join(
-                    ["(topic LIKE ? OR content LIKE ?)"] * len(needles)
-                )
-                params = []
-                for n in needles:
-                    params.extend([f"%{n}%", f"%{n}%"])
-                cursor2 = await conn.execute(
-                    f"SELECT timestamp, topic, content FROM memories "
-                    f"WHERE user_id = '__BOT__' AND ({clause}) "
+                clause = " OR ".join(["topic LIKE ?"] * len(needles))
+                params = [f"%{n}%" for n in needles]
+                cursor0 = await conn.execute(
+                    f"SELECT timestamp, topic, content, context FROM memories "
+                    f"WHERE user_id = ?{ctx_sql} AND ({clause}) "
                     f"ORDER BY timestamp DESC LIMIT ?",
-                    params + [PERSON_BOT_ROW_LIMIT],
+                    (str(user_id),) + ctx_args + params + [limit],
                 )
+                rows = await cursor0.fetchall()
+                seen = {(r[1], r[2]) for r in rows}
+                if len(rows) < limit:
+                    cursor1 = await conn.execute(
+                        f"SELECT timestamp, topic, content, context FROM memories "
+                        f"WHERE user_id = ?{ctx_sql} "
+                        f"ORDER BY timestamp DESC LIMIT ?",
+                        (str(user_id),) + ctx_args + [limit * 3],
+                    )
+                    for r in await cursor1.fetchall():
+                        if len(rows) >= limit:
+                            break
+                        if (r[1], r[2]) not in seen:
+                            seen.add((r[1], r[2]))
+                            rows.append(r)
+        if not rows:
+            if context_filter:
+                cursor = await conn.execute(
+                    "SELECT timestamp, topic, content, context FROM memories WHERE user_id = ? AND context = ? ORDER BY timestamp DESC LIMIT ?",
+                    (str(user_id), context_filter, limit),
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT timestamp, topic, content, context FROM memories WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (str(user_id), limit),
+                )
+            rows = await cursor.fetchall()
+
+        # 也撈角色自身記憶中關於此人的內容（透過名字匹配）
+        bot_rows = []
+        if user_name and needles:
+            clause2 = " OR ".join(["(topic LIKE ? OR content LIKE ?)"] * len(needles))
+            params2 = []
+            for n in needles:
+                params2.extend([f"%{n}%", f"%{n}%"])
+            cursor2 = await conn.execute(
+                f"SELECT timestamp, topic, content FROM memories "
+                f"WHERE user_id = '__BOT__' AND ({clause2}) "
+                f"ORDER BY timestamp DESC LIMIT ?",
+                params2 + [PERSON_BOT_ROW_LIMIT],
+            )
             bot_rows = await cursor2.fetchall()
 
     if not rows and not bot_rows:
