@@ -140,13 +140,37 @@ async def list_character_names() -> list[str]:
 # 每個正名都會自映射一筆（甲 -> 甲），讓解析統一走表。
 
 
+def _shapeless_neighbor(a: str, b: str) -> bool:
+    """判斷兩字是否為形近字（同部件 + 相近 codepoint），用來擋『澪』↔『澀』。
+
+    模型偶爾會把視覺相近的字當成同一個字寫進別名表：
+    澪(U+6FAA) 與 澀(U+6F80) 只差 42 個 codepoint、右側部件不同，
+    卻會被當成別名登記，久了就長出一個幽靈角色。
+    判斷只看 codepoint 距離，不做語意猜測，避免誤殺真正合法的別名。
+    """
+    if len(a) != 1 or len(b) != 1:
+        return False
+    return abs(ord(a) - ord(b)) <= 64
+
+
 async def set_person_alias(alias: str, canonical: str, note: str = "") -> bool:
-    """登記一筆別名對應；alias 等於 canonical 時記為自映射。回傳是否寫入成功。"""
+    """登記一筆別名對應；alias 等於 canonical 時記為自映射。回傳是否寫入成功。
+
+    擋掉會製造幽靈角色的輸入：
+      · alias 或 canonical 為空
+      · alias 與 canonical 相同（自映射，這裡不負責）
+      · alias 是 canonical 的形近字（如『澀』對『澪』，只差 42 個 codepoint）
+    """
     alias = (alias or "").strip()
     canonical = (canonical or "").strip()
     if not alias or not canonical:
         return False
     if alias == canonical:
+        return False
+    if _shapeless_neighbor(alias, canonical):
+        print(f"[別名] 擋下形近字：{alias} vs {canonical}"
+              f"（codepoint 相差 {abs(ord(alias) - ord(canonical))}，"
+              f"疑似誤字而非別名）")
         return False
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     async with get_db() as conn:

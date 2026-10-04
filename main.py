@@ -492,6 +492,29 @@ async def get_person_memory(canonical: str, limit: int = 8) -> str:
     return "\n".join(lines)
 
 
+def _find_shapeless_typo(text: str, char_name: str) -> str:
+    """找出 text 中形近於角色名的『壞字』，沒有就回 None。
+
+    背景：模型偶爾把視覺相近的字當成同一個字寫出來。實測 bot 自己
+    （澪 U+6FAA）被寫成『澀』（U+6F80），Phase 3 據此長出一整套
+    『澀』的假設定——入學經歷、數據干涉能力全都憑空冒出來。
+
+    只比對 bot 自己的名字，不去猜任意兩個字是否形近：那樣誤殺率太高，
+    正常的設定（角色名相近）會被擋掉。
+    """
+    if not text or not char_name:
+        return None
+    for ch in text:
+        if ch == char_name:
+            continue
+        # 排除純 ASCII / 標點 / 空白
+        if ord(ch) < 0x2E80:
+            continue
+        if abs(ord(ch) - ord(char_name)) <= 64:
+            return ch
+    return None
+
+
 async def save_user_memory(
     user_id: int,
     user_name: str,
@@ -1740,8 +1763,14 @@ async def phase3_process(
   2. 額外輸出 alias 欄位記錄對應關係：{{"action":"learn","alias":"草莓姊","canonical":"甲",…}}
   3. 判斷不出正名時（兩種稱呼誰是本名不確定）→ topic 照原樣寫，不要猜，並在 note 標記待確認
 【子主題不是別名】——括號裡是屬性或狀態時不要當別名：
-  「人物:凌空（狐族）」「人物:凌空（貓爸行為）」「人物:鴨嘴獸（凌空設計中）」這些括號是子主題，
-  正名是『凌空』『鴨嘴獸』，括號內容照常留在 topic，不要輸出 alias。
+   「人物:凌空（狐族）」「人物:凌空（貓爸行為）」「人物:鴨嘴獸（凌空設計中）」這些括號是子主題，
+   正名是『凌空』『鴨嘴獸』，括號內容照常留在 topic，不要輸出 alias。
+【⚠️ 絕對禁止：把形近字當成別名】
+   最危險的錯誤是把「看起來像」的字當成另一個稱呼。實測 bot 自己（『澪』）
+   被寫成『澀』，結果憑空長出一整套『澀』的假設定（入學經歷、數據干涉…）。
+   · alias 必須是【使用者或 bot 在對話中實際打出過的字】，逐字照抄。
+   · 絕對不可輸出與 canonical 讀音相近、字形相近、codepoint 接近的單字。
+   · 拿不準就不要輸出 alias 欄位。少記一個別名，遠比憑空生出新角色安全。
 
 {alias_map_block}
 【輸出格式】
@@ -1940,6 +1969,18 @@ async def phase3_process(
                     if await set_person_alias(_al, _cn, note="Phase 3 learn"):
                         await ensure_person_canonical(_cn)
                         log_lines.append(f"  [別名] {_al} -> {_cn}")
+                # 防幽靈角色：模型有時把視覺相近的字當同一個字
+                # （實測『澪』被寫成『澀』，長出 8 筆假設定）。
+                # 別名擋掉了，但 topic / content 裡的壞字仍會寫進記憶，
+                # 所以在寫入前再擋一次形近字。
+                _bad = _find_shapeless_typo(topic, char_name)
+                if _bad is None:
+                    _bad = _find_shapeless_typo(act.get("content", ""), char_name)
+                if _bad:
+                    print(f"[記憶] 擋下形近字疑似誤字：{_bad}"
+                          f"（topic={topic!r}）")
+                    log_lines.append(f"  [擋下] 形近字誤字 {_bad}")
+                    continue
                 if topic in learned_topics:
                     continue
                 learned_topics.add(topic)
