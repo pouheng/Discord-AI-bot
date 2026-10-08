@@ -24,14 +24,31 @@ def get_pid() -> int | None:
 
 
 def is_running() -> bool:
+    """檢查 bot 是否仍在執行（唯讀探測，絕不終止目標）。
+
+    Windows 上 os.kill(pid, 0) 不是存在檢查：0 == signal.CTRL_C_EVENT，
+    會對目標送 Ctrl+C（GenerateConsoleCtrlEvent），把正在跑的 bot 殺掉
+    （exit code 0、無 traceback）。監控迴圈每 2 秒呼叫一次 = bot 一啟動就被補掉。
+    改用 OpenProcess + GetExitCodeProcess 讀取退出碼。
+    """
     pid = get_pid()
     if pid is None:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, PermissionError):
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
         return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def start_bot():
