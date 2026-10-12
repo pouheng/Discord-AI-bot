@@ -315,6 +315,14 @@ async def test_phase3_prompt_structure():
         "Phase 3 原始碼包含動態資料區註解",
         "動態資料區（底部）：以下為每次呼叫不同的內容" in src,
     )
+    yield check(
+        "Phase 3 原始碼包含小名/別名來源規則",
+        "小名／別名／綽號的來源只能是「使用者」" in src,
+    )
+    yield check(
+        "Phase 3 原始碼禁止 bot 自身稱呼當別名來源",
+        "使用者實際打出過的字" in src and "bot 自己講的稱呼不算" in src,
+    )
 
     # 確認動態資料區在靜態指令區之後
     static_idx = src.index("靜態指令區（上方）：規則說明")
