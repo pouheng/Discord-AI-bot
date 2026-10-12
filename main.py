@@ -4049,6 +4049,94 @@ async def resolve_and_fetch_memories(recall_user_ids: list, recall_candidates: l
     return resolved_ids, combined_memories
 
 
+# 記憶 topic 的人物前綴（人物:甲 / 角色能力:甲（草莓姊）的水柱 / 角色背景:...）
+_PERSON_TOPIC_RE = re.compile(r"^(?:人物|角色能力|角色背景)[:：]\s*(.+)$")
+# combined_memories 每個區塊的標題：【吳神月】 / 【甲】（草莓姊）
+_PERSON_LABEL_RE = re.compile(r"^【([^】]+)】", re.M)
+
+
+async def _collect_known_person_names() -> dict[str, str]:
+    """建立 {可辨識名稱: 正名} 對照，來源為 person_aliases 與記憶 topic。
+
+    topic 是關鍵：像『羊君』這種沒跟任何人互為別名的獨立角色，永遠不會
+    出現在 person_aliases，但會有『人物:羊君』的記憶；不從 topic 撈的話，
+    這類角色就算被對話點名也召不回來（2026-10-09 實測羊君被忘記即此因）。
+    """
+    mapping: dict[str, str] = {}
+    try:
+        async with get_db() as conn:
+            cursor = await conn.execute("SELECT alias, canonical FROM person_aliases")
+            for alias, canonical in await cursor.fetchall():
+                alias = (alias or "").strip()
+                canonical = (canonical or alias).strip()
+                if alias:
+                    mapping[alias] = canonical
+                if canonical:
+                    mapping.setdefault(canonical, canonical)
+            cursor = await conn.execute(
+                "SELECT DISTINCT topic FROM memories "
+                "WHERE topic LIKE '人物:%' OR topic LIKE '人物：%' "
+                "OR topic LIKE '角色能力:%' OR topic LIKE '角色能力：%' "
+                "OR topic LIKE '角色背景:%' OR topic LIKE '角色背景：%'"
+            )
+            for (topic,) in await cursor.fetchall():
+                m = _PERSON_TOPIC_RE.match((topic or "").strip())
+                if not m:
+                    continue
+                # 去括號複合名（『甲（草莓姊）』→『甲』），只用主名比對
+                base = re.sub(r"[（(].*?[）)].*$", "", m.group(1)).strip()
+                if len(base) >= 2:
+                    mapping.setdefault(base, base)
+    except Exception as e:
+        print(f"[人物召回] 讀取人物清單失敗: {e}")
+    return mapping
+
+
+async def recall_mentioned_persons_memories(
+    text: str, combined_memories: str, limit: int = 3
+) -> str:
+    """掃描對話文字中提及的已知角色，撈其記憶並回傳可注入的區塊。
+
+    治本於「被提到的人就該被召回」：不再只靠 Phase 1 點名（Phase 1 常因
+    看不到該角色記憶而漏），也不要求角色先登記進 person_aliases。
+    長名優先、每人最多一筆，已在 combined_memories 出現過的對象跳過。
+    """
+    text = text or ""
+    if not text.strip():
+        return ""
+    mapping = await _collect_known_person_names()
+    if not mapping:
+        return ""
+    bot_name = await get_character_name()
+    already = set(_PERSON_LABEL_RE.findall(combined_memories or ""))
+    # 只比對長度 >= 2 的名稱，避免『甲』『乙』這種單字暱稱亂命中
+    hits = [
+        (name, canonical)
+        for name, canonical in mapping.items()
+        if len(name) >= 2 and name in text and name not in already
+        and canonical != bot_name
+    ]
+    if not hits:
+        return ""
+    hits.sort(key=lambda x: len(x[0]), reverse=True)
+    chosen: list[tuple[str, str]] = []
+    seen_canon: set[str] = set()
+    for name, canonical in hits:
+        if canonical in seen_canon or canonical in already:
+            continue
+        seen_canon.add(canonical)
+        chosen.append((name, canonical))
+        if len(chosen) >= limit:
+            break
+    blocks = []
+    for name, canonical in chosen:
+        mem = await get_person_memory(canonical)
+        if mem and mem != "（無記錄）":
+            blocks.append(f"【{canonical}】（對話提及：{name}）\n{mem}")
+            print(f"[人物召回] 對話提及 '{name}' → 召回 {canonical}")
+    return "\n\n".join(blocks)
+
+
 async def assemble_lore_text(phase1_supplement, lore_topics: list, lore_notes: list) -> str:
     """用 Phase 1 的 supplement 或降級為舊式組裝，回傳 lore_text。"""
     if isinstance(phase1_supplement, list):
@@ -4626,6 +4714,20 @@ async def on_message(message: discord.Message):
                     combined_memories = (
                         f"{combined_memories}\n\n{date_mem}" if combined_memories else date_mem
                     )
+
+            # 對話「提到誰就召回誰」：補上 Phase 1 點名機制的漏洞
+            # （獨立角色如羊君不在候選人也沒登記別名，只能靠這條撈回來）。
+            mention_text = clean_input_reply + "\n" + "\n".join(
+                m["content"] for m in all_context[-3:] if m.get("content")
+            )
+            mentioned_mem = await recall_mentioned_persons_memories(
+                mention_text, combined_memories,
+            )
+            if mentioned_mem:
+                combined_memories = (
+                    f"{combined_memories}\n\n{mentioned_mem}"
+                    if combined_memories else mentioned_mem
+                )
 
             lore_text = await assemble_lore_text(phase1_supplement, lore_topics, lore_notes)
 
