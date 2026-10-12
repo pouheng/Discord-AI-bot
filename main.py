@@ -268,6 +268,51 @@ def llm_effort(effort: str) -> dict:
     raise ValueError(f"未知的思考強度: {effort!r}（可用 off/low/high）")
 
 
+_LLM_DEBUG_LOG = os.path.join(SCRIPT_DIR, "llm_call_debug.jsonl")
+
+
+def _llm_debug_log(record: dict) -> None:
+    """把每一筆 LLM 呼叫與例外寫入 llm_call_debug.jsonl（永不拋錯）。
+
+    管理器以 CREATE_NO_WINDOW/無重導向啟動 bot，print() 全進黑洞，
+    之前 API 限流／逾時／finish 原因全部看不到。改成持久化才查得到。
+    """
+    try:
+        record.setdefault("ts", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        with open(_LLM_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+async def _llm_create_with_retry(call_kwargs: dict, *, label: str, retries: int = 4):
+    """呼叫 API；429／逾時／連線這類暫時性錯誤做退避重試。
+
+    401、400 這類永久錯誤不重試，原樣拋給呼叫端。
+    """
+    import openai as _oa
+
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return await client.chat.completions.create(**call_kwargs)
+        except _oa.RateLimitError as e:
+            last_exc = e
+            wait = 2.0 * (attempt + 1)
+            _llm_debug_log({"event": "rate_limit", "label": label, "attempt": attempt,
+                            "detail": str(e)[:300]})
+            print(f"[LLM] {label} 429 限流，{wait:.0f}s 後重試")
+            await asyncio.sleep(wait)
+        except (_oa.APITimeoutError, _oa.APIConnectionError) as e:
+            last_exc = e
+            wait = 1.5 * (attempt + 1)
+            _llm_debug_log({"event": "transient", "label": label, "attempt": attempt,
+                            "type": type(e).__name__, "detail": str(e)[:300]})
+            print(f"[LLM] {label} {type(e).__name__}，{wait:.0f}s 後重試")
+            await asyncio.sleep(wait)
+    raise last_exc
+
+
 async def call_llm(effort: str, messages: list, *, temperature=None,
                    max_tokens=None, response_format=None, model=None, label: str = "",
                    empty_retries: int = 1):
@@ -279,6 +324,11 @@ async def call_llm(effort: str, messages: list, *, temperature=None,
     reasoning_content 上，正文還沒寫完就 finish_reason=length，content 變空字串。
     這裡統一偵測「空正文 + 預算用完」並放大預算重試，
     讓任何 effort 設定都不會靜默回空。
+
+    額外處理「昨天一整天回空」的成因與觀測：
+      - 429／逾時／連線等暫時性錯誤自動退避重試（原本只在黑洞 print）
+      - 每筆呼叫與例外都記錄到 llm_call_debug.jsonl
+      - 空正文若已把預算頂到 32000 且開著思考，最後一次關閉思考硬擠出正文
     """
     kwargs = {"model": model or DEEPSEEK_MODEL, "messages": messages}
     if temperature is not None:
@@ -289,22 +339,38 @@ async def call_llm(effort: str, messages: list, *, temperature=None,
 
     budget = max_tokens
     resp = None
+    total_chars = sum(len(str(m.get("content") or "")) for m in messages)
+    base_record = {
+        "event": "call", "label": label, "effort": effort,
+        "model": model or DEEPSEEK_MODEL, "n_msgs": len(messages),
+        "total_chars": total_chars, "max_tokens": max_tokens,
+    }
     for attempt in range(empty_retries + 1):
         call_kwargs = dict(kwargs)
         if budget is not None:
             call_kwargs["max_tokens"] = budget
-        resp = await client.chat.completions.create(**call_kwargs)
-        choice = resp.choices[0]
-        content = (choice.message.content or "").strip()
+        try:
+            resp = await _llm_create_with_retry(call_kwargs, label=label)
+        except Exception as e:
+            _llm_debug_log(dict(base_record, event="exception", attempt=attempt,
+                                type=type(e).__name__, detail=str(e)[:300]))
+            raise
+        choice = resp.choices[0] if resp.choices else None
+        content = (choice.message.content or "").strip() if choice else ""
+        reasoning = (getattr(choice.message, "reasoning_content", None) or "") if choice else ""
+        finish = getattr(choice, "finish_reason", None) if choice else "no_choice"
+        usage = getattr(resp, "usage", None)
         if label:
-            usage = getattr(resp, "usage", None)
-            reasoning = getattr(choice.message, "reasoning_content", None) or ""
             print(
                 f"[LLM] {label} effort={effort} completion="
                 f"{usage.completion_tokens if usage else '?'} "
-                f"reasoning={len(reasoning)} finish={choice.finish_reason} "
+                f"reasoning={len(reasoning)} finish={finish} "
                 f"content={len(content)}"
             )
+        _llm_debug_log(dict(base_record, attempt=attempt, finish=finish,
+                            content_len=len(content), reasoning_len=len(reasoning),
+                            completion_tokens=getattr(usage, "completion_tokens", None),
+                            total_tokens=getattr(usage, "total_tokens", None)))
         if content:
             return resp
         # 正文空：預算被思考吃光（finish_reason=length）就放大預算再試
@@ -314,10 +380,29 @@ async def call_llm(effort: str, messages: list, *, temperature=None,
                 break
             grew = min(budget * 4, 32000)
             print(
-                f"[LLM] {label} 正文為空（finish={choice.finish_reason}），"
+                f"[LLM] {label} 正文為空（finish={finish}），"
                 f"預算 {budget} → {grew} 重試"
             )
             budget = grew
+            continue
+        # 預算已頂到上限仍是空，且這任務開著思考 → 關閉思考最後硬擠一次正文
+        if effort in (EFFORT_LOW, EFFORT_HIGH):
+            off_kwargs = dict(kwargs)
+            off_kwargs.update(llm_effort(EFFORT_OFF))
+            if budget is not None:
+                off_kwargs["max_tokens"] = budget
+            print(f"[LLM] {label} 正文仍為空，關閉思考最後一搏")
+            base_record["event"] = "last_resort_thinking_off"
+            try:
+                resp = await _llm_create_with_retry(off_kwargs, label=label)
+                choice = resp.choices[0] if resp.choices else None
+                off_content = (choice.message.content or "").strip() if choice else ""
+                _llm_debug_log(dict(base_record, content_len=len(off_content),
+                                    finish=getattr(choice, "finish_reason", None) if choice else None))
+                if off_content:
+                    return resp
+            except Exception as e:
+                _llm_debug_log(dict(base_record, type=type(e).__name__, detail=str(e)[:300]))
     return resp
 
 
@@ -4199,7 +4284,11 @@ async def log_recalled_data(resolved_ids: list, recall_candidates: list,
 async def _call_phase2_with_retry(
     phase2_messages: list, *, label: str = "Phase 2"
 ) -> str:
-    """呼叫 deepseek-v4-flash Phase 2；空內容時放大預算重試（最多 3 次）。"""
+    """呼叫 deepseek-v4-flash Phase 2；空內容時放大預算重試（最多 3 次）。
+
+    API 例外、空 reply 的 finish reason 都會寫進 error_logs（管理器啟動時
+    print 進黑洞，這是唯一能事後追查空回的管道）。
+    """
     last = ""
     for attempt in range(3):
         budget = min(2048 * (2 ** attempt), 8192)
@@ -4210,6 +4299,10 @@ async def _call_phase2_with_retry(
             )
         except Exception as e:
             print(f"[Phase 2] API 錯誤 attempt={attempt + 1}: {type(e).__name__}: {e}")
+            await _log_error(
+                "phase2_api_error",
+                f"{type(e).__name__}: {e} (attempt={attempt + 1})",
+            )
             last = ""
             await asyncio.sleep(0.5)
             continue
@@ -4217,9 +4310,14 @@ async def _call_phase2_with_retry(
         last = content
         if content:
             return content
+        finish = getattr(resp.choices[0], "finish_reason", None)
         print(
             f"[Phase 2] 空內容 attempt={attempt + 1} budget={budget} "
-            f"finish={getattr(resp.choices[0], 'finish_reason', None)}"
+            f"finish={finish}"
+        )
+        await _log_error(
+            "phase2_empty_retry",
+            f"content 空 attempt={attempt + 1} budget={budget} finish={finish}",
         )
         await asyncio.sleep(0.5)
 
@@ -4227,6 +4325,7 @@ async def _call_phase2_with_retry(
     # 上面 3 次都空時（多半是完整 prompt 太長／模型偶發罷工），
     # 丟掉記憶、世界觀、lore、上下文，只留「角色 + 當前訊息」再打一次。
     # 短 prompt 失敗率極低，確保 bot 永遠不會沉默。
+    # 先試 low；仍為空時換「關閉思考」再試（思考吃光預算會回空正文）。
     try:
         user_txt = next(
             (m["content"] for m in phase2_messages if m.get("role") == "user"), ""
@@ -4237,17 +4336,26 @@ async def _call_phase2_with_retry(
             "不要加任何標記，只輸出角色要說的話。"
         )
         minimal_user = user_txt[-1500:]
-        resp = await call_llm(
-            EFFORT_LOW, [
-                {"role": "system", "content": minimal_system},
-                {"role": "user", "content": minimal_user[-1500:]},
-            ],
-            temperature=0.8, max_tokens=2048, label="phase2_minimal",
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        if content:
-            print(f"[Phase 2] 精簡 prompt 兜底成功（{len(content)} 字）")
-            return content
+        for effort in (EFFORT_LOW, EFFORT_OFF):
+            try:
+                resp = await call_llm(
+                    effort, [
+                        {"role": "system", "content": minimal_system},
+                        {"role": "user", "content": minimal_user[-1500:]},
+                    ],
+                    temperature=0.8, max_tokens=2048, label="phase2_minimal",
+                )
+                content = (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                print(f"[Phase 2] 精簡 prompt 兜底 API 錯誤 effort={effort}: {e}")
+                await _log_error(
+                    "phase2_minimal_api_error",
+                    f"{type(e).__name__}: {e} effort={effort}",
+                )
+                continue
+            if content:
+                print(f"[Phase 2] 精簡 prompt 兜底成功（{len(content)} 字, effort={effort}）")
+                return content
     except Exception as e:
         print(f"[Phase 2] 精簡 prompt 兜底也失敗: {type(e).__name__}: {e}")
 

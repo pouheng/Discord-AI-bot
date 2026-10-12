@@ -14,6 +14,7 @@ Exit code:
 import os
 import subprocess
 import sys
+import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PID_FILE = os.path.join(SCRIPT_DIR, "bot.pid")
@@ -55,15 +56,26 @@ def is_running() -> bool:
         kernel32.CloseHandle(handle)
 
 
+# bot 是 DETACHED_PROCESS + CREATE_NO_WINDOW，print() 會消失在黑洞，
+# 造成 API 限流／逾時／finish reason 全查不到。把 stdout/stderr 重導到
+# console_logs/{date}.log，發生問題才有實際錯誤可看。
+CONSOLE_LOG_DIR = os.path.join(SCRIPT_DIR, "console_logs")
+
+
 def start_bot():
+    os.makedirs(CONSOLE_LOG_DIR, exist_ok=True)
+    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = os.path.join(CONSOLE_LOG_DIR, f"{ts}.log")
+    out = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
     proc = subprocess.Popen(
         ["python", "main.py"],
         cwd=SCRIPT_DIR,
         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-        stdout=None,
-        stderr=None,
+        stdout=out,
+        stderr=out,
         stdin=None,
     )
+    print(f"[start.py] 日誌：{log_path}")
     return proc
 
 
