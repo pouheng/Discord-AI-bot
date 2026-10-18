@@ -53,6 +53,7 @@
   "skills": [...],
   "domains": [...],
   "race": {...},
+  "clash_villain": {...},（目標角色是魔物/反派時輸出，否則省略）
   "uncertainties": ["無法從故事判斷、需要人工確認的項目，陣列"]
 }
 
@@ -148,6 +149,21 @@
 - 六維修正範圍 0.8~1.5，四捨五入到小數第 1 位
 - 種族有強項就該有弱項，不該全 1.0；未突出項目用 1.0；人類為全 1.0 基準
 - 魔法強項反映在智力、耐打反映在體質、速度反映在敏捷、領袖氣場反映在魅力
+
+【反派血條註冊 clash_villain】欄位（目標角色是魔物/反派、需為其建血條時，額外輸出）：
+{
+  "type": "clash_villain",
+  "name": "目標角色名（須與 character.name 相同，且已萃取其角色資料）",
+  "tier": "雜兵 / 重點 / Boss",
+  "domain_mod": 1.0,
+  "dynamic_difficulty": false
+}
+- **dynamic_difficulty 一律 false**：自動偵測的反派 guard 純粹由「體質隱藏分數 × Domain_Mod」計算，
+  不進入 calibrate_roster 校準流程
+- tier 決定 MaxHP 與 Cap_tier（雜兵 5B/2.5B｜重點 12B/4B｜Boss 24B/5B）；單節點聚合上限由系統機械套用，
+  不需萃取時自行推算 ticks
+- 有結界且張開過 → domain_mod 依覺醒進度取 1.1/1.25/1.4/1.5（未開結界 1.0），並說明判斷依據
+- guard_value / max_hp_ticks / cap_ticks 由系統依既有角色欄位與 tier 計算，不需萃取輸出
 
 【輸出要求】
 1. 只輸出合法 JSON，不要額外說明

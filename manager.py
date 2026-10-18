@@ -1,16 +1,23 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-import subprocess, os, time, threading
+import subprocess, os, time, threading, json
+import llm_models
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PID_FILE = os.path.join(SCRIPT_DIR, "bot.pid")
 DB_FILE = os.path.join(SCRIPT_DIR, "rp_memory.db")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 DB_VIEWER = os.path.join(SCRIPT_DIR, "db_viewer.py")
+WATCHDOG_FILE = os.path.join(SCRIPT_DIR, "watchdog.json")
+WATCHDOG_TASK_NAME = "MioBotWatchdog"
 
 bot_proc = None
 monitor_running = True
 root = None
+_wd_installed = False
+_model_combos = {}
+_model_vars = {}
+_source_vars = {}
 
 
 def get_pid() -> int | None:
@@ -188,23 +195,35 @@ def monitor_loop():
     tkinter 不是 thread-safe，background thread 直接碰 widget（config/insert）
     會拋 SystemError/WinError 87 並讓監控執行緒崩潰，導致狀態欄停在舊值。
     """
+    global _wd_installed
+    tick = 0
     while monitor_running:
         try:
             pid = get_pid()
             alive = is_running()
             ap_on = get_autopilot_status()
+            wd = get_watchdog_config()
+            wd_on = bool(wd.get("enabled", True))
+            try:
+                wd_min = max(1, int(wd.get("interval_minutes", 1)))
+            except (TypeError, ValueError):
+                wd_min = 1
+            # 工作是否已註冊要跑 schtasks，較慢；每 5 圈（約 10 秒）查一次。
+            if tick % 5 == 0:
+                _wd_installed = watchdog_task_installed()
         except Exception:
             time.sleep(2)
             continue
         # 透過 after 排程到主執行緒更新 UI（確保 widget 只被主執行緒觸碰）
         try:
-            root.after(0, _apply_status, pid, alive, ap_on)
+            root.after(0, _apply_status, pid, alive, ap_on, wd_on, wd_min, _wd_installed)
         except Exception:
             pass
+        tick += 1
         time.sleep(2)
 
 
-def _apply_status(pid, alive, ap_on):
+def _apply_status(pid, alive, ap_on, wd_on, wd_min, wd_installed):
     try:
         if alive:
             status_label.config(text=f"RUNNING (PID {pid})", foreground="#00ff00")
@@ -214,6 +233,11 @@ def _apply_status(pid, alive, ap_on):
             ap_status_label.config(text="ON", foreground="#00ff00")
         else:
             ap_status_label.config(text="OFF", foreground="#ff4444")
+        task_txt = "task OK" if wd_installed else "no task"
+        wd_status_label.config(
+            text=f"{'ON' if wd_on else 'OFF'} · {wd_min}min · {task_txt}",
+            foreground="#00ff00" if wd_on else "#ff4444",
+        )
     except Exception as e:
         print(f"[manager] 狀態更新失敗: {e}")
 
@@ -277,17 +301,170 @@ def update_autopilot_status():
         ap_status_label.config(text="OFF", foreground="#ff4444")
 
 
+def get_watchdog_config() -> dict:
+    """讀取 watchdog.json（不存在或壞掉時回預設值）。"""
+    try:
+        with open(WATCHDOG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("watchdog.json 不是物件")
+        return cfg
+    except (ValueError, OSError):
+        return {"enabled": True, "interval_minutes": 1}
+
+
+def set_watchdog_enabled(enabled: bool):
+    """只寫設定檔；畫面由監控迴圈自動更新（不需提權）。"""
+    cfg = get_watchdog_config()
+    cfg["enabled"] = bool(enabled)
+    _save_watchdog(cfg)
+    log(f"Watchdog {'ON' if enabled else 'OFF'}")
+
+
+def set_watchdog_interval(minutes: int):
+    cfg = get_watchdog_config()
+    cfg["interval_minutes"] = max(1, int(minutes))
+    _save_watchdog(cfg)
+    log(f"Watchdog interval = {cfg['interval_minutes']} min")
+
+
+def _save_watchdog(cfg: dict):
+    try:
+        with open(WATCHDOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        log(f"Watchdog 設定寫入失敗: {e}")
+
+
+def watchdog_task_installed() -> bool:
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Query", "/TN", WATCHDOG_TASK_NAME],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _run_watchdog_ps1(name: str):
+    script = os.path.join(SCRIPT_DIR, name)
+    if not os.path.exists(script):
+        log(f"{name} 不存在")
+        return
+    log(f"執行 {name}（會跳出 UAC / 確認視窗）...")
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=180,
+        )
+    except Exception as e:
+        log(f"{name} 執行失敗: {e}")
+
+
+def install_watchdog_task():
+    _run_watchdog_ps1("install_watchdog.ps1")
+    log("若 UAC 已確認，狀態將於數秒內更新為 task OK")
+
+
+def uninstall_watchdog_task():
+    _run_watchdog_ps1("uninstall_watchdog.ps1")
+    log("若 UAC 已確認，工作將於數秒內移除")
+
+
+def _on_source_changed(_event=None):
+    """Endpoint / 金鑰改完即時寫入 models.json。"""
+    try:
+        cur = llm_models.get_saved_source()
+        new = {
+            "base_url": _source_vars["base_url"].get().strip(),
+            "api_key": _source_vars["api_key"].get().strip(),
+        }
+        if new == cur:
+            return
+        llm_models.save_source(new["base_url"], new["api_key"])
+        log("來源設定已更新（下一則訊息生效）")
+    except Exception as e:
+        log(f"儲存來源設定失敗: {e}")
+
+
+def _test_connection():
+    """打一次 GET /models 驗證目前來源可用。"""
+    try:
+        ids = llm_models.fetch_models()
+        log(f"連線成功：{len(ids)} 個模型（{', '.join(ids)}）")
+    except Exception as e:
+        log(f"連線失敗：{type(e).__name__}: {e}")
+
+
+def _combo_values(slot, ids):
+    """下拉選項＝拉取清單；現值若不在清單內也帶出（放最前），避免被清空。"""
+    cur = llm_models.get_model(slot)
+    vals = list(ids or [])
+    if cur and cur not in vals:
+        vals = [cur] + vals
+    return vals
+
+
+def _on_model_selected(slot):
+    """使用者改選／輸入後即時寫入 models.json（下一則訊息生效）。"""
+    try:
+        val = _model_vars[slot].get().strip()
+        if not val or val == llm_models.get_model(slot):
+            return
+        llm_models.save_model(slot, val)
+        log(f"模型 {llm_models.SLOT_LABELS.get(slot, slot)} → {val}")
+    except Exception as e:
+        log(f"儲存模型設定失敗: {e}")
+
+
+def _fetch_and_apply_models():
+    """背景執行：向來源拉取模型清單，更新所有下拉選項。"""
+    try:
+        ids = llm_models.fetch_models()
+    except Exception as e:
+        log(f"拉取模型失敗: {type(e).__name__}: {e}")
+        return
+
+    def _apply():
+        for slot, combo in _model_combos.items():
+            combo["values"] = _combo_values(slot, ids)
+        log(f"已拉取 {len(ids)} 個模型: {', '.join(ids)}")
+
+    try:
+        root.after(0, _apply)
+    except Exception:
+        _apply()
+
+
 class BotManagerGUI:
     def __init__(self):
         global root
         self.root = tk.Tk()
         root = self.root
         self.root.title("Bot Manager")
-        self.root.geometry("520x480")
+        self.root.geometry("620x680")
         self.root.resizable(False, False)
 
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        console_tab = ttk.Frame(nb, padding=12)
+        settings_tab = ttk.Frame(nb, padding=12)
+        nb.add(console_tab, text="控制台")
+        nb.add(settings_tab, text="設定")
+
+        # 既有控制項全部掛到「控制台」分頁（沿用 main 變數名）
+        main = console_tab
+
+        # 設定分頁：來源 + 模型選擇 + Watchdog
+        self._build_source_section(settings_tab)
+        self._build_model_section(settings_tab)
+        ttk.Label(settings_tab, text="Watchdog（定時自動重啟）",
+                  font=("Segoe UI", 11, "bold")).pack(anchor=tk.W, pady=(12, 2))
 
         # Status bar
         global status_label
@@ -341,6 +518,53 @@ class BotManagerGUI:
         ttk.Button(
             ap_frame, text="OFF", command=lambda: set_autopilot(False), width=6
         ).pack(side=tk.LEFT, padx=2)
+
+        # Watchdog row（定時自動重啟 — Windows 工作排程器）→ 掛在「設定」分頁
+        wd_frame = ttk.Frame(settings_tab)
+        wd_frame.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(wd_frame, text="Watchdog:", font=("Segoe UI", 9, "bold")).pack(
+            side=tk.LEFT
+        )
+        global wd_status_label, wd_interval_label, wd_scale
+        wd_status_label = ttk.Label(wd_frame, text="...", font=("Segoe UI", 10))
+        wd_status_label.pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            wd_frame, text="ON", command=lambda: set_watchdog_enabled(True), width=5
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            wd_frame, text="OFF", command=lambda: set_watchdog_enabled(False), width=5
+        ).pack(side=tk.LEFT, padx=2)
+        self.install_wd_btn = ttk.Button(
+            wd_frame,
+            text="Install task",
+            command=lambda: self._thread_action("install_watchdog"),
+            width=11,
+        )
+        self.install_wd_btn.pack(side=tk.LEFT, padx=2)
+        self.uninstall_wd_btn = ttk.Button(
+            wd_frame,
+            text="Remove",
+            command=lambda: self._thread_action("uninstall_watchdog"),
+            width=8,
+        )
+        self.uninstall_wd_btn.pack(side=tk.LEFT, padx=2)
+
+        wd_row2 = ttk.Frame(settings_tab)
+        wd_row2.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(wd_row2, text="Interval:", font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        wd_interval_label = ttk.Label(wd_row2, text="1 min", font=("Segoe UI", 9))
+        wd_scale = tk.Scale(
+            wd_row2,
+            from_=1,
+            to=60,
+            orient=tk.HORIZONTAL,
+            length=200,
+            showvalue=False,
+            command=self._on_wd_slide,
+        )
+        wd_scale.pack(side=tk.LEFT, padx=6)
+        wd_scale.bind("<ButtonRelease-1>", self._on_wd_slide_release)
+        wd_interval_label.pack(side=tk.LEFT, padx=4)
 
         sep = ttk.Separator(main, orient=tk.HORIZONTAL)
         sep.pack(fill=tk.X, pady=6)
@@ -401,13 +625,96 @@ class BotManagerGUI:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         try:
+            wd = get_watchdog_config()
+            wd_min = max(1, int(wd.get("interval_minutes", 1) or 1))
+            wd_scale.set(wd_min)
+            wd_interval_label.config(text=f"{wd_min} min")
             pid = get_pid()
             alive = is_running()
             ap_on = get_autopilot_status()
-            _apply_status(pid, alive, ap_on)
+            _apply_status(pid, alive, ap_on, bool(wd.get("enabled", True)),
+                          wd_min, watchdog_task_installed())
         except Exception:
             pass
         log("Bot Manager ready.")
+        # 開啟時自動拉取一次模型清單
+        threading.Thread(target=_fetch_and_apply_models, daemon=True).start()
+
+    def _build_source_section(self, parent):
+        ttk.Label(parent, text="來源（相容 OpenAI 的聊天補全）",
+                  font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+        saved = llm_models.get_saved_source()
+
+        row1 = ttk.Frame(parent)
+        row1.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(row1, text="Endpoint URL:", font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        _source_vars["base_url"] = tk.StringVar(value=saved["base_url"])
+        e1 = ttk.Entry(row1, textvariable=_source_vars["base_url"], width=44)
+        e1.pack(side=tk.LEFT, padx=6)
+        e1.bind("<Return>", _on_source_changed)
+        e1.bind("<FocusOut>", _on_source_changed)
+
+        row2 = ttk.Frame(parent)
+        row2.pack(fill=tk.X, pady=(2, 2))
+        ttk.Label(row2, text="API 金鑰:", font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        _source_vars["api_key"] = tk.StringVar(value=saved["api_key"])
+        e2 = ttk.Entry(row2, textvariable=_source_vars["api_key"], width=44, show="*")
+        e2.pack(side=tk.LEFT, padx=6)
+        e2.bind("<Return>", _on_source_changed)
+        e2.bind("<FocusOut>", _on_source_changed)
+
+        def _toggle_key():
+            e2.config(show="" if e2.cget("show") else "*")
+
+        ttk.Button(row2, text="顯示", width=6, command=_toggle_key).pack(
+            side=tk.LEFT, padx=2)
+
+        hint = ttk.Frame(parent)
+        hint.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(hint, text="留空＝Endpoint 用預設 DeepSeek、金鑰用 .env。",
+                  font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        ttk.Button(
+            hint, text="測試連線", width=10,
+            command=lambda: threading.Thread(target=_test_connection, daemon=True).start(),
+        ).pack(side=tk.RIGHT)
+
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+
+    def _build_model_section(self, parent):
+        ttk.Label(parent, text="模型選擇", font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+        header = ttk.Frame(parent)
+        header.pack(fill=tk.X, pady=(2, 8))
+        ttk.Label(header, text="改選即時生效（下一則訊息）。",
+                  font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        ttk.Button(
+            header, text="重新拉取模型", width=13,
+            command=lambda: threading.Thread(
+                target=_fetch_and_apply_models, daemon=True).start(),
+        ).pack(side=tk.RIGHT)
+
+        grid = ttk.Frame(parent)
+        grid.pack(fill=tk.X)
+        for i, (slot, label) in enumerate(llm_models.SLOTS[:3]):
+            self._make_model_row(grid, i, slot, label)
+
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        other = ttk.Frame(parent)
+        other.pack(fill=tk.X)
+        for i, (slot, label) in enumerate(llm_models.SLOTS[3:]):
+            self._make_model_row(other, i, slot, label)
+
+    def _make_model_row(self, parent, row, slot, label):
+        ttk.Label(parent, text=label, font=("Segoe UI", 9)).grid(
+            row=row, column=0, sticky=tk.W, pady=2, padx=(0, 8))
+        var = tk.StringVar(value=llm_models.get_model(slot))
+        combo = ttk.Combobox(parent, textvariable=var, width=30,
+                             values=_combo_values(slot, []))
+        combo.grid(row=row, column=1, sticky=tk.W, pady=2)
+        combo.bind("<<ComboboxSelected>>", lambda e, s=slot: _on_model_selected(s))
+        combo.bind("<Return>", lambda e, s=slot: _on_model_selected(s))
+        combo.bind("<FocusOut>", lambda e, s=slot: _on_model_selected(s))
+        _model_combos[slot] = combo
+        _model_vars[slot] = var
 
     def _thread_action(self, action: str):
         """Run action in thread with instant button feedback."""
@@ -415,6 +722,8 @@ class BotManagerGUI:
             "start": (self.start_btn, "Starting...", "Start"),
             "stop": (self.stop_btn, "Stopping...", "Stop"),
             "restart": (self.restart_btn, "Restarting...", "Restart"),
+            "install_watchdog": (self.install_wd_btn, "Installing...", "Install task"),
+            "uninstall_watchdog": (self.uninstall_wd_btn, "Removing...", "Remove"),
         }
         btn, busy_text, idle_text = btn_map[action]
         btn.config(text=busy_text, state=tk.DISABLED)
@@ -423,16 +732,38 @@ class BotManagerGUI:
             try:
                 if action == "start":
                     start_bot()
+                    # 啟動 = 允許 watchdog 接手自動重啟
+                    set_watchdog_enabled(True)
                 elif action == "stop":
                     stop_bot()
+                    # 停止 = 關掉 watchdog，否則會被自動重啟
+                    set_watchdog_enabled(False)
                 elif action == "restart":
                     stop_bot()
                     time.sleep(2)
                     start_bot()
+                elif action == "install_watchdog":
+                    install_watchdog_task()
+                elif action == "uninstall_watchdog":
+                    uninstall_watchdog_task()
             finally:
                 console.after(0, lambda: btn.config(text=idle_text, state=tk.NORMAL))
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def _on_wd_slide(self, val):
+        """拖動滑桿時即時更新文字（不寫檔）。"""
+        try:
+            wd_interval_label.config(text=f"{int(float(val))} min")
+        except Exception:
+            pass
+
+    def _on_wd_slide_release(self, _event):
+        """放開滑桿才寫入 watchdog.json。"""
+        try:
+            set_watchdog_interval(int(float(wd_scale.get())))
+        except Exception:
+            pass
 
     def on_close(self):
         global monitor_running

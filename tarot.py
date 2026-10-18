@@ -12,6 +12,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from openai import AsyncOpenAI
+from llm_models import chat_create, has_credentials
 import random
 import os
 import re
@@ -21,12 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TAROT_IMAGE_DIR = os.path.join(SCRIPT_DIR, "tarot_images")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-_client = (
-    AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
-    if DEEPSEEK_API_KEY
-    else None
-)
+# 客戶端改由 llm_models.get_client() 依來源即時提供（見下方呼叫點）。
 
 os.makedirs(TAROT_IMAGE_DIR, exist_ok=True)
 
@@ -552,7 +548,7 @@ def build_spread_description(cards: list[TarotCard], spread_type: str) -> str:
 async def interpret_tarot(
     cards: list[TarotCard], user_message: str, spread_type: str, user_name: str
 ) -> str:
-    if not _client:
+    if not has_credentials():
         return "（AI 解讀服務未啟用，請檢查 API 金鑰設定）"
 
     card_lines = []
@@ -600,8 +596,8 @@ async def interpret_tarot(
 請用繁體中文，保持占卜師的專業與溫暖。不要過度恐嚇或過度樂觀，保持平衡的觀點。"""
 
     try:
-        resp = await _client.chat.completions.create(
-            model="deepseek-v4-flash",
+        resp = await chat_create(
+            "tarot",
             messages=[
                 {
                     "role": "system",

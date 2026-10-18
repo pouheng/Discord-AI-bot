@@ -37,6 +37,7 @@ AUTOPILOT_MEMORY_DIR = os.path.join(SCRIPT_DIR, "auto_pilot_memories")
 
 from contextlib import asynccontextmanager
 from db import get_db as _shared_get_db
+from llm_models import chat_create, has_credentials
 from profiles import (
     PROFILE_FIELDS, PROFILE_LABELS,
     get_character_profile as _shared_get_character_profile,
@@ -44,12 +45,7 @@ from profiles import (
     format_character_profile as _shared_format_character_profile,
 )
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-_deepseek_client = (
-    AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
-    if DEEPSEEK_API_KEY
-    else None
-)
+# 客戶端改由 llm_models.get_client() 依來源即時提供（見下方呼叫點）。
 
 
 def _init_db():
@@ -886,11 +882,11 @@ def register_commands(bot: commands.Bot):
 若內容不需要寫入則回傳 {{"actions":[]}}"""
 
         try:
-            if not _deepseek_client:
+            if not has_credentials():
                 await interaction.followup.send("❌ API 金鑰未設定", ephemeral=True)
                 return
-            resp = await _deepseek_client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "autopilot",
                 messages=[
                     {"role": "system", "content": "你只輸出 JSON，不要加任何解釋。"},
                     {"role": "user", "content": prompt},

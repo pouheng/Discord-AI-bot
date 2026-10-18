@@ -401,6 +401,29 @@ WRITE_RULES = {
 
 【輸出格式】
 {"name": "...", "owner": "...", "domain_type": "...", "awakening": "中期覺醒", "precision": 1.2, "rule_self": "...", "rule_enemy": "...", "rule_environment": "...", "cooldown": "6 小時內可再展開", "sustain_mp": 8}""",
+    "clash_villain": """你是招式對撞系統的資料輸入解析器。請把管理員的自然語言描述轉成結構化 JSON。
+目標資料表：血條對戰（collide_clash_battles）的反派註冊。輸出只能是 JSON，不要額外說明；所有欄位值一律使用繁體中文（Traditional Chinese），禁止簡體中文。
+
+【反派註冊必填欄位】
+- name: 反派角色名（字串，須已存在於角色表 collide_characters；系統會取該角色體質隱藏分數計算 guard）
+- tier: 階級（字串，只能是 雜兵 / 重點 / Boss；決定 MaxHP 與 Cap_tier）
+- dynamic_difficulty: 動態難度（布林）——**一律 false**。自動偵測的反派 guard 純粹由
+  `體質隱藏分數 × Domain_Mod` 計算，**不得開啟** calibrate_roster 校準流程
+
+【可選欄位（依 story 表現；缺省時由系統依 tier 機械取值）】
+- guard_value: 反派防禦閾值（數字，>0）——系統依角色體質隱藏分數 × domain_mod 計算時可缺省
+- domain_mod: 反派結界覺醒修正（數字，1.0~1.5，缺省 1.0=未開結界）——guard 計算用，一般不填
+- max_hp_ticks: 最大血量（整數，>0）——缺省依 tier（雜兵 50 / 重點 120 / Boss 240）
+- cap_ticks: 單節點聚合上限（整數，>0）——缺省依 tier（雜兵 25 / 重點 40 / Boss 50）
+
+【範圍約束（不可違反，違反則回報錯誤）】
+- name 不可為空；tier 只能是 雜兵/重點/Boss
+- dynamic_difficulty 若輸出 true → 驗證錯誤（自動偵測路徑一律 0）
+- domain_mod 若填寫必須在 1.0~1.5
+- guard_value / max_hp_ticks / cap_ticks 若填寫必須為正數
+
+【輸出格式】
+{"name": "暗影魔狼", "tier": "重點", "domain_mod": 1.0, "dynamic_difficulty": false}""",
 }
 
 # 招式擴展推導檢查（collide_parser.check_skill_derivation 使用）
@@ -440,7 +463,7 @@ CLASH_PHASE_A_SYSTEM = """你是招式對撞系統的戰局分析器。根據討
      並同時**估算該招式的完整數值**（見 skill_estimates）——讓本次對撞第一次就能用真實威力計算，不必等事後記錄
    - 不屬任何已登記能力（全新能力／通用魔法）→ abilities 填 null；skill_estimates 該側填 null
      （全新能力無法估算，依既有規則落回普通攻擊或通用魔法）
-8. **判斷雙方動作型別（action_type）**——這是最重要的一步，務必讀懂討論串：
+8b. **判斷雙方動作型別（action_type）**——這是最重要的一步，務必讀懂討論串：
    - "skill"：使用一般招式（能力擴展應用、魔法、近戰招式）
    - "domain"：**張開/展開結界**（角色展開領域、結界、結界技能、結界壓迫，例如
      「展開結界」「領域展開」「張開龍王禁地」「以地獄水牢包覆」）——結界張開本身是動作，
@@ -486,6 +509,10 @@ CLASH_PHASE_A_SYSTEM = """你是招式對撞系統的戰局分析器。根據討
 {
   "attacker_candidate": {"char": "角色名", "skill": "招式/結界名", "action_type": "skill", "is_player": true, "is_npc": false},
   "defender_candidate": {"char": "角色名", "skill": "招式/結界名", "action_type": "skill", "is_player": true, "is_npc": false},
+  "combatants": [
+    {"char": "玩家角色A", "skill": "招式/結界名", "action_type": "skill", "target": "本節點反派名", "holding_back": false},
+    {"char": "玩家角色B", "skill": "招式/結界名", "action_type": "skill", "target": "本節點反派名", "holding_back": false}
+  ],
   "applications": {"attacker": "擴展一：傷害型", "defender": "擴展二：非傷害型"},
   "abilities": {"attacker": "招式所屬能力名或null", "defender": "招式所屬能力名或null"},
   "skill_estimates": {
@@ -518,6 +545,11 @@ CLASH_PHASE_A_SYSTEM = """你是招式對撞系統的戰局分析器。根據討
 
 規則：
 - 玩家角色不可被預設意圖/動作；若玩家替其他玩家設定動作，記入 warnings；NPC 動作由你預設，不記越權警告
+- **combatants（多打一）**：本節點**所有出手攻擊 `defender_candidate` 這一名反派的玩家角色**，依發言順序列出。
+  - **目標必須與 `defender_candidate` 同一名**：每筆 combatant 填 `target`（該玩家攻擊的反派名）。若討論串同時出現多隻反派／多組平行對撞，**只收 target 等於 defender_candidate 者**；攻擊其他反派的玩家**不列入本節點**，並記入 warnings（他們屬另一節點）。
+  - **只列玩家本人貼出的行動，AI 不得代寫**（越權時記 warnings）。反派本身**不放**進 combatants（反派置於 defender_candidate）。
+  - `holding_back` = **該玩家自己**在發言中主張的留手（只想擊退／點到為止 → true；一般交手／全力 → false），與其 intended_outcomes 一致。
+  - 單挑時 combatants 退化為 1 人。
 - 攻守最終由威力比較決定，Phase A 的 candidate 僅為初判
 - Status_Mod：重傷/瀕死 0.5~0.8、輕傷/疲勞 0.9~0.95、正常 1.0、強化 1.05~1.3
 - Form_Mod：僅當角色於劇中明確轉變為特殊型態才套用（依角色表 special_forms 倍率）

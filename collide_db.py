@@ -268,7 +268,7 @@ CREATE TABLE IF NOT EXISTS collide_battles (
     element_mod REAL,
     verdict TEXT,
     result TEXT,
-    remaining_damage TEXT,
+    remaining_damage TEXT,   -- 已棄用（deprecated，v2 起不再寫入；由 collide_clash_nodes 的 ticks 取代）
     phase_c TEXT,
     skills_meta TEXT,
     domain_fusion INTEGER DEFAULT 0,
@@ -279,6 +279,40 @@ CREATE TABLE IF NOT EXISTS collide_battles (
     undone_by TEXT,
     undone_reason TEXT,
     created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS collide_clash_battles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    battle_id TEXT NOT NULL UNIQUE,
+    villain_id INTEGER,
+    villain_name TEXT,
+    tier TEXT,
+    max_hp_ticks INTEGER,
+    cap_ticks INTEGER,
+    guard_value REAL,
+    current_hp_ticks INTEGER,
+    retreat_floor_ticks INTEGER,
+    outcome TEXT DEFAULT 'active',
+    source TEXT DEFAULT 'auto_detect',
+    dynamic_difficulty INTEGER DEFAULT 0,
+    created_at TEXT,
+    absolute_expire_at TEXT,
+    soft_expire_at TEXT,
+    retreat_snapshot_ticks INTEGER
+);
+CREATE TABLE IF NOT EXISTS collide_clash_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    battle_id TEXT,
+    node_id TEXT,
+    occurred_at TEXT,
+    delta_ticks INTEGER,
+    chip INTEGER DEFAULT 0,
+    aggressors TEXT DEFAULT '[]',
+    source TEXT DEFAULT 'parsed',
+    confidence REAL,
+    confirmed INTEGER DEFAULT 0,
+    created_at TEXT,
+    UNIQUE(battle_id, node_id)
 );
 """
 
@@ -301,6 +335,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _init_growth_schema(conn)
     _migrate_collide_columns(conn)
+    _migrate_clash_indexes(conn)
     conn.commit()
 
 
@@ -314,6 +349,7 @@ def _migrate_collide_columns(conn: sqlite3.Connection) -> None:
             ("phase_c", "TEXT DEFAULT ''"),
             ("skills_meta", "TEXT DEFAULT '{}'"),
             ("effects", "TEXT DEFAULT '{}'"),
+            ("clash_meta", "TEXT DEFAULT '{}'"),
         ],
     }
     for table, cols in tables.items():
@@ -321,6 +357,26 @@ def _migrate_collide_columns(conn: sqlite3.Connection) -> None:
         for col, ddl in cols:
             if col not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+
+def _migrate_clash_indexes(conn: sqlite3.Connection) -> None:
+    """為既有資料庫補齊 Clash 血條索引。
+
+    - 複合唯一索引 UNIQUE(battle_id, node_id)：同一節點重放（重複結算）不得重複扣血。
+    - battle_id 一般索引：節點清單 / pending 確認 / 過期刪除的查詢路徑。
+    """
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_clash_nodes_battle_node "
+        "ON collide_clash_nodes(battle_id, node_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clash_nodes_battle "
+        "ON collide_clash_nodes(battle_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clash_battles_villain "
+        "ON collide_clash_battles(villain_id)"
+    )
 
 
 # ── 能力（collide_abilities）──────────────────────────────
@@ -606,8 +662,8 @@ def insert_battle(conn: sqlite3.Connection, data: dict) -> dict:
             thread_id, battle_time, attacker, attacker_skill,
             defender, defender_skill, atk_output, def_output,
             element_mod, verdict, result, remaining_damage,
-            phase_c, skills_meta, domain_fusion, chain_of_thought, effects, confirmed, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            phase_c, skills_meta, domain_fusion, chain_of_thought, effects, clash_meta, confirmed, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         """,
         (
             str(data.get("thread_id") or "").strip(),
@@ -627,6 +683,7 @@ def insert_battle(conn: sqlite3.Connection, data: dict) -> dict:
             1 if data.get("domain_fusion") else 0,
             str(data.get("chain_of_thought") or "").strip(),
             _json_dumps(data.get("effects") or {}),
+            _json_dumps(data.get("clash_meta") or {}),
             1 if data.get("confirmed") else 0,
             str(data.get("status") or "pending").strip(),
         ),
@@ -683,6 +740,297 @@ def growth_log_for_battle(conn: sqlite3.Connection, battle_id: int) -> list[dict
         ).fetchall()
     except Exception:
         return []
+    return [dict(r) for r in rows]
+
+
+# ── Clash 血條（v2：多打一 HP Ledger）────────────────────
+
+CLASH_ABSOLUTE_TTL_DAYS = 180   # 絕對上限：建立 + 180 天硬刪除
+CLASH_SOFT_TTL_DAYS = 30        # 軟性展期：最後一次更新 + 30 天（永不超過絕對上限）
+
+CLASH_OUTCOME_ACTIVE = "active"
+CLASH_OUTCOME_DEFEATED = "defeated"
+CLASH_OUTCOME_RETREATED = "retreated"
+CLASH_OUTCOME_SEALED = "sealed"
+
+
+def get_clash_battle(conn: sqlite3.Connection, battle_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM collide_clash_battles WHERE battle_id = ?", (battle_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def create_clash_battle(
+    conn: sqlite3.Connection,
+    *,
+    battle_id: str,
+    villain_id: int,
+    villain_name: str,
+    tier: str,
+    max_hp_ticks: int,
+    cap_ticks: int,
+    guard_value: float,
+    retreat_floor_ticks: int,
+    initial_hp_ticks: int | None = None,
+    source: str = "auto_detect",
+    dynamic_difficulty: int = 0,
+) -> dict:
+    """建立血條對戰。battle_id 建立時凍結 max_hp / cap / guard / floor（唯一可變 = current_hp_ticks）。
+
+    initial_hp_ticks 預設 = max_hp_ticks；擊退續接（retreat snapshot）時傳入快照值。
+    source：auto_detect（自動偵測，dynamic_difficulty 一律 0）/ gm（管理員註冊）。
+    """
+    if initial_hp_ticks is None:
+        initial_hp_ticks = max_hp_ticks
+    conn.execute(
+        """
+        INSERT INTO collide_clash_battles (
+            battle_id, villain_id, villain_name, tier,
+            max_hp_ticks, cap_ticks, guard_value, current_hp_ticks,
+            retreat_floor_ticks, outcome, source, dynamic_difficulty,
+            created_at, absolute_expire_at, soft_expire_at, retreat_snapshot_ticks
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now', ?), datetime('now', ?), NULL)
+        """,
+        (
+            battle_id, villain_id, villain_name, tier,
+            max_hp_ticks, cap_ticks, guard_value, initial_hp_ticks,
+            retreat_floor_ticks, CLASH_OUTCOME_ACTIVE, source, dynamic_difficulty,
+            f"+{CLASH_ABSOLUTE_TTL_DAYS} days",
+            f"+{CLASH_SOFT_TTL_DAYS} days",
+        ),
+    )
+    conn.commit()
+    return get_clash_battle(conn, battle_id)
+
+
+def update_clash_hp(
+    conn: sqlite3.Connection,
+    battle_id: str,
+    new_hp_ticks: int,
+    *,
+    outcome: str | None = None,
+    retreat_snapshot: int | None = None,
+) -> dict | None:
+    """套用節點扣減：唯一可變動欄位 current_hp_ticks。
+
+    outcome / retreat_snapshot 於終局（defeated / retreated / sealed）時一併寫入。
+    每次更新滑動軟性展期（soft_expire_at = 現在 + SOFT 天數，但永不超過 absolute_expire_at）。
+    """
+    sets = ["current_hp_ticks = ?"]
+    params: list = [new_hp_ticks]
+    if outcome is not None:
+        sets.append("outcome = ?")
+        params.append(outcome)
+    if retreat_snapshot is not None:
+        sets.append("retreat_snapshot_ticks = ?")
+        params.append(retreat_snapshot)
+    sets.append("soft_expire_at = MIN(datetime('now', ?), absolute_expire_at)")
+    params.append(f"+{CLASH_SOFT_TTL_DAYS} days")
+    params.append(battle_id)
+    conn.execute(
+        f"UPDATE collide_clash_battles SET {', '.join(sets)} WHERE battle_id = ?",
+        params,
+    )
+    conn.commit()
+    return get_clash_battle(conn, battle_id)
+
+
+def record_clash_node(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    battle_id: str,
+    node_id: str,
+    occurred_at: str,
+    delta_ticks: int,
+    chip: bool,
+    aggressors: list,
+    source: str = "parsed",
+    confidence: float,
+    confirmed: bool = False,
+) -> dict | None:
+    """Ledger 寫入一筆節點聚合事件（生成器提案 → Ledger 驗證後才落庫）。
+
+    去重：event_id 唯一（UNIQUE 約束）＋ (battle_id, node_id) 複合唯一（唯一索引）。
+    重複 event_id 或重複 (battle_id, node_id) 直接回傳 None（不覆寫，解析器只補空隙）。
+    """
+    if conn.execute(
+        "SELECT 1 FROM collide_clash_nodes WHERE event_id = ?", (event_id,)
+    ).fetchone():
+        return None
+    if conn.execute(
+        "SELECT 1 FROM collide_clash_nodes WHERE battle_id = ? AND node_id = ?",
+        (battle_id, node_id),
+    ).fetchone():
+        return None
+    conn.execute(
+        """
+        INSERT INTO collide_clash_nodes (
+            event_id, battle_id, node_id, occurred_at, delta_ticks, chip,
+            aggressors, source, confidence, confirmed, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """,
+        (
+            event_id, battle_id, node_id, occurred_at, delta_ticks,
+            1 if chip else 0, _json_dumps(aggressors), source, confidence,
+            1 if confirmed else 0,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM collide_clash_nodes WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def record_clash_settlement(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    battle_id: str,
+    node_id: str,
+    occurred_at: str,
+    delta_ticks: int,
+    chip: bool,
+    aggressors: list,
+    source: str = "parsed",
+    confidence: float,
+    confirmed: bool = False,
+    new_hp_ticks: int,
+    outcome: str | None = None,
+    retreat_snapshot: int | None = None,
+) -> dict | None:
+    """Ledger 驗證後**原子寫入**一節點：node 記錄 + HP 更新同一交易。
+
+    去重：`(battle_id, node_id)` 複合唯一（DB 唯一索引兜底）——
+    同一節點重放（重複結算）回傳 None，不覆寫、**不重複扣血**。
+
+    Returns:
+        dict | None: 更新後的 battle 列；None = 重複節點或 battle 不存在。
+    """
+    # 若呼叫端已有未提交交易，BEGIN IMMEDIATE 會拋 "cannot start a transaction
+    # within a transaction"；先收尾既有交易，再開新交易以保留原子性。
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute(
+            "SELECT 1 FROM collide_clash_nodes WHERE battle_id = ? AND node_id = ?",
+            (battle_id, node_id),
+        ).fetchone():
+            conn.execute("ROLLBACK")
+            return None
+        cur = conn.execute(
+            """
+            UPDATE collide_clash_battles SET
+                current_hp_ticks = ?,
+                outcome = CASE WHEN ? IS NOT NULL THEN ? ELSE outcome END,
+                retreat_snapshot_ticks = CASE WHEN ? IS NOT NULL THEN ? ELSE retreat_snapshot_ticks END,
+                soft_expire_at = MIN(datetime('now', ?), absolute_expire_at)
+            WHERE battle_id = ?
+            """,
+            (
+                int(new_hp_ticks),
+                outcome, outcome,
+                retreat_snapshot, retreat_snapshot,
+                f"+{CLASH_SOFT_TTL_DAYS} days",
+                battle_id,
+            ),
+        )
+        if cur.rowcount == 0:
+            conn.execute("ROLLBACK")
+            return None
+        conn.execute(
+            """
+            INSERT INTO collide_clash_nodes (
+                event_id, battle_id, node_id, occurred_at, delta_ticks, chip,
+                aggressors, source, confidence, confirmed, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                event_id, battle_id, node_id, occurred_at, delta_ticks,
+                1 if chip else 0, _json_dumps(aggressors), source, confidence,
+                1 if confirmed else 0,
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return get_clash_battle(conn, battle_id)
+
+
+def next_clash_node_id(conn: sqlite3.Connection, battle_id: str) -> str:
+    """回傳該 battle 下一個 node_id（序號字串 'n1'、'n2'…，依既有節點數 +1）。
+
+    重放同一事件會得到相同 node_id → 由複合唯一鍵擋下，不重複扣血。
+    """
+    count = conn.execute(
+        "SELECT COUNT(*) FROM collide_clash_nodes WHERE battle_id = ?", (battle_id,)
+    ).fetchone()[0]
+    return f"n{int(count) + 1}"
+
+
+def confirm_pending_for_battle(conn: sqlite3.Connection, battle_id: str) -> int:
+    """下一結算節點到達時，把同 battle_id 的 pending 事件轉為 confirmed。
+
+    pending 生命週期綁定節點：隨該 battle 的下一個結算節點確認；
+    battle 進入終局（outcome != active）後不再有結算節點 → pending 自然封存。
+    回傳被確認筆數。
+    """
+    cur = conn.execute(
+        """
+        UPDATE collide_clash_nodes SET confirmed = 1
+        WHERE battle_id = ? AND source = 'pending' AND confirmed = 0
+        """,
+        (battle_id,),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def expire_clash_battles(conn: sqlite3.Connection) -> list[str]:
+    """TTL 硬刪除：絕對上限（absolute_expire_at）或滑動展期（soft_expire_at）到期
+    → 連同節點一併清除。回傳被刪 battle_id。"""
+    expired = [
+        r[0]
+        for r in conn.execute(
+            "SELECT battle_id FROM collide_clash_battles "
+            "WHERE absolute_expire_at <= datetime('now') "
+            "OR soft_expire_at <= datetime('now')"
+        )
+    ]
+    for bid in expired:
+        conn.execute("DELETE FROM collide_clash_nodes WHERE battle_id = ?", (bid,))
+        conn.execute("DELETE FROM collide_clash_battles WHERE battle_id = ?", (bid,))
+    conn.commit()
+    return expired
+
+
+def find_active_clash_for_villain(
+    conn: sqlite3.Connection, villain_id: int
+) -> dict | None:
+    """該反派目前進行中的 battle（凍結粒度 battle_id：同反派同一時間只保留一場 active）。"""
+    row = conn.execute(
+        "SELECT * FROM collide_clash_battles WHERE villain_id = ? AND outcome = 'active' ORDER BY id DESC LIMIT 1",
+        (villain_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_clash_battles(
+    conn: sqlite3.Connection, *, outcome: str | None = None
+) -> list[dict]:
+    if outcome:
+        rows = conn.execute(
+            "SELECT * FROM collide_clash_battles WHERE outcome = ? ORDER BY id DESC",
+            (outcome,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM collide_clash_battles ORDER BY id DESC"
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -953,6 +1301,65 @@ def quick_test():
     assert b3["status"] == "undone" and b3["undone_by"] == "admin"
     assert len(list_battles(conn, status="undone")) == 1
     assert get_battle(conn, b["id"])["verdict"] == "優勢壓制"
+
+    # ===== Clash v2 血條 Ledger =====
+    cb = create_clash_battle(
+        conn,
+        battle_id="C1", villain_id=999, villain_name="暗影王", tier="Boss",
+        max_hp_ticks=240, cap_ticks=50, guard_value=10.5, retreat_floor_ticks=48,
+        source="auto_detect", dynamic_difficulty=0,
+    )
+    assert cb["outcome"] == "active" and cb["current_hp_ticks"] == 240
+    assert cb["absolute_expire_at"] > cb["created_at"], "絕對上限應晚於建立時間"
+    assert cb["soft_expire_at"] <= cb["absolute_expire_at"], "軟性展期不得超過絕對上限"
+    assert find_active_clash_for_villain(conn, 999)["battle_id"] == "C1"
+
+    # 節點寫入 + event_id 去重（重複提案不覆寫）
+    n1 = record_clash_node(
+        conn, event_id="C1:1", battle_id="C1", node_id="C1:n1",
+        occurred_at="2026-10-12 10:00", delta_ticks=20, chip=False,
+        aggressors=[{"name": "神月", "verdict": "碾壓", "delta_ticks": 20}],
+        source="parsed", confidence=0.95, confirmed=True,
+    )
+    assert n1["delta_ticks"] == 20 and n1["chip"] == 0
+    assert record_clash_node(
+        conn, event_id="C1:1", battle_id="C1", node_id="C1:n1",
+        occurred_at="2026-10-12 10:00", delta_ticks=99, chip=False,
+        aggressors=[], source="parsed", confidence=0.95,
+    ) is None, "重複 event_id 應拒絕，不得覆寫"
+
+    # 扣血：唯一可變欄位 current_hp_ticks；soft_expire_at 滑動展期
+    hp = update_clash_hp(conn, "C1", 220)
+    assert hp["current_hp_ticks"] == 220
+
+    # pending 生命週期：下一結算節點到達 → 轉 confirmed
+    record_clash_node(
+        conn, event_id="C1:p1", battle_id="C1", node_id="C1:pending",
+        occurred_at="2026-10-12 10:05", delta_ticks=10, chip=False,
+        aggressors=[], source="pending", confidence=0.75,
+    )
+    assert confirm_pending_for_battle(conn, "C1") == 1, "pending 應被確認 1 筆"
+    assert confirm_pending_for_battle(conn, "C1") == 0, "已確認後不應重複計數"
+
+    # 擊退快照：retreated 寫入 retreat_snapshot_ticks → 新 battle_id 由快照續接
+    rv = update_clash_hp(conn, "C1", 48, outcome="retreated", retreat_snapshot=48)
+    assert rv["outcome"] == "retreated" and rv["retreat_snapshot_ticks"] == 48
+    cb2 = create_clash_battle(
+        conn,
+        battle_id="C2", villain_id=999, villain_name="暗影王", tier="Boss",
+        max_hp_ticks=240, cap_ticks=50, guard_value=10.5, retreat_floor_ticks=48,
+        initial_hp_ticks=rv["retreat_snapshot_ticks"], source="auto_detect", dynamic_difficulty=0,
+    )
+    assert cb2["current_hp_ticks"] == 48, "新 battle 應由擊退快照續接，非回滿"
+    assert len(list_clash_battles(conn, outcome="retreated")) == 1
+    assert len(list_clash_battles(conn, outcome="active")) == 1
+
+    # TTL 硬刪除：absolute_expire_at 到期 → battle 連同節點清除
+    conn.execute(
+        "UPDATE collide_clash_battles SET absolute_expire_at = '2000-01-01' WHERE battle_id = 'C2'"
+    )
+    assert expire_clash_battles(conn) == ["C2"], "到期應硬刪除並回傳 battle_id"
+    assert get_clash_battle(conn, "C2") is None
 
     conn.close()
     os.remove(tmp)

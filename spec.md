@@ -1,7 +1,7 @@
 # 招式對撞系統（Skill Collision System）規格書
 
-版本：v1.0（草案）
-日期：2026-08-08
+版本：v2.0（草案）
+日期：2026-10-12
 狀態：待審查
 
 ---
@@ -308,7 +308,7 @@
 | element_mod | REAL | 元素相克判定倍率 |
 | verdict | TEXT | 最終判定（碾壓/壓制/僵持/結界交疊） |
 | result | TEXT | 玩家可讀結果區塊（JSON：verdict/summary/projection/reason——含**預估結果**，供玩家檢視計算靠不靠譜、供 Phase C 轉寫正文） |
-| remaining_damage | TEXT | 剩餘衝擊傷害 |
+| remaining_damage | TEXT | **已棄用（deprecated）**：v1 剩餘衝擊傷害自由文字。v2 起由 Clash 血條系統的 ticks 欄位承接（見 5.6），不再新增寫入；既有資料保留供追溯 |
 | domain_fusion | INTEGER | 結界融合觸發 0/1 |
 | chain_of_thought | TEXT | 思維鏈與計算過程 |
 | confirmed | INTEGER | 中之人是否確認 0/1 |
@@ -447,6 +447,71 @@
 
 - **所有變動皆寫入 `collide_growth_log`**（含 old→new 與 delta），管理員可人工審查修改（`reviewed` / `reviewed_by` / `reviewed_note`）；人工修正也記錄一筆新的 log。
 - 樓層的 AI Action Log 透過 `/clash log <討論串>` 全部可查。
+
+### 5.6 Clash 血條系統（HP Pool）資料表
+
+> **v2 核心**：偵測到魔物/反派時，系統依劇情表現**自動建立數據（全自動）**，以**血條**代表其狀態；血條歸零即**打敗或擊退**。血條對玩家**可視**（訊息文字進度條，見 5.6.4）。資料雖為暫時性，**最長可維持存放半年**。
+
+#### 5.6.1 資料表：`collide_clash_battles`
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| id | INTEGER PK AUTOINCREMENT | — |
+| battle_id | TEXT UNIQUE | 該場血條對戰的唯一識別碼（**凍結粒度 = battle_id**，見 5.6.4） |
+| villain_id | INTEGER | 反派角色 id（`collide_characters.id`，`is_villain = 1`） |
+| villain_name | TEXT | 反派顯示名（血條標題） |
+| tier | TEXT | 階級：雜兵 / 重點 / Boss（決定 MaxHP 與 Cap_tier，見 5.6.3） |
+| max_hp_ticks | INTEGER | 總血量（ticks）。**battle_id 建立時凍結** |
+| cap_ticks | INTEGER | 單節點聚合上限（ticks）。**battle_id 建立時凍結** |
+| guard_value | REAL | Villain_Guard（反派防禦閾值，見 6.5.1）：`stat_constitution_hidden × Domain_Mod`。**battle_id 建立時凍結** |
+| current_hp_ticks | INTEGER | 當前血量（ticks）。**唯一可變動欄位**；0 為終局狀態（見 outcome） |
+| retreat_floor_ticks | INTEGER | 擊退線（ticks）= MaxHP 的 20%（見 5.6.3）。低於此線只能「擊退」，不能繼續扣到 0（見 6.5.2 chip 規則） |
+| outcome | TEXT | 終局狀態：`active`（進行中）/ `defeated`（打敗）/ `retreated`（擊退）/ `sealed`（封印）。歸零後**不刪除資料**，僅標狀態 |
+| source | TEXT | 建立來源：`auto_detect`（劇情自動偵測）/ `gm`（管理員註冊） |
+| dynamic_difficulty | INTEGER | 自動偵測的反派一律 0（guard 純計算，不進校準流程）；僅管理員註冊的篇章 Boss 可為 1（見 9 邊界） |
+| created_at | TEXT | ISO 時間 |
+| absolute_expire_at | TEXT | **絕對上限** = 建立時間 + 180 天（到期硬刪除） |
+| soft_expire_at | TEXT | 軟性有效期限 = 最後一次更新 + 滑動展期；**永不超過 absolute_expire_at**（雙軌 TTL，見 5.6.4） |
+| retreat_snapshot_ticks | INTEGER | 擊退當下寫入的 `current_hp_ticks` 快照；新 battle_id 由快照續接（見 5.6.4） |
+
+#### 5.6.2 節點表：`collide_clash_nodes`
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| id | INTEGER PK AUTOINCREMENT | — |
+| event_id | TEXT UNIQUE | 事件唯一識別碼（Phase A 產生，`<battle_id>:<序號>`）。**去重鍵** |
+| battle_id | TEXT | 對應 `collide_clash_battles.battle_id` |
+| node_id | TEXT | 節點識別碼（`<battle_id>:<節點序號>`）；**每節點最多一筆聚合事件**（單節點聚合，見 6.5.2） |
+| occurred_at | TEXT | 事件發生時間（討論串時間） |
+| delta_ticks | INTEGER | 本次扣減（ticks，0 ~ cap_ticks） |
+| chip | INTEGER | 是否為僵持扣血（chip）0/1 |
+| aggressors | TEXT | 參與玩家清單（JSON 陣列，含各玩家 verdict 摘要） |
+| source | TEXT | `parsed`（信心 ≥ 0.90 自動提交）/ `pending`（0.70 ~ 0.89 待結算）/ `gm`（管理員覆寫） |
+| confidence | REAL | Phase A 結構化事件的信心值（0.70 ~ 1.00） |
+| confirmed | INTEGER | 0/1；`pending` 事件在下一結算節點確認後轉 1 |
+| created_at | TEXT | ISO 時間 |
+
+> **寫入規則（Ledger 驗證，雙軌制）**：生成器（Phase A / LLM）只提出 `combat.events[]` **提案**；**Ledger 驗證後才寫入**。模型**永不直接寫血條**；解析器只補空隙、不覆寫高信心事件。`event_id` + `(battle_id, node_id)` 去重；同節點多位玩家 → **單一聚合事件**（見 6.5.2），不逐人寫入。
+
+#### 5.6.3 階級參數（存程式碼常數，公開可查）
+
+| tier | MaxHP（B / ticks） | 單節點 Cap（B / ticks） | 擊退線（ticks） | 說明 |
+|---|---|---|---|---|
+| 雜兵 | 5B / 50 ticks | 2.5B / 25 ticks | 10 | 無名雜兵：**不個別建血條**，合併為「戰線狀態」（見 5.6.4） |
+| 重點 | 12B / 120 ticks | 4B / 40 ticks | 24 | 有名或有特色的反派 |
+| Boss | 24B / 240 ticks | 5B / 50 ticks | 48 | 篇章級反派 |
+
+> 常數：`TICKS_PER_B = 10`、`CHIP_TICKS = 2`（僵持扣血一次 = 0.2B）。所有數值皆以 **ticks** 儲存；**B 只是顯示單位**（血條進度條換算），不存在於 schema（見 6.5.2 B 消去）。階級參數於 battle_id 建立時凍結，存放於 `collide_clash_battles` 對應欄位。
+
+#### 5.6.4 生命週期與可見性
+
+- **血條對玩家可視**：以訊息文字進度條（如 `██████░░░░ 12B/24B`）輸出到討論串，並附**一行理由**（為何扣血）。**runtime 渲染入口 = `collide_engine.format_clash_hp_bar(current_hp_ticks, max_hp_ticks, *, width=10)`**（純函式；**全保真**——保留 `█`／`░` 與終局 emoji（`❌`／`💨`／`🔒`），產物供 Discord UTF-8）。**編碼安全只在輸出邊界**：寫入 console／legacy log 等窄編碼串流時才經 `collide_engine.enc_safe_for_stream(text, stream=sys.stdout)` 降級（`░`→`-`、emoji→ASCII），故 cp950 下 `python collide_engine.py` 仍 exit 0 且**不需**設定 `PYTHONIOENCODING`；送 Discord 的 payload **不降級**。`collide_ui.render_clash_bar(...)` 僅為 **UI 委派包裝**（全保真，委派至 engine）。討論串正文由指令層（`collide_cmds`）於**確認時**附加；渲染只讀值、不碰結算。
+- **歸零 = 終局狀態，不是刪除**：`outcome` 標記 `defeated` / `retreated` / `sealed`；資料保留至 TTL 到期。
+- **TTL 雙軌**：**絕對上限** = 建立時間 + 180 天（到期硬刪除）；**軟性展期** = 最後一次更新 + 滑動延長，**永不超過絕對上限**（對應「最多可維持存放半年」）。
+- **擊退快照**：擊退（`retreated`）當下把 `current_hp_ticks` 寫入 `retreat_snapshot_ticks`；反派再登場 = **新 battle_id**，初始血量由快照續接。僅 `休整恢復` 事件（`source = gm`）可回復至 MaxHP；**預設不自動回血**。
+- **階級分層（避免儲存爆炸）**：有名關鍵反派 → 個別血條；無名雜兵 → 合併為「戰線狀態」單一血條。
+- **凍結粒度 = battle_id**：「不可重新校準」指同一場 battle_id 內；新章節再登場 = 新 battle_id，血量由快照續接，參數重新凍結。
+- **只有反派有血條**：玩家受傷是純敘事（無玩家 HP pool，單向），血條只存在於反派側。
 
 ---
 
@@ -599,6 +664,52 @@ Atk < Def_BP        → 徹底化解：防禦方毫髮無傷，取得反打位�
 - **按鈕權限歸屬**：所有對撞結果按鈕（確認/重試/取消）在 `custom_id` 中**編碼 `/clash` 發送者的 user_id**；View 回調先校驗 `interaction.user.id == 發送者`，不符即回覆「只有發送者可以確認此結果」並**忽略操作**。發送者事後交接給管理員時，僅管理員可代為操作或撤銷。
 - 草稿（`status = pending`）可由發送者按「取消」清除，避免初期 bug 時洗版。
 
+### 6.5 Clash 血條判定（v2）
+
+> 血條計算承接四階判定結果，是**純函數**：verdict→delta。**敘事分數永不進入公式**——Phase A 只負責判斷「誰打了誰、結果像什麼等級」，扣多少血由 `r = Atk_BP / Villain_Guard` 機械決定。
+
+#### 6.5.1 Villain_Guard（反派防禦閾值，純計算）
+
+```
+Villain_Guard = stat_constitution_hidden × Domain_Mod
+```
+
+- `stat_constitution_hidden`：反派角色表既有欄位（體質隱藏分數）。
+- `Domain_Mod`：反派結界覺醒修正（未開結界 1.0，見 5.3 / 6.1）。
+- **純計算、零新增輸入**：不依賴任何新欄位。自動偵測的反派一律 `dynamic_difficulty = 0`，guard 純粹由上式算出，**不進入** `calibrate_roster` 校準流程（見 9 邊界）。
+
+#### 6.5.2 verdict→delta 純函數（多打一）
+
+每位玩家**獨立**對同一反派計算 `r = Atk_BP / Villain_Guard`，再依下表機械換算：
+
+```
+r ≥ 2.0        → 碾壓：2B = 20 ticks
+1.0 < r ≤ 2.0  → 壓制：1B = 10 ticks
+0.9 ≤ r ≤ 1.0  → 僵持：chip = 0.2B = 2 ticks（CHIP_TICKS）
+r < 0.9        → 無效：0 ticks
+```
+
+- **一次對撞 = 一個節點**：同節點多位玩家各自算出 delta 後**聚合**為單一事件（`node_id` 一筆），扣減 = `min(Σdelta, Cap_tier)`（單節點上限）。
+- **破防節點只聚合破防玩家（共識 A1）**：該節點若有任一位玩家達 `r > 1.0`（壓制／碾壓），節點總扣減**只累加破防玩家的 delta**；僵持（chip 2）／無效（0）玩家的扣減**不加入**——**破防節點不給 chip**。
+- **剩餘血量截斷**：扣減後 `current_hp_ticks` 不得低於 0：`delta_total = min(Σdelta, Cap_tier, current_hp_ticks)`。
+- **chip 規則**：僅當**沒有任何玩家**達到 `r > 1.0` 時觸發（全員僵持）；一次性扣 `CHIP_TICKS`。**chip 無法擊殺**——最低只到擊退線（`retreat_floor_ticks`），不跨過擊退線歸零。
+- **雙軌結局**：
+  - chip 路徑（停在擊退線）→ `outcome = active` + `at_retreat_floor = True`（**不自動終局**）；`retreated` 只能由中之人（玩家）宣告後才寫入（共識 A2）。
+  - 碾壓/壓制路徑 → 跨過擊退線扣至 0 → `outcome = defeated`（打敗）或 `sealed`（封印，依劇情）。
+- **B 是顯示單位、會消去**：節點數 = MaxHP/delta = 24B/(k×B) = 24/k，B 在除法中消去。**只有 Villain_Guard、Cap_tier、MaxHP 承載數值**，三者於 battle_id 建立時凍結；`current_hp_ticks` 是唯一可變動欄位。
+
+#### 6.5.3 事件信心與提交（雙軌制 + Ledger）
+
+| 信心值 | 動作 |
+|---|---|
+| ≥ 0.90 | 自動提交（`source = parsed`），當節點即時扣減 |
+| 0.70 ~ 0.89 | 標記 `pending`，**等待同 battle_id 的下一結算節點**；確認後合併扣減 |
+| < 0.70 | 丟棄，不寫入 |
+
+- **硬門檻**：必填欄位齊全是提交的前置條件（即使信心 ≥ 0.90，欄位不全也不提交，**不可**用降低信心門檻代替補齊欄位）。
+- **pending 生命週期**：只存活到同 battle_id 的下一結算節點；當 battle_id 到達終局狀態（`defeated` / `retreated` / `sealed`）即失效。
+- **留手不影響威力**：玩家意圖（留手）只把 碾壓→壓制 降級（沿用 6.3 留手規則），**不進 BP 公式**；意圖寫入 log 供追溯。
+
 ---
 
 ## 7. 系統架構
@@ -687,6 +798,13 @@ Phase B — 數學計算（第 2 次 API 調用）
    按鈕 custom_id 編碼發送者 user_id，View 回調校驗互動者身分（見 6.4）
 ```
 
+**v2 多打一與血條流程（延伸）**：
+- **自動偵測**：討論串中偵測到魔物/反派且玩家與其對抗 → 系統**自動**建立 `battle_id` 與血條（全自動，無需管理員介入；`source = auto_detect`，`dynamic_difficulty = 0`）。
+- Phase A 額外產出 **`combatants`**：本節點**攻擊同一名反派**的所有玩家角色（依發言順序；每筆 `{char, skill, action_type, target, holding_back}`）。**`target` 必須等於 `defender_candidate`**——打別隻反派的玩家**不入**本節點（屬平行對撞的另一節點，另記 warnings）。只收**玩家本人貼出的行動**（AI 不得代寫）；`holding_back` 為該玩家自己主張的留手。單挑時退化為 1 人。這是**提案**，不是結果。
+- Phase B 依 6.5.2 **逐玩家**計算 `r = Atk_BP / Villain_Guard`，聚合為單一節點扣減提案（`min(Σdelta, Cap_tier)`）。
+- **Ledger 驗證後才寫入** `collide_clash_nodes`（去重、信心門檻、cap 截斷、剩餘血量截斷）並更新 `collide_clash_battles.current_hp_ticks`（雙軌制，見 5.6.2）。
+- Phase C 文風輸出時附帶**血條進度條 + 一行理由**（見 5.6.4）。
+
 ---
 
 ## 8. 模組分工（建議）
@@ -759,6 +877,13 @@ Phase B — 數學計算（第 2 次 API 調用）
 - **確認逾時**：對撞結果按鈕逾時（如 5 分鐘）自動標記未確認，`pending` 紀錄保留（可稍後由發送者再次觸發 `/clash` 或清除），結果仍留在討論串供所有人查看。
 - **非發送者點擊對撞結果按鈕**：按鈕 `custom_id` 編碼發送者 user_id，View 回調校驗互動者身分——非發送者一律回覆「只有發送者可以確認此結果」並**忽略操作**（沿用 main.py / autopilot.py 既有「不是你的操作」權限 pattern，見 6.4）。
 - **討論串過長**：Phase A 只讀取討論串**尾部**（如最近 50 則），避免 token 爆量。
+- **自動偵測的反派誤帶 dynamic_difficulty = 1**：自動偵測路徑一律強制 `dynamic_difficulty = 0`（guard 純計算）；若資料仍誤帶 1 且無 `calibrate_roster` → 沿用既有拒絕規則（spec.md:741 門檻）。
+- **多打一但無人破防（全員 r < 0.9）**：該節點扣減 0 ticks；不觸發 chip（chip 僅在全員僵持 0.9 ≤ r ≤ 1.0 時）。
+- **單節點扣減超過剩餘血量**：截斷至 0，絕不負值；觸底即終局狀態（`defeated` / `sealed`）。
+- **chip 是否可能擊殺**：不可能——chip 最低只到擊退線（`retreat_floor_ticks`），不跨線；僅 碾壓/壓制 可跨過擊退線扣至 0。
+- **血條到期（TTL）**：絕對上限 180 天硬刪除；軟性展期永不超過絕對上限。到期前於頻道公告「{反派} 的血條資料已到期清除」。
+- **同 battle_id 內重新校準**：不可（凍結粒度 = battle_id）；新章節再登場 = 新 battle_id，由 `retreat_snapshot_ticks` 續接。
+- **玩家意圖（留手）與威力**：玩家意圖只影響**要不要留手**（沿用 6.3 留手規則，碾壓→壓制降級），**不影響威力與扣血公式**；意圖寫入 log 供追溯，不進 BP 計算。
 
 ---
 
@@ -818,6 +943,15 @@ Phase B — 數學計算（第 2 次 API 調用）
 - collide_action.py 樓層 Action Log 記錄（`action_type = clash` 填 battle_id）
 - **成長溯源**：`/grow` 依 clash 紀錄將 `battle_id` 填入 `collide_growth_log` / `collide_ability_usage`；`/clash undo` 自動列出該 battle_id 關聯的成長清單
 - `/clash log` 查看 + 管理頁面人工修正
+
+### M3c — Clash 血條系統（v2 多打一）
+- collide_engine.py：`verdict_to_delta` 純函數（r = Atk_BP / Villain_Guard；碾壓 20 ticks / 壓制 10 / chip 2 / 無效 0）+ 多路聚合 + chip 截斷 + 剩餘血量截斷；常數 `TICKS_PER_B = 10`、`CHIP_TICKS = 2`（無硬編碼數字）
+- collide_db.py：`collide_clash_battles` / `collide_clash_nodes` 表 + `make_db_lookup` 支援 villain guard 純計算；`event_id` + `(battle_id, node_id)` 去重；擊退快照；pending 綁定節點
+- collide_pipeline.py：Phase A 產出 `combat.events[]` 提案 → Ledger 驗證寫入（雙軌制）
+- collide_parser.py / extract_clash_prompt.md：反派註冊模板（guard、max_hp_ticks、cap_ticks）；自動偵測路徑 `dynamic_difficulty = 0` 門檻
+- collide_engine.py：`format_clash_hp_bar` 訊息文字血條進度條（**runtime 入口**，逐字元編碼安全 fallback）+ `clash_outcome_label`
+- collide_ui.py：`render_clash_bar` UI 委派包裝（後台／測試用，委派至 engine）
+- 測試：chip 擊退線（Boss 240/48：滿血到擊退線 = 96 節點、累積 192 ticks、永不低於 48）；chip 無法擊殺、只在擊退線觸底
 
 ### M4 — 公開與文件
 - `/clash rule` 查看規範

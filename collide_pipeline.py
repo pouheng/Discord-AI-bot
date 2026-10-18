@@ -10,27 +10,37 @@ Phase C：文風輸出（確認後，依文風規則生成對撞文本）
 
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from llm_models import chat_create, has_credentials
 
 from collide_engine import (
+    CLASH_OUTCOME_ACTIVE,
+    CLASH_TIER_SPECS,
     VERDICT_DECISIVE,
     VERDICT_FUSION,
     VERDICT_SUPPRESS,
+    _hidden_of,
     apply_effects,
+    clash_outcome_label,
     compute_atk_bp,
     compute_domain_bp,
     compute_manamelee_bp,
     compute_melee_bp,
+    compute_villain_guard,
     decide_with_domain,
     domain_fusion_effects,
     domain_mod,
     element_mod,
+    format_clash_hp_bar,
     hidden_score,
+    resolve_clash_node,
+    retreat_floor_ticks,
 )
 from collide_rules import (
     CLASH_EFFECT_SYSTEM,
@@ -39,14 +49,10 @@ from collide_rules import (
     CLASH_PHASE_C_SYSTEM,
     RANGE_MOD_SYSTEM,
 )
+import collide_db
 
 load_dotenv()
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-_client = (
-    AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
-    if DEEPSEEK_API_KEY
-    else None
-)
+# 客戶端改由 llm_models.get_client() 依來源即時提供（見下方呼叫點）。
 
 # db_lookup: async (char_name, table) -> row dict or None
 DbLookup = Callable[[str, str], Awaitable[Optional[dict]]]
@@ -64,15 +70,15 @@ async def _call_llm(
     max_tokens: int = 6000,
     label: str = "",
 ) -> str:
-    if not _client:
+    if not has_credentials():
         raise ClashError("AI 服務未啟用，請檢查 DEEPSEEK_API_KEY 設定")
     # deepseek-v4-flash 為 reasoning 型，reasoning_content 吃 token 預算，
     # 若 content 為空（預算被推論吃光）則放大預算重試，最多 3 次。
     last = ""
     for attempt in range(3):
         budget = min(max_tokens * (2 ** attempt), 32000)
-        resp = await _client.chat.completions.create(
-            model="deepseek-v4-flash",
+        resp = await chat_create(
+            "collide",
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -400,6 +406,133 @@ def _effects_by_char(phase_a: dict, effects_by_side: dict, atk_actor: dict, def_
     return out
 
 
+def compute_actor_bp(
+    actor: dict,
+    skill: dict,
+    status_m: float,
+    form_m: float,
+    variant_m: float,
+    ambush_m: float,
+    elem_m: float,
+) -> dict:
+    """單一角色最終 BP。與 compute_sides 同公式，供多打一逐人計算。"""
+    from collide_engine import weapon_base as _wb
+    weapon_cat = actor.get("weapon_category") or "bare"
+    weapon_override = actor.get("weapon_base")
+    weapon = _wb(weapon_cat, weapon_override)
+    range_m = float(actor.get("range_mod") or 1.0)
+    exp = int(actor.get("exp") or 0)
+    _base = {
+        "exp_mod": round(1.0 + exp / 500.0, 3),
+        "status_mod": status_m,
+        "form_mod": form_m,
+        "variant_mod": variant_m,
+        "range_mod": range_m,
+        "ambush_mod": ambush_m,
+    }
+    if actor.get("action_type") == "domain":
+        dom = actor.get("domain") or {}
+        domain_m = float(dom.get("_domain_mod") or 1.0)
+        precision = float(dom.get("precision") or 1.0)
+        int_h = _stat_hidden(actor, "智力")
+        bp = compute_domain_bp(
+            precision,
+            int_h,
+            exp,
+            domain_m=domain_m,
+            status_m=status_m,
+            form_m=form_m,
+            variant_m=variant_m,
+            range_m=range_m,
+            ambush_m=ambush_m,
+        )
+        name = dom.get("name") or actor.get("skill")
+        return {
+            "char": actor.get("name"), "skill": name, "bp": bp, "kind": "domain",
+            "domain_mod": domain_m, "precision": precision,
+            "breakdown": {
+                **_base, "stat_hidden": int_h,
+                "domain_mod": domain_m, "precision": precision,
+            },
+        }
+    str_h = _stat_hidden(actor, "力量")
+    if actor.get("action_type") == "melee" or not skill or skill.get("kind") == "melee":
+        bp = compute_melee_bp(
+            weapon,
+            str_h,
+            int(actor.get("martial") or 0),
+            exp,
+            domain_m=float(actor.get("domain_mod") or 1.0),
+            status_m=status_m,
+            form_m=form_m,
+            variant_m=variant_m,
+            range_m=range_m,
+            ambush_m=ambush_m,
+        )
+        return {
+            "char": actor.get("name"), "skill": skill.get("name") if skill else "普通攻擊",
+            "bp": bp, "kind": "melee", "element": "",
+            "breakdown": {
+                **_base, "weapon_base": weapon, "str_hidden": str_h,
+                "martial": int(actor.get("martial") or 0),
+            },
+        }
+    elif skill.get("kind") == "manamelee":
+        int_h = _stat_hidden(actor, "智力")
+        bp = compute_manamelee_bp(
+            weapon,
+            str_h,
+            int_h,
+            float(skill.get("mp_invested") or 0.0),
+            int(actor.get("martial") or 0),
+            exp,
+            element_m=elem_m,
+            proficiency_m=float(skill.get("proficiency_mod") or 1.0),
+            status_m=status_m,
+            form_m=form_m,
+            variant_m=variant_m,
+            range_m=range_m,
+            ambush_m=ambush_m,
+        )
+        return {
+            "char": actor.get("name"), "skill": skill.get("name"), "bp": bp,
+            "kind": "manamelee", "element": str(skill.get("element") or "").strip(),
+            "breakdown": {
+                **_base, "weapon_base": weapon, "str_hidden": str_h,
+                "int_hidden": int_h, "mp_invested": float(skill.get("mp_invested") or 0.0),
+                "element_mod": elem_m,
+                "proficiency_mod": float(skill.get("proficiency_mod") or 1.0),
+                "martial": int(actor.get("martial") or 0),
+            },
+        }
+    else:
+        int_h = _stat_hidden(actor, "智力")
+        bp = compute_atk_bp(
+            float(skill.get("power_base") or 1.0),
+            int_h,
+            exp,
+            element_m=elem_m,
+            domain_m=float(actor.get("domain_mod") or 1.0),
+            proficiency_m=float(skill.get("proficiency_mod") or 1.0),
+            status_m=status_m,
+            form_m=form_m,
+            variant_m=variant_m,
+            range_m=range_m,
+            ambush_m=ambush_m,
+        )
+        return {
+            "char": actor.get("name"), "skill": skill.get("name"), "bp": bp,
+            "kind": "magic", "element": str(skill.get("element") or "").strip(),
+            "breakdown": {
+                **_base, "skill_base": float(skill.get("power_base") or 1.0),
+                "stat_hidden": int_h,
+                "element_mod": elem_m,
+                "domain_mod": float(actor.get("domain_mod") or 1.0),
+                "proficiency_mod": float(skill.get("proficiency_mod") or 1.0),
+            },
+        }
+
+
 def compute_sides(
     atk: dict,
     def_: dict,
@@ -434,121 +567,9 @@ def compute_sides(
         ambush_m: float,
         elem_m: float,
     ) -> dict:
-        from collide_engine import weapon_base as _wb
-        weapon_cat = actor.get("weapon_category") or "bare"
-        weapon_override = actor.get("weapon_base")
-        weapon = _wb(weapon_cat, weapon_override)
-        range_m = float(actor.get("range_mod") or 1.0)
-        exp = int(actor.get("exp") or 0)
-        _base = {
-            "exp_mod": round(1.0 + exp / 500.0, 3),
-            "status_mod": status_m,
-            "form_mod": form_m,
-            "variant_mod": variant_m,
-            "range_mod": range_m,
-            "ambush_mod": ambush_m,
-        }
-        if actor.get("action_type") == "domain":
-            dom = actor.get("domain") or {}
-            domain_m = float(dom.get("_domain_mod") or 1.0)
-            precision = float(dom.get("precision") or 1.0)
-            int_h = _stat_hidden(actor, "智力")
-            bp = compute_domain_bp(
-                precision,
-                int_h,
-                exp,
-                domain_m=domain_m,
-                status_m=status_m,
-                form_m=form_m,
-                variant_m=variant_m,
-                range_m=range_m,
-                ambush_m=ambush_m,
-            )
-            name = dom.get("name") or actor.get("skill")
-            return {
-                "char": actor.get("name"), "skill": name, "bp": bp, "kind": "domain",
-                "domain_mod": domain_m, "precision": precision,
-                "breakdown": {
-                    **_base, "stat_hidden": int_h,
-                    "domain_mod": domain_m, "precision": precision,
-                },
-            }
-        str_h = _stat_hidden(actor, "力量")
-        if actor.get("action_type") == "melee" or not skill or skill.get("kind") == "melee":
-            bp = compute_melee_bp(
-                weapon,
-                str_h,
-                int(actor.get("martial") or 0),
-                exp,
-                domain_m=float(actor.get("domain_mod") or 1.0),
-                status_m=status_m,
-                form_m=form_m,
-                variant_m=variant_m,
-                range_m=range_m,
-                ambush_m=ambush_m,
-            )
-            return {
-                "char": actor.get("name"), "skill": skill.get("name") if skill else "普通攻擊",
-                "bp": bp, "kind": "melee", "element": "",
-                "breakdown": {
-                    **_base, "weapon_base": weapon, "str_hidden": str_h,
-                    "martial": int(actor.get("martial") or 0),
-                },
-            }
-        elif skill.get("kind") == "manamelee":
-            int_h = _stat_hidden(actor, "智力")
-            bp = compute_manamelee_bp(
-                weapon,
-                str_h,
-                int_h,
-                float(skill.get("mp_invested") or 0.0),
-                int(actor.get("martial") or 0),
-                exp,
-                element_m=elem_m,
-                proficiency_m=float(skill.get("proficiency_mod") or 1.0),
-                status_m=status_m,
-                form_m=form_m,
-                variant_m=variant_m,
-                range_m=range_m,
-                ambush_m=ambush_m,
-            )
-            return {
-                "char": actor.get("name"), "skill": skill.get("name"), "bp": bp,
-                "kind": "manamelee", "element": str(skill.get("element") or "").strip(),
-                "breakdown": {
-                    **_base, "weapon_base": weapon, "str_hidden": str_h,
-                    "int_hidden": int_h, "mp_invested": float(skill.get("mp_invested") or 0.0),
-                    "element_mod": elem_m,
-                    "proficiency_mod": float(skill.get("proficiency_mod") or 1.0),
-                    "martial": int(actor.get("martial") or 0),
-                },
-            }
-        else:
-            int_h = _stat_hidden(actor, "智力")
-            bp = compute_atk_bp(
-                float(skill.get("power_base") or 1.0),
-                int_h,
-                exp,
-                element_m=elem_m,
-                domain_m=float(actor.get("domain_mod") or 1.0),
-                proficiency_m=float(skill.get("proficiency_mod") or 1.0),
-                status_m=status_m,
-                form_m=form_m,
-                variant_m=variant_m,
-                range_m=range_m,
-                ambush_m=ambush_m,
-            )
-            return {
-                "char": actor.get("name"), "skill": skill.get("name"), "bp": bp,
-                "kind": "magic", "element": str(skill.get("element") or "").strip(),
-                "breakdown": {
-                    **_base, "skill_base": float(skill.get("power_base") or 1.0),
-                    "stat_hidden": int_h,
-                    "element_mod": elem_m,
-                    "domain_mod": float(actor.get("domain_mod") or 1.0),
-                    "proficiency_mod": float(skill.get("proficiency_mod") or 1.0),
-                },
-            }
+        return compute_actor_bp(
+            actor, skill, status_m, form_m, variant_m, ambush_m, elem_m
+        )
 
     a = _one(atk, a_skill, status_a, form_a, variant_a, ambush_a, a_elem_m)
     d = _one(def_, d_skill, status_d, form_d, variant_d, ambush_d, d_elem_m)
@@ -767,18 +788,296 @@ async def phase_c(computation: dict, style_rules: str) -> str:
 
 # ── 主流程 ─────────────────────────────────────────────────
 
-async def run_clash(history: str, style_rules: str, db_lookup: Optional[DbLookup] = None) -> dict:
+# ── 主流程 ─────────────────────────────────────────────────
+
+def _new_clash_battle_id(conn) -> str:
+    """產生唯一 battle_id（與 collide_parser 同款）：clash-<時間戳>-<亂數>。"""
+    import uuid
+
+    for _ in range(5):
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        bid = f"clash-{ts}-{uuid.uuid4().hex[:6]}"
+        if not collide_db.get_clash_battle(conn, bid):
+            return bid
+    return f"clash-{uuid.uuid4().hex[:12]}"
+
+
+def _new_clash_node_id() -> str:
+    """草稿期固定節點識別：同一草稿重複確認 → 同 node_id → Ledger 複合唯一鍵擋下。"""
+    import uuid
+
+    return f"d{uuid.uuid4().hex[:8]}"
+
+
+def _clash_reason_line(
+    bar: str,
+    *,
+    total_delta: int,
+    chip: bool,
+    at_retreat_floor: bool,
+    outcome: str,
+    villain: str,
+) -> str:
+    """血條 + 一行理由（spec 5.6.4 / 6.5）：終局用 outcome 標註，進行中依節點 delta。"""
+    label = clash_outcome_label(outcome, villain)
+    if not label:
+        if total_delta > 0:
+            kind = "全員僵持 chip" if chip else "破防"
+            label = f"{kind} -{total_delta} ticks"
+        else:
+            label = "未造成有效傷害"
+        if at_retreat_floor:
+            label += "（已達擊退線，可宣告擊退）"
+    return f"{bar} {label}".strip()
+
+
+async def _find_clash_villain(a: dict, db_lookup: Optional[DbLookup]) -> dict | None:
+    """從 Phase A 候選找出登記反派（is_villain）。反派置於 defender_candidate
+    （兼容 villain_candidate）；回傳其角色列（含 id）或 None。"""
+    for cand in (a.get("villain_candidate"), a.get("defender_candidate"), a.get("attacker_candidate")):
+        if not isinstance(cand, dict):
+            continue
+        name = str(cand.get("char") or "").strip()
+        if not name:
+            continue
+        ch = await db_lookup(name, "character") or {}
+        if ch.get("is_villain"):
+            return {**ch, "name": ch.get("name") or name}
+    return None
+
+
+async def _resolve_combatant_bp(combatant: dict, db_lookup: Optional[DbLookup]) -> dict | None:
+    """單一玩家 combatant → 最終 BP（沿用 compute_actor_bp 同公式；供多打一）。
+
+    多打一 v1：逐玩家各自解析招式（已登記或 Phase A 估算）與角色列 → BP；
+    未提供之狀態/型態/變體/距離修正視為中性 1.0（Phase A 可選擇性覆寫）。
+    """
+    if not isinstance(combatant, dict):
+        return None
+    name = str(combatant.get("char") or "").strip()
+    if not name:
+        return None
+    # 契約：combatant = {"char", "action": {"skill", "action_type", "holding_back", ...}}
+    # 兼容扁平的 {"char", "skill", "action_type"} 形式。
+    action = combatant.get("action")
+    action_d = action if isinstance(action, dict) else {}
+    skill_name = combatant.get("skill") or action_d.get("skill") or ""
+    action_type = combatant.get("action_type") or action_d.get("action_type") or "skill"
+    ch = await db_lookup(name, "character") or {}
+    actor = {
+        "char": name,
+        "name": ch.get("name") or name,
+        "skill": skill_name,
+        "action_type": action_type,
+        **ch,
+    }
+    for k in ("status_mod", "form_mod", "variant_mod", "range_mod", "domain_mod"):
+        if combatant.get(k) is not None:
+            actor[k] = combatant[k]
+    actor = await _resolve_skill_or_domain(actor, db_lookup)
+    skill = actor.get("skill_data") or {}
+    elem = str(skill.get("element") or "").strip()
+    opp = str(combatant.get("opponent_element") or "").strip()
+    elem_m = element_mod(elem, opp) if (elem and opp) else 1.0
+    res = compute_actor_bp(
+        actor,
+        skill,
+        float(actor.get("status_mod") or 1.0),
+        float(actor.get("form_mod") or 1.0),
+        float(actor.get("variant_mod") or 1.0),
+        float(combatant.get("ambush_mod") or 1.0),
+        elem_m,
+    )
+    return {
+        "char": str(res.get("char") or name),
+        "bp": float(res.get("bp") or 0.0),
+        "kind": res.get("kind"),
+        "skill": res.get("skill"),
+        "holding_back": bool(combatant.get("holding_back") or action_d.get("holding_back")),
+    }
+
+
+async def _settle_clash_after_phase_b(
+    a: dict, b: dict, conn, db_lookup: Optional[DbLookup]
+) -> dict | None:
+    """Clash v2 結算投影（A3 運行時接線）：Phase B 後偵測反派並計算血條扣減。
+
+    反派 = 登記反派（is_villain，優先 Phase A defender_candidate）。玩家 BP：
+    **多打一優先**——Phase A 的 `combatants`（有序，僅玩家本人貼出的行動）逐人
+    解析後各自算 BP，N 個一次送進 resolve_clash_node（引擎聚合）；無 combatants
+    時退回單挑（Phase B 非反派側）。留手**逐玩家**各自宣告（不再有單一贏方假設）。
+
+    找 active battle（無則依 parser 同款前例自動建立：guard = 體質隱藏 ×
+    Domain_Mod 純計算、dynamic_difficulty=0、tier 依角色檔或預設「重點」）。
+
+    本函式**不寫 Ledger**——只在草稿期回傳投影（hp_bar / reason_line 與
+    player_bps 等 commit 所需資料）；實際原子寫入由確認端
+    collide_cmds._commit_clash_settlement 執行，重試/取消草稿不會重複扣血。
+    無反派對撞回 None。
+    """
+    if conn is None or db_lookup is None:
+        return None
+
+    villain_row = await _find_clash_villain(a, db_lookup)
+    if villain_row is None:
+        # 容錯：候選未標 is_villain 時，退回掃描 Phase B 兩側
+        comp0 = b.get("computation") or {}
+        for side in (comp0.get("attacker") or {}, comp0.get("defender") or {}):
+            nm = str(side.get("char") or "").strip()
+            if not nm:
+                continue
+            ch = await db_lookup(nm, "character") or {}
+            if ch.get("is_villain"):
+                villain_row = {**ch, "name": ch.get("name") or nm}
+                break
+    if villain_row is None:
+        return None
+    v_id = villain_row.get("id")
+    if v_id is None:
+        return None
+
+    villain_name = str(villain_row.get("name") or "")
+
+    # 玩家 BP：多打一優先（Phase A combatants，逐玩家各自宣告留手）；
+    # 否則退回單挑（Phase B 非反派側，沿用舊行為）。
+    player_entries = []
+    combatants = a.get("combatants")
+    has_combatants = isinstance(combatants, list) and bool(combatants)
+    if has_combatants:
+        for c in combatants:
+            # 防 Phase A 目標混入：必須明確指向本節點反派；缺欄位也不能猜測歸屬。
+            tgt = str((c or {}).get("target") or "").strip()
+            if not tgt or not villain_name or tgt != villain_name:
+                continue
+            entry = await _resolve_combatant_bp(c, db_lookup)
+            if entry:
+                player_entries.append(entry)
+    if not has_combatants:
+        winner = str(b.get("attacker") or "")
+        overall_hb = bool(b.get("holding_back"))
+        comp = b.get("computation") or {}
+        for side in (comp.get("attacker") or {}, comp.get("defender") or {}):
+            nm = str(side.get("char") or "").strip()
+            if not nm:
+                continue
+            ch = await db_lookup(nm, "character") or {}
+            if ch.get("is_villain"):
+                continue
+            player_entries.append({
+                "char": str(ch.get("name") or nm),
+                "bp": float(side.get("bp") or 0.0),
+                "holding_back": overall_hb if nm == winner else False,
+            })
+
+    if not player_entries:
+        if not has_combatants:
+            return None
+        # 有 combatants 卻無一筆對上本節點反派 → **出聲**：回傳可見 warning，
+        # 絕不靜默、也絕不退回單挑（那會把傷害扣在錯的規則／對象上）。
+        warning = (
+            f"⚠️ 多打一參與者無法對應本節點反派「{villain_name or '（未知）'}」"
+            "（Phase A 可能未吐 target、或目標不符）；本節點未產生血條、未扣血。"
+        )
+        log_warning = warning.encode("ascii", "backslashreplace").decode("ascii")
+        logging.getLogger("collide.pipeline").warning(log_warning)
+        return {
+            "warning": warning,
+            "aggressors": [],
+            "player_bps": [],
+            "villain": villain_name,
+        }
+
+    battle = collide_db.find_active_clash_for_villain(conn, v_id)
+    if battle is None:
+        v_name = villain_name or "反派"
+        guard = compute_villain_guard(
+            _hidden_of(villain_row, "體質"), float(villain_row.get("domain_mod") or 1.0)
+        )
+        tier = str(villain_row.get("tier") or villain_row.get("clash_tier") or "重點").strip()
+        spec = CLASH_TIER_SPECS.get(tier, CLASH_TIER_SPECS["重點"])
+        battle = collide_db.create_clash_battle(
+            conn,
+            battle_id=_new_clash_battle_id(conn),
+            villain_id=int(v_id),
+            villain_name=v_name,
+            tier=tier,
+            max_hp_ticks=int(spec["max_hp_ticks"]),
+            cap_ticks=int(spec["cap_ticks"]),
+            guard_value=guard,
+            retreat_floor_ticks=retreat_floor_ticks(int(spec["max_hp_ticks"])),
+            source="auto_detect",
+            dynamic_difficulty=0,
+        )
+
+    player_bps = [e["bp"] for e in player_entries]
+    holding_back = [bool(e.get("holding_back")) for e in player_entries]
+    aggressors = [e["char"] for e in player_entries]
+
+    settled = resolve_clash_node(
+        player_bps,
+        float(battle["guard_value"]),
+        cap_ticks=int(battle["cap_ticks"]),
+        current_hp_ticks=int(battle["current_hp_ticks"]),
+        retreat_floor=int(battle["retreat_floor_ticks"]),
+        holding_back=holding_back,
+    )
+    bar = format_clash_hp_bar(
+        int(settled["new_hp_ticks"]), int(battle["max_hp_ticks"])
+    )
+    vname = str(battle.get("villain_name") or villain_row.get("name") or "反派")
+    ostate = str(battle.get("outcome") or CLASH_OUTCOME_ACTIVE)
+    return {
+        "battle_id": battle["battle_id"],
+        "node_id": _new_clash_node_id(),
+        "villain": vname,
+        "tier": battle.get("tier", ""),
+        "player_bps": player_bps,
+        "holding_back": holding_back,
+        "aggressors": aggressors,
+        "guard_value": float(battle["guard_value"]),
+        "cap_ticks": int(battle["cap_ticks"]),
+        "retreat_floor_ticks": int(battle["retreat_floor_ticks"]),
+        "verdicts": settled["verdicts"],
+        "total_delta": int(settled["total_delta"]),
+        "chip": bool(settled["chip"]),
+        "at_retreat_floor": bool(settled["at_retreat_floor"]),
+        "hp_bar": bar,
+        "reason_line": _clash_reason_line(
+            bar,
+            total_delta=int(settled["total_delta"]),
+            chip=bool(settled["chip"]),
+            at_retreat_floor=bool(settled["at_retreat_floor"]),
+            outcome=ostate,
+            villain=vname,
+        ),
+    }
+
+
+async def run_clash(
+    history: str,
+    style_rules: str,
+    db_lookup: Optional[DbLookup] = None,
+    *,
+    conn=None,
+) -> dict:
     """完整對撞流程：Phase A → B → C。回傳含計算與最終文本的 dict。
 
     若 Phase A 判斷雙方皆為非對抗性動作（no_clash），直接回報「無對撞發生」，
     不進入計算與文風輸出。
+
+    conn 提供時，Phase B 後自動執行 Clash v2 結算投影（偵測反派 → 血條扣減
+    計算，見 _settle_clash_after_phase_b），結果掛在回傳 dict 的 "clash"；
+    實際 Ledger 寫入於草稿確認時由 collide_cmds 執行。
     """
     a = await phase_a(history, db_lookup)
     if a.get("no_clash"):
         return {"phase_a": a, "phase_b": None, "phase_c": "無對撞發生", "no_clash": True}
     b = await phase_b(a, db_lookup)
-    text = await phase_c(b, style_rules)
-    return {"phase_a": a, "phase_b": b, "phase_c": text}
+    result = {"phase_a": a, "phase_b": b}
+    if conn is not None:
+        result["clash"] = await _settle_clash_after_phase_b(a, b, conn, db_lookup)
+    result["phase_c"] = await phase_c(b, style_rules)
+    return result
 
 
 def _json_or_raise(raw: str, phase: str) -> dict:

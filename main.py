@@ -28,6 +28,8 @@ from profiles import (
 )
 from prompts import build_style_block, build_banned_str, build_expr_str, build_safety_str
 import image_reader
+from llm_models import get_model, get_client
+import llm_models
 
 # Windows 主控台 cp950 印不出 UTF-8 特殊字元（emoji/罕用字）會讓 print() 拋
 # UnicodeEncodeError，進而炸掉整個訊息處理（「陷入沉思」fallback）。
@@ -222,12 +224,14 @@ async def load_prompt_config() -> dict:
     return _prompt_config_cache
 
 
-# 初始化 DeepSeek 客戶端（60 秒 timeout，避免 Phase 3 等太久）
-client = AsyncOpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com/v1",
-    timeout=60.0,
-)
+# 單次 LLM 呼叫的硬性上限。供應商偶爾會「收下請求卻不回內容」
+# （串流只吐 : keep-alive），此時 httpx 的讀取逾時不會觸發、await 會永遠卡住。
+# 用 asyncio.wait_for 包住當最後一道牆，逾時視為暫時性錯誤重試。
+LLM_CALL_TIMEOUT = 60.0
+
+# 客戶端交給 llm_models 管理（來源 base_url/key 可由 Manager 即時調整）。
+# 保留一個全域 client 供相容/外部引用；實際呼叫點用 get_client() 取最新來源。
+client = get_client(timeout=LLM_CALL_TIMEOUT, max_retries=0)
 
 
 # ──────────────────────────────────────────────
@@ -285,17 +289,24 @@ def _llm_debug_log(record: dict) -> None:
         pass
 
 
-async def _llm_create_with_retry(call_kwargs: dict, *, label: str, retries: int = 4):
-    """呼叫 API；429／逾時／連線這類暫時性錯誤做退避重試。
+async def _llm_create_with_retry(call_kwargs: dict, *, label: str, retries: int = 4,
+                                 slot: str = "default"):
+    """呼叫 API；暫時性錯誤（429／5xx／逾時／連線）做退避重試。
 
-    401、400 這類永久錯誤不重試，原樣拋給呼叫端。
+    重試用盡、或遇到永久錯誤（4xx）→ 一律退回預設 DeepSeek
+    （來源：DEFAULT_BASE_URL + .env key；模型：該 slot 的預設 ID）一次。
     """
     import openai as _oa
 
     last_exc: Exception | None = None
     for attempt in range(retries):
         try:
-            return await client.chat.completions.create(**call_kwargs)
+            # 硬性逾時：供應商收下請求卻不回內容時（keep-alive 讓讀取逾時失效），
+            # 這是最後一道牆，避免整個訊息處理卡死。
+            return await asyncio.wait_for(
+                get_client(timeout=LLM_CALL_TIMEOUT, max_retries=0).chat.completions.create(**call_kwargs),
+                timeout=LLM_CALL_TIMEOUT,
+            )
         except _oa.RateLimitError as e:
             last_exc = e
             wait = 2.0 * (attempt + 1)
@@ -303,19 +314,48 @@ async def _llm_create_with_retry(call_kwargs: dict, *, label: str, retries: int 
                             "detail": str(e)[:300]})
             print(f"[LLM] {label} 429 限流，{wait:.0f}s 後重試")
             await asyncio.sleep(wait)
-        except (_oa.APITimeoutError, _oa.APIConnectionError) as e:
+        except _oa.InternalServerError as e:
+            # 5xx（含閘道 no_healthy_account 這類上游暫時不可用）→ 退避重試
+            last_exc = e
+            wait = 2.0 * (attempt + 1)
+            _llm_debug_log({"event": "server_error", "label": label, "attempt": attempt,
+                            "status": getattr(e, "status_code", None), "detail": str(e)[:300]})
+            print(f"[LLM] {label} 5xx（{getattr(e, 'status_code', None)}），{wait:.0f}s 後重試")
+            await asyncio.sleep(wait)
+        except (asyncio.TimeoutError, _oa.APITimeoutError, _oa.APIConnectionError) as e:
             last_exc = e
             wait = 1.5 * (attempt + 1)
             _llm_debug_log({"event": "transient", "label": label, "attempt": attempt,
                             "type": type(e).__name__, "detail": str(e)[:300]})
             print(f"[LLM] {label} {type(e).__name__}，{wait:.0f}s 後重試")
             await asyncio.sleep(wait)
-    raise last_exc
+        except Exception as e:
+            # 永久錯誤（400/404 等）不重試，直接進回退
+            last_exc = e
+            _llm_debug_log({"event": "permanent_error", "label": label,
+                            "type": type(e).__name__, "detail": str(e)[:300]})
+            break
+
+    # ── 回退：任何錯誤都退回預設 DeepSeek（來源 + 該 slot 的預設模型）一次 ──
+    fb_model = llm_models.fallback_model(slot)
+    if llm_models.is_default_source() and call_kwargs.get("model") == fb_model:
+        raise last_exc  # 本來就是預設，回退同一組沒有意義
+    fb_kwargs = dict(call_kwargs)
+    fb_kwargs["model"] = fb_model
+    try:
+        _llm_debug_log({"event": "fallback", "label": label, "model": fb_model})
+        print(f"[LLM] {label} 回退預設模型 {fb_model}")
+        return await asyncio.wait_for(
+            llm_models.get_fallback_client(timeout=LLM_CALL_TIMEOUT).chat.completions.create(**fb_kwargs),
+            timeout=LLM_CALL_TIMEOUT,
+        )
+    except Exception:
+        raise last_exc
 
 
 async def call_llm(effort: str, messages: list, *, temperature=None,
                    max_tokens=None, response_format=None, model=None, label: str = "",
-                   empty_retries: int = 1):
+                   empty_retries: int = 1, slot: str = "default"):
     """統一呼叫 DeepSeek，帶入思考強度設定。
 
     全專案只有這裡碰 reasoning_effort / thinking，避免各呼叫點各自為政。
@@ -330,7 +370,8 @@ async def call_llm(effort: str, messages: list, *, temperature=None,
       - 每筆呼叫與例外都記錄到 llm_call_debug.jsonl
       - 空正文若已把預算頂到 32000 且開著思考，最後一次關閉思考硬擠出正文
     """
-    kwargs = {"model": model or DEEPSEEK_MODEL, "messages": messages}
+    model = model or get_model("default")
+    kwargs = {"model": model, "messages": messages}
     if temperature is not None:
         kwargs["temperature"] = temperature
     if response_format is not None:
@@ -342,7 +383,7 @@ async def call_llm(effort: str, messages: list, *, temperature=None,
     total_chars = sum(len(str(m.get("content") or "")) for m in messages)
     base_record = {
         "event": "call", "label": label, "effort": effort,
-        "model": model or DEEPSEEK_MODEL, "n_msgs": len(messages),
+        "model": model, "n_msgs": len(messages),
         "total_chars": total_chars, "max_tokens": max_tokens,
     }
     for attempt in range(empty_retries + 1):
@@ -350,7 +391,7 @@ async def call_llm(effort: str, messages: list, *, temperature=None,
         if budget is not None:
             call_kwargs["max_tokens"] = budget
         try:
-            resp = await _llm_create_with_retry(call_kwargs, label=label)
+            resp = await _llm_create_with_retry(call_kwargs, label=label, slot=slot)
         except Exception as e:
             _llm_debug_log(dict(base_record, event="exception", attempt=attempt,
                                 type=type(e).__name__, detail=str(e)[:300]))
@@ -394,7 +435,7 @@ async def call_llm(effort: str, messages: list, *, temperature=None,
             print(f"[LLM] {label} 正文仍為空，關閉思考最後一搏")
             base_record["event"] = "last_resort_thinking_off"
             try:
-                resp = await _llm_create_with_retry(off_kwargs, label=label)
+                resp = await _llm_create_with_retry(off_kwargs, label=label, slot=slot)
                 choice = resp.choices[0] if resp.choices else None
                 off_content = (choice.message.content or "").strip() if choice else ""
                 _llm_debug_log(dict(base_record, content_len=len(off_content),
@@ -1464,7 +1505,8 @@ async def maintain_self_memories():
                 ],
                 temperature=0.2, max_tokens=8000,
                 response_format={"type": "json_object"},
-                label="maintain",
+                model=get_model("maintenance"),
+                label="maintain", slot="maintenance",
             )
             raw = resp.choices[0].message.content or '{"actions":[]}'
 
@@ -1947,10 +1989,10 @@ async def phase3_process(
 
     temps = [0.3, 0.4, 0.5]
     models = [
-        "deepseek-v4-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
+        get_model("maintenance"),
+        get_model("maintenance"),
+        get_model("maintenance"),
+        get_model("default"),
     ]
     for attempt in range(4):
         if attempt > 0:
@@ -1964,6 +2006,7 @@ async def phase3_process(
                     {"role": "user", "content": detect_prompt},
                 ],
                 temperature=temp, max_tokens=8000, model=model, label="phase3_detect",
+                slot="maintenance",
             )
         except Exception as e:
             log_lines.append(f"  [檢測API失敗] attempt={attempt + 1} {model} {e}")
@@ -3073,12 +3116,15 @@ async def on_ready():
     await tarot.ensure_images()
 
 
-def format_supplement(supplement) -> str:
+def format_supplement(supplement, include_notes: bool = True) -> str:
     """將 Phase 1 輸出的 supplement 轉為可讀文字，注入 Phase 2/3 prompt。
 
     支援兩種格式：
     - 新格式：JSON array [{"category","topic","content","note"?}, ...]
     - 舊格式：XML 字串 "<supplement>...</supplement>"（向後相容）
+
+    include_notes=False 時只輸出事實（content）；note 是 Phase 1 模型撰寫的
+    推測，與事實分開注入（見 format_supplement_notes），避免模型把推測當成對話事實。
     """
     if not supplement:
         return ""
@@ -3097,7 +3143,7 @@ def format_supplement(supplement) -> str:
                 continue
             prefix = f"- [{cat}] {topic}" if cat else f"- {topic}"
             lines.append(f"{prefix}：{content}")
-            if note:
+            if include_notes and note:
                 lines.append(f"  ※{note}")
         return "\n".join(lines)
 
@@ -3114,6 +3160,27 @@ def format_supplement(supplement) -> str:
         return text
 
     return ""
+
+
+def format_supplement_notes(supplement) -> str:
+    """抽出 Phase 1 supplement 的 note（模型的推測），供「非事實區塊」使用。
+
+    note 是模型對劇情的解讀與運用建議，可能出錯（例如把相鄰不同人的發言
+    併給同一人）。因此不與 content 混在一起，改注入獨立且明確標示為
+    「非對話事實」的區塊，Phase 2 不得將其當成「誰說了什麼」的事實引用。
+    """
+    if not isinstance(supplement, list):
+        return ""
+    lines = []
+    for entry in supplement:
+        if not isinstance(entry, dict):
+            continue
+        note = (entry.get("note") or "").strip()
+        if not note:
+            continue
+        topic = (entry.get("topic") or "").strip()
+        lines.append(f"- {topic}：{note}" if topic else f"- {note}")
+    return "\n".join(lines)
 
 
 def _phase1_is_usable(raw: str) -> bool:
@@ -3236,6 +3303,9 @@ async def run_phase1(
   {"category": "分類標籤", "topic": "主題名稱", "content": "條目完整內容", "note": "運用備註（可選）"}
   分類標籤必須與資料庫原文一致，例如：世界觀、角色能力、角色背景、事件、人物、場景與人物、劇情摘要、勢力、數值體系。
   note 為可選欄位，說明為什麼相關、Phase 2 該如何運用。
+  ⚠️ note 是「推測與建議」，不是事實。嚴禁在 note 裡複述或改寫對話內容、
+  嚴禁聲稱「某人（在本輪）說了什麼」——尤其不可把相鄰不同人的發言併給同一人。
+  note 只能描述「這條背景跟當下對話的關聯與可用之處」。
 
    supplement 中的條目可以來自世界觀、角色記憶、參與者資訊等。
    寧可多選，不可少選。至少 6 條。
@@ -3457,6 +3527,7 @@ async def build_phase2_system_prompt(
     self_memories: str,
     server_rules_text: str,
     quests_text: str = "",
+    lore_speculation: str = "",
 ) -> str:
     """建立 Phase 2 角色扮演系統提示詞
     注意：靜態規則（身份、文風、planning）在上方組裝，
@@ -3549,6 +3620,12 @@ async def build_phase2_system_prompt(
             phase2_system += f"""
 {lore_text}
 （以上是世界觀資料。當你們討論劇情時可以參考這些內容。）"""
+        if lore_speculation:
+            phase2_system += f"""
+
+【系統推測 — 非對話事實，不可當事實引用】
+{lore_speculation}
+（以上是系統對劇情的推測與運用建議，不是對話紀錄。⚠️ 嚴禁把這裡的內容當成「誰說了什麼」的事實：對話中每個人的發言歸屬，一律以實際對話紀錄為準；若此處與對話紀錄衝突，以對話紀錄為準。）"""
         _p2_alias_ooc = await format_person_alias_map()
         _ooc_blocks = []
         for _p in await _present_persons_from_memories(combined_memories):
@@ -3647,6 +3724,12 @@ async def build_phase2_system_prompt(
 {lore_text}
 
 （以上是世界觀資料。當對方要求你說明時，用自然的語氣轉述這些內容，但不要添加資料中沒有的細節。）"""
+        if lore_speculation:
+            phase2_system += f"""
+
+【系統推測 — 非對話事實，不可當事實引用】
+{lore_speculation}
+（以上是系統對劇情的推測與運用建議，不是對話紀錄。⚠️ 嚴禁把這裡的內容當成「誰說了什麼」的事實：對話中每個人的發言歸屬，一律以實際對話紀錄為準；若此處與對話紀錄衝突，以對話紀錄為準。）"""
         ic_self_profile = ""
         if char_name:
             ic_self_profile = await format_character_profile(char_name)
@@ -4229,24 +4312,28 @@ async def recall_mentioned_persons_memories(
     return "\n\n".join(blocks)
 
 
-async def assemble_lore_text(phase1_supplement, lore_topics: list, lore_notes: list) -> str:
-    """用 Phase 1 的 supplement 或降級為舊式組裝，回傳 lore_text。"""
+async def assemble_lore_text(phase1_supplement, lore_topics: list, lore_notes: list) -> tuple[str, str]:
+    """回傳 (lore_text, lore_speculation)。
+
+    lore_text：世界觀/背景事實（逐字取自 DB），注入 Phase 2 的事實區。
+    lore_speculation：Phase 1 模型撰寫的「運用建議」（推測），注入獨立的
+    非事實區塊。兩者分開，避免模型把推測當成「誰說了什麼」的事實引用。
+    """
     if isinstance(phase1_supplement, list):
-        text = format_supplement(phase1_supplement)
+        text = format_supplement(phase1_supplement, include_notes=False)
+        speculation = format_supplement_notes(phase1_supplement)
         if text:
             print(f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} 條）")
-            return text
+            return text, speculation
     elif phase1_supplement and phase1_supplement.strip():
         print(f"[Phase 1] 使用 AI 撰寫的 supplement（{len(phase1_supplement)} chars）")
-        return phase1_supplement
+        return phase1_supplement, ""
 
     lore_entries = await get_lore_by_topics(lore_topics)
     if lore_entries or lore_notes:
-        supplement_lines = ["<supplement>"]
-        if lore_entries:
-            supplement_lines.append("[條目]")
-            for e in lore_entries:
-                supplement_lines.append(f"- [{e['category']}] {e['topic']}：{e['content']}")
+        fact_lines = []
+        for e in lore_entries:
+            fact_lines.append(f"- [{e['category']}] {e['topic']}：{e['content']}")
         all_notes = []
         for n in lore_notes:
             if isinstance(n, str):
@@ -4262,14 +4349,9 @@ async def assemble_lore_text(phase1_supplement, lore_topics: list, lore_notes: l
                         all_notes.append(f"# [{topic}] {note_text}")
                     else:
                         all_notes.append(f"# {note_text}")
-        if all_notes:
-            supplement_lines.append("")
-            supplement_lines.append("[註釋]")
-            supplement_lines.extend(all_notes)
-        supplement_lines.append("</supplement>")
         print(f"[世界觀] 召回 {len(lore_entries)} 條, 註釋 {len(all_notes)} 條 (topics: {lore_topics})")
-        return "\n".join(supplement_lines)
-    return ""
+        return "\n".join(fact_lines), "\n".join(all_notes)
+    return "", ""
 
 
 async def log_recalled_data(resolved_ids: list, recall_candidates: list,
@@ -4288,10 +4370,15 @@ async def log_recalled_data(resolved_ids: list, recall_candidates: list,
     print(f"[DEBUG] 召回資料已寫入 {PROMPT_LOG_DIR}\\last_recalled_data.txt")
 
 
+def phase2_slot(channel_type: str, enable_ic_style: bool) -> str:
+    """IC，或 OOC 但被要求寫作（enable_ic_style）→ 劇情；其餘 OOC → 日常。"""
+    return "plot" if (channel_type == "in_character" or enable_ic_style) else "default"
+
+
 async def _call_phase2_with_retry(
-    phase2_messages: list, *, label: str = "Phase 2"
+    phase2_messages: list, *, label: str = "Phase 2", slot: str = "plot"
 ) -> str:
-    """呼叫 deepseek-v4-flash Phase 2；空內容時放大預算重試（最多 3 次）。
+    """呼叫 Phase 2 生成回覆；空內容時放大預算重試（最多 3 次）。
 
     API 例外、空 reply 的 finish reason 都會寫進 error_logs（管理器啟動時
     print 進黑洞，這是唯一能事後追查空回的管道）。
@@ -4302,7 +4389,8 @@ async def _call_phase2_with_retry(
         try:
             resp = await call_llm(
                 EFFORT_LOW, phase2_messages,
-                temperature=0.8, max_tokens=budget, label="phase2",
+                temperature=0.8, max_tokens=budget, model=get_model(slot),
+                label="phase2", slot=slot,
             )
         except Exception as e:
             print(f"[Phase 2] API 錯誤 attempt={attempt + 1}: {type(e).__name__}: {e}")
@@ -4350,7 +4438,8 @@ async def _call_phase2_with_retry(
                         {"role": "system", "content": minimal_system},
                         {"role": "user", "content": minimal_user[-1500:]},
                     ],
-                    temperature=0.8, max_tokens=2048, label="phase2_minimal",
+                    temperature=0.8, max_tokens=2048, model=get_model(slot),
+                    label="phase2_minimal", slot=slot,
                 )
                 content = (resp.choices[0].message.content or "").strip()
             except Exception as e:
@@ -4373,7 +4462,8 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
                                 enable_ic_style: bool, channel_context: str, channel_note: str,
                                 ic_context_text: str, combined_memories: str, lore_text: str,
                                 quests_text: str, all_context: list, clean_input_reply: str,
-                                tarot_drawn: dict | None, image_description: str = "") -> tuple[str, str, str]:
+                                tarot_drawn: dict | None, image_description: str = "",
+                                lore_speculation: str = "") -> tuple[str, str, str]:
     """建構 Phase 2 prompt、呼叫 API、寫入 debug log。回傳 (raw_content, phase2_char_name, current_user_name)。"""
     self_memories = await get_self_memory(limit=15)
     server_rules_text = ""
@@ -4383,7 +4473,7 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
     phase2_system = await build_phase2_system_prompt(
         channel_type, pcfg, enable_ic_style, channel_context, channel_note,
         ic_context_text, combined_memories, lore_text, self_memories,
-        server_rules_text, quests_text,
+        server_rules_text, quests_text, lore_speculation,
     )
 
     if channel_type == "in_character":
@@ -4457,7 +4547,10 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
         await f.write(f"\n\n=== PRIMING ===\n{priming_suffix}")
     print(f"[DEBUG] Phase 2 完整提示詞已寫入 {PROMPT_LOG_DIR}\\last_prompt.txt")
 
-    raw_content = await _call_phase2_with_retry(phase2_messages, label="Phase 2")
+    raw_content = await _call_phase2_with_retry(
+        phase2_messages, label="Phase 2",
+        slot=phase2_slot(channel_type, enable_ic_style),
+    )
     raw_content = autopilot.strip_japanese_original(raw_content)
     print(f"[LOG] [Phase 2] 回傳長度={len(raw_content)}")
     if not raw_content.strip():
@@ -4492,13 +4585,14 @@ async def run_phase2_direct(
     clean_input_reply: str,
     current_user_name: str,
     image_description: str = "",
+    lore_speculation: str = "",
 ) -> tuple[str, str, str]:
     """輕量版 Phase 2 呼叫：接受預建好的 context，不需要 discord.Message 物件。
     供 /readimg 等 slash command 使用。回傳 (raw_content, char_name, user_name)。"""
     phase2_system = await build_phase2_system_prompt(
         channel_type, pcfg, enable_ic_style, channel_context, channel_note,
         ic_context_text, combined_memories, lore_text, self_memories,
-        server_rules_text, quests_text,
+        server_rules_text, quests_text, lore_speculation,
     )
 
     phase2_messages = [{"role": "system", "content": phase2_system}]
@@ -4554,7 +4648,10 @@ async def run_phase2_direct(
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
         await f.write(f"\n\n=== PRIMING ===\n{priming_suffix}")
 
-    phase2_resp = await _call_phase2_with_retry(phase2_messages, label="Phase 2 direct")
+    phase2_resp = await _call_phase2_with_retry(
+        phase2_messages, label="Phase 2 direct",
+        slot=phase2_slot(channel_type, enable_ic_style),
+    )
     raw_content = phase2_resp or ""
     raw_content = autopilot.strip_japanese_original(raw_content)
     print(f"[LOG] [Phase 2 direct] 回傳長度={len(raw_content)}")
@@ -4844,7 +4941,9 @@ async def on_message(message: discord.Message):
                     if combined_memories else mentioned_mem
                 )
 
-            lore_text = await assemble_lore_text(phase1_supplement, lore_topics, lore_notes)
+            lore_text, lore_speculation = await assemble_lore_text(
+                phase1_supplement, lore_topics, lore_notes
+            )
 
             await log_recalled_data(resolved_ids, recall_candidates, combined_memories, lore_text)
 
@@ -4858,6 +4957,7 @@ async def on_message(message: discord.Message):
                 combined_memories=combined_memories, lore_text=lore_text,
                 quests_text=quests_text, all_context=all_context,
                 clean_input_reply=clean_input_reply, tarot_drawn=tarot_drawn,
+                lore_speculation=lore_speculation,
             )
 
             raw_content = await style_self_check(raw_content, channel_type, enable_ic_style, pcfg)
@@ -5056,7 +5156,7 @@ async def _flash_chat(
     for attempt in range(3):
         budget = min(max_tokens * (2 ** attempt), 32000)
         kwargs = {
-            "model": DEEPSEEK_MODEL,
+            "model": get_model("default"),
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -5068,7 +5168,7 @@ async def _flash_chat(
             kwargs["response_format"] = {"type": "json_object"}
         kwargs.update(llm_effort(effort))
         try:
-            resp = await client.chat.completions.create(**kwargs)
+            resp = await llm_models.chat_create("default", timeout=LLM_CALL_TIMEOUT, **kwargs)
         except Exception as e:
             print(f"[flash] API 錯誤 attempt={attempt + 1} budget={budget}: {type(e).__name__}: {e}")
             last = ""

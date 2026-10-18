@@ -19,6 +19,7 @@ import discord
 from discord import app_commands
 
 import collide_db
+import collide_engine
 import collide_growth
 import collide_parser
 import collide_pipeline
@@ -301,6 +302,10 @@ class ClashFinalConfirmView(discord.ui.View):
         conn = _conn()
         collide_db.update_battle_status(conn, self.battle_id, "active")
         battle = collide_db.get_battle(conn, self.battle_id)
+        clash_line = (
+            _commit_clash_settlement(conn, _parse_json_field(battle.get("clash_meta") or {}))
+            if battle else ""
+        )
         conn.close()
         await interaction.response.send_message(
             f"對撞紀錄 #{self.battle_id} 已確認（status=active）。文風輸出 Phase C 正在生成…",
@@ -319,6 +324,8 @@ class ClashFinalConfirmView(discord.ui.View):
             channel = interaction.client.get_channel(int(self.thread_id)) or interaction.channel
         except (TypeError, ValueError):
             channel = interaction.channel
+        if clash_line:
+            text = f"{text}\n\n──────────────\n{clash_line}"
         if channel and hasattr(channel, "send"):
             await channel.send(text)
         else:
@@ -664,7 +671,7 @@ async def _perform_clash(
         history = await _read_clash_history(channel)
         if supplement:
             history += f"\n（補充說明：{supplement}）"
-        result = await collide_pipeline.run_clash(history, _load_style_rules(), db_lookup)
+        result = await collide_pipeline.run_clash(history, _load_style_rules(), db_lookup, conn=conn)
     except collide_pipeline.ClashError as e:
         await interaction.followup.send(f"❌ 對撞失敗：{e}")
         conn.close()
@@ -693,6 +700,72 @@ def _parse_json_field(v):
     if isinstance(v, (dict, list)):
         return v
     return {}
+
+
+def _commit_clash_settlement(conn, clash_meta: dict) -> str:
+    """Clash v2：確認對撞時把草稿期的血條投影正式寫入 Ledger（原子，重放安全）。
+
+    回傳 commit 後的血條＋理由行；無 Clash 結算或重放（重複節點）回空字串。
+    """
+    if not isinstance(clash_meta, dict) or not clash_meta:
+        return ""
+    bid = str(clash_meta.get("battle_id") or "").strip()
+    if not bid:
+        return ""
+    battle = collide_db.get_clash_battle(conn, bid)
+    if not battle or str(battle.get("outcome") or "") != "active":
+        return ""
+    player_bps = [float(x) for x in (clash_meta.get("player_bps") or [])]
+    if not player_bps:
+        return ""
+    holding_back = [bool(x) for x in (clash_meta.get("holding_back") or [])]
+    settled = collide_engine.resolve_clash_node(
+        player_bps,
+        float(battle["guard_value"]),
+        cap_ticks=int(battle["cap_ticks"]),
+        current_hp_ticks=int(battle["current_hp_ticks"]),
+        retreat_floor=int(battle["retreat_floor_ticks"]),
+        holding_back=holding_back,
+    )
+    node_id = (
+        str(clash_meta.get("node_id") or "").strip()
+        or collide_db.next_clash_node_id(conn, bid)
+    )
+    from datetime import datetime
+
+    outcome = (
+        None
+        if settled["outcome"] == collide_engine.CLASH_OUTCOME_ACTIVE
+        else settled["outcome"]
+    )
+    updated = collide_db.record_clash_settlement(
+        conn,
+        event_id=f"{bid}-{node_id}",
+        battle_id=bid,
+        node_id=node_id,
+        occurred_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        delta_ticks=int(settled["total_delta"]),
+        chip=bool(settled["chip"]),
+        aggressors=[str(x) for x in (clash_meta.get("aggressors") or [])],
+        source="parsed",
+        confidence=1.0,
+        confirmed=True,
+        new_hp_ticks=int(settled["new_hp_ticks"]),
+        outcome=outcome,
+    )
+    if updated is None:
+        return ""
+    bar = collide_engine.format_clash_hp_bar(
+        int(updated["current_hp_ticks"]), int(updated["max_hp_ticks"])
+    )
+    return collide_pipeline._clash_reason_line(
+        bar,
+        total_delta=int(settled["total_delta"]),
+        chip=bool(settled["chip"]),
+        at_retreat_floor=bool(settled["at_retreat_floor"]),
+        outcome=str(updated.get("outcome") or "active"),
+        villain=str(updated.get("villain_name") or clash_meta.get("villain") or "反派"),
+    )
 
 
 def _phase_b_from_battle(b: dict) -> dict:
@@ -844,6 +917,7 @@ async def _post_draft(
         "domain_fusion": phase_b.get("domain_fusion", False),
         "chain_of_thought": phase_b.get("chain_of_thought", ""),
         "effects": phase_b.get("effects") or {},
+        "clash_meta": result.get("clash") or {},
         "status": "pending",
     })
     conn.close()
@@ -855,6 +929,16 @@ async def _post_draft(
 
     lines = [f"**對撞計算結果 #{battle['id']}**（草稿，待確認）"]
     lines += _clash_detail_lines(phase_b)
+    clash = result.get("clash") or {}
+    if clash.get("warning"):
+        lines.append("")
+        lines.append(str(clash["warning"]))
+    elif clash.get("reason_line"):
+        lines.append("")
+        lines.append(f"**反派血條（草稿投影，確認後寫入）：**{clash['reason_line']}")
+        parts = clash.get("aggressors") or []
+        if len(parts) > 1:
+            lines.append(f"**參與者（{len(parts)} 人）：**{'、'.join(str(p) for p in parts)}")
     pages = _paginate("\n".join(lines))
 
     view = ClashConfirmView(interaction.user.id, battle["id"], thread_id, unregistered=unregistered)

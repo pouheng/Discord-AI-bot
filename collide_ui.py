@@ -28,7 +28,12 @@ from pydantic import BaseModel
 import collide_db
 import collide_growth
 import sheets_sync
-from collide_engine import STAT_KEYS, hidden_score
+from collide_engine import (
+    STAT_KEYS,
+    clash_b_display,
+    format_clash_hp_bar,
+    hidden_score,
+)
 
 SCRIPT_DIR = __import__("os").path.dirname(__import__("os").path.abspath(__file__))
 
@@ -48,6 +53,22 @@ def _conn():
     c = collide_db.open_conn()
     collide_db.init_schema(c)
     return c
+
+
+# ── Clash 血條渲染（UI 委派包裝；A3-b）────────────────────
+#
+# 真正的編碼安全渲染在 collide_engine.format_clash_hp_bar（runtime 路徑使用、
+# 純函式、不依賴 fastapi）。本函式僅供管理後台 / 測試：呼叫 engine 取得已編碼
+# 安全的血條，再附一行理由；不重複維護渲染邏輯（避免層級倒置與雙份實作）。
+
+def render_clash_bar(current_hp_ticks, max_hp_ticks, reason="", *, width=10):
+    """UI 委派包裝：engine 血條 + 一行理由（**全保真**，保留 ░ 與 emoji）。
+
+    簽名凍結，供後台與測試呼叫；產物供 Discord / HTTP(UTF-8)。若要寫入
+    窄編碼 console，於輸出邊界呼叫 collide_engine.enc_safe_for_stream。
+    """
+    bar = format_clash_hp_bar(current_hp_ticks, max_hp_ticks, width=width)
+    return f"{bar} {reason}".strip() if reason else bar
 
 
 # ── API：資料表查閱 ───────────────────────────────────────

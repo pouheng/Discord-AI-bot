@@ -14,9 +14,16 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from llm_models import chat_create, has_credentials
 
 import collide_db
-from collide_engine import STAT_KEYS
+from collide_engine import (
+    CLASH_TIER_SPECS,
+    STAT_KEYS,
+    _hidden_of,
+    compute_villain_guard,
+    retreat_floor_ticks,
+)
 from collide_rules import (
     ABILITY_CATEGORIES,
     BOUNDS,
@@ -28,14 +35,9 @@ from collide_rules import (
 )
 
 load_dotenv()
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-_client = (
-    AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
-    if DEEPSEEK_API_KEY
-    else None
-)
+# 客戶端改由 llm_models.get_client() 依來源即時提供（見下方呼叫點）。
 
-VALID_TARGETS = {"character", "ability", "skill", "domain"}
+VALID_TARGETS = {"character", "ability", "skill", "domain", "clash_villain"}
 
 
 def _log_parse_failure(target: str, raw: str, reason: str, text: str = "") -> None:
@@ -199,6 +201,26 @@ def _check_bounds(data: dict, target: str) -> list[str]:
             errors.append(f"覺醒進度「{data.get('awakening')}」不合法（僅 {'/'.join(ENUMS['awakening'])}）")
         if not data.get("name"):
             errors.append("結界名稱不可為空")
+    elif target == "clash_villain":
+        if not str(data.get("name") or "").strip():
+            errors.append("反派角色名不可為空")
+        tier = str(data.get("tier") or "").strip()
+        if tier not in CLASH_TIER_SPECS:
+            errors.append(f"階級「{tier}」不合法（僅 {'/'.join(CLASH_TIER_SPECS)}）")
+        if data.get("dynamic_difficulty") is True:
+            errors.append(
+                "dynamic_difficulty 必須為 false：自動偵測的反派 guard 純粹由體質隱藏分數 × "
+                "Domain_Mod 計算，不進入 calibrate_roster 校準流程"
+            )
+        dm = data.get("domain_mod")
+        if dm is not None and not (isinstance(dm, (int, float)) and 1.0 <= dm <= 1.5):
+            errors.append(f"domain_mod {dm} 超出 1.0~1.5（未開結界 1.0）")
+        gv = data.get("guard_value")
+        if gv is not None and not (isinstance(gv, (int, float)) and gv > 0):
+            errors.append(f"guard_value {gv!r} 必須是正數")
+        for field in ("max_hp_ticks", "cap_ticks"):
+            if data.get(field) is not None:
+                _check_int(data, field, (1, 10**6), errors)
     return errors
 
 
@@ -246,7 +268,7 @@ async def parse_natural_language(text: str, target: str, *, retries: int = 2) ->
     """
     if target not in VALID_TARGETS:
         raise ParseError(f"不支援的目標類型：{target}")
-    if not _client:
+    if not has_credentials():
         raise ParseError("AI 解析服務未啟用，請檢查 DEEPSEEK_API_KEY 設定")
 
     system_prompt = WRITE_RULES[target]
@@ -256,8 +278,8 @@ async def parse_natural_language(text: str, target: str, *, retries: int = 2) ->
     last_raw = ""
     for attempt in range(retries + 1):
         try:
-            resp = await _client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "collide",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -317,7 +339,7 @@ async def propose_race_mods(race: str, *, context: str = "") -> dict:
     Raises:
         ParseError: AI 多次輸出非合法 JSON。
     """
-    if not _client:
+    if not has_credentials():
         raise ParseError("AI 解析服務未啟用，請檢查 DEEPSEEK_API_KEY 設定")
     system = RACE_MOD_SYSTEM.format(
         race_min=collide_db.RACE_MOD_MIN,
@@ -328,8 +350,8 @@ async def propose_race_mods(race: str, *, context: str = "") -> dict:
     last_error = "未知錯誤"
     for attempt in range(2):
         try:
-            resp = await _client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "collide",
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -398,7 +420,7 @@ async def check_skill_derivation(skill: dict, ability: dict, *, retries: int = 1
     輸入能力必須含 principle；回傳 {"valid": bool, "reason": str}。
     招式與能力無關機制、或違背能力限制 → valid=false。
     """
-    if not _client:
+    if not has_credentials():
         raise ParseError("AI 解析服務未啟用，請檢查 DEEPSEEK_API_KEY 設定")
     payload = json.dumps(
         {"ability": ability, "skill": skill}, ensure_ascii=False, indent=2
@@ -406,8 +428,8 @@ async def check_skill_derivation(skill: dict, ability: dict, *, retries: int = 1
     last_error = "未知錯誤"
     for attempt in range(retries + 1):
         try:
-            resp = await _client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "collide",
                 messages=[
                     {"role": "system", "content": SKILL_DERIVATION_SYSTEM},
                     {"role": "user", "content": payload},
@@ -545,6 +567,83 @@ async def write_domain(text: str, conn=None) -> dict:
             conn.close()
 
 
+async def write_clash_villain(text: str, conn=None, *, source: str = "gm") -> dict:
+    """把自然語言反派描述解析、驗證並建立血條對戰（collide_clash_battles）。
+
+    自動偵測路徑的門檻：
+    - `dynamic_difficulty` 一律強制為 0（guard 純粹由體質隱藏分數 × Domain_Mod 計算），
+      不進入 calibrate_roster 校準流程（spec 9 邊界）。
+    - 反派必須已存在於角色表 collide_characters（guard 需要其體質隱藏分數）。
+
+    source：gm（管理員註冊）/ auto_detect（自動偵測，pipeline 使用）。
+
+    回傳 {"clash_battle": battle_row, "guard_value": float, "status": "insert"}。
+    """
+    data = await parse_natural_language(text, "clash_villain")
+    # 自動偵測路徑門檻：無論 LLM 怎麼輸出，一律強制 dynamic_difficulty = 0
+    data["dynamic_difficulty"] = False
+
+    own = conn is None
+    conn = conn or collide_db.open_conn()
+    collide_db.init_schema(conn)
+    try:
+        name = str(data["name"]).strip()
+        char = collide_db.get_character(conn, name)
+        if not char:
+            raise ParseError(
+                f"反派「{name}」不存在於角色表（collide_characters），"
+                "請先用 /create 建立角色資料（guard 需取該角色體質隱藏分數）"
+            )
+        char["_race_mods"] = collide_db.race_mods_for(str(char.get("race") or ""))
+        constitution_hidden = _hidden_of(char, "體質")
+        domain_mod = float(data.get("domain_mod") or 1.0)
+        # 共識 A4：guard 純粹由 體質隱藏 × Domain_Mod 機械計算，
+        # 解析注入的 guard_value 一律忽略（自動偵測與 gm 註冊皆然），不可覆寫。
+        guard_value = compute_villain_guard(constitution_hidden, domain_mod)
+
+        tier = str(data["tier"]).strip()
+        spec = CLASH_TIER_SPECS[tier]
+        max_hp_ticks = int(data.get("max_hp_ticks") or spec["max_hp_ticks"])
+        cap_ticks = int(data.get("cap_ticks") or spec["cap_ticks"])
+        floor_ticks = retreat_floor_ticks(max_hp_ticks)
+
+        battle_id = _new_clash_battle_id(conn)
+        row = collide_db.create_clash_battle(
+            conn,
+            battle_id=battle_id,
+            villain_id=int(char["id"]),
+            villain_name=name,
+            tier=tier,
+            max_hp_ticks=max_hp_ticks,
+            cap_ticks=cap_ticks,
+            guard_value=guard_value,
+            retreat_floor_ticks=floor_ticks,
+            source=source,
+            dynamic_difficulty=0,
+        )
+        return {
+            "clash_battle": row,
+            "guard_value": guard_value,
+            "constitution_hidden": constitution_hidden,
+            "status": "insert",
+        }
+    finally:
+        if own:
+            conn.close()
+
+
+def _new_clash_battle_id(conn) -> str:
+    """產生唯一 battle_id：clash-<時間戳>-<亂數>；與既有 battle 撞號則重試。"""
+    import uuid
+
+    for _ in range(5):
+        ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        bid = f"clash-{ts}-{uuid.uuid4().hex[:6]}"
+        if not collide_db.get_clash_battle(conn, bid):
+            return bid
+    return f"clash-{uuid.uuid4().hex[:12]}"
+
+
 async def write_entries(text: str, conn=None, *, require_derivation: bool = False, skip_derivation: bool = False) -> dict:
     """批次寫入：一次接受招式/角色/能力/結界多筆資料。
 
@@ -640,7 +739,7 @@ async def write_entries_nl(text: str, *, retries: int = 2, require_derivation: b
     LLM 依各類寫入規範把整段描述拆成含 type 的 JSON 陣列，再走 write_entries 硬驗證與寫入。
     若 LLM 產出非合法 JSON/多次驗證失敗，raw 輸出寫入 error_logs 供除錯。
     """
-    if not _client:
+    if not has_credentials():
         raise ParseError("AI 解析服務未啟用，請檢查 DEEPSEEK_API_KEY 設定")
 
     system_prompt = (
@@ -658,8 +757,8 @@ async def write_entries_nl(text: str, *, retries: int = 2, require_derivation: b
     last_raw = ""
     for attempt in range(retries + 1):
         try:
-            resp = await _client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "collide",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},

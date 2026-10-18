@@ -13,6 +13,7 @@ import asyncio, sys, os, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from llm_models import chat_create
 
 load_dotenv()
 
@@ -33,7 +34,7 @@ ALL_TARGETS = [
 
 
 async def review_one(
-    client: AsyncOpenAI, reviewer_system: str, name: str, path: str
+    reviewer_system: str, name: str, path: str
 ) -> str | None:
     path = os.path.join(SCRIPT_DIR, path)
     if not os.path.exists(path):
@@ -46,8 +47,8 @@ async def review_one(
     header = f"\n{'=' * 60}\n[{name}] 審查中... ({len(content)} 字元)\n{'=' * 60}"
     print(header)
     try:
-        resp = await client.chat.completions.create(
-            model="deepseek-v4-pro",
+        resp = await chat_create(
+            "review",
             messages=[
                 {"role": "system", "content": reviewer_system},
                 {
@@ -57,7 +58,7 @@ async def review_one(
             ],
             temperature=0.3,
             max_tokens=4000,
-            timeout=300,
+            timeout=300.0,
         )
         result = resp.choices[0].message.content or ""
         print(result)
@@ -77,15 +78,10 @@ async def main():
     with open(REVIEWER_FILE, "r", encoding="utf-8") as f:
         reviewer_system = f.read()
 
-    client = AsyncOpenAI(
-        api_key=os.environ["DEEPSEEK_API_KEY"],
-        base_url="https://api.deepseek.com/v1",
-    )
-
     lines = []
     if arg == "all":
         for name, path in ALL_TARGETS:
-            result = await review_one(client, reviewer_system, name, path)
+            result = await review_one(reviewer_system, name, path)
             lines.append(result or "")
     else:
         target = SHORTCUTS.get(arg, arg)
@@ -95,7 +91,7 @@ async def main():
             print("可用: last_prompt / last_phase3 / last_phase1 / all，或直接給路徑")
             sys.exit(1)
         result = await review_one(
-            client, reviewer_system, arg if arg in SHORTCUTS else target, target
+            reviewer_system, arg if arg in SHORTCUTS else target, target
         )
         lines.append(result or "")
 

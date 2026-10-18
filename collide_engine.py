@@ -6,6 +6,8 @@ collide_engine.py — 對撞計算純函式引擎（不呼叫 LLM）
 - 元素相剋
 - 四條公式（Atk_BP / Melee_BP / ManaMelee_BP / Exp_Mod）
 - 四階判定 + 結界覆蓋與魔力彌補
+- Clash 血條（v2 多打一）：Villain_Guard 純計算、verdict→delta 純函數、
+  單節點聚合、chip 截斷、剩餘血量截斷
 """
 
 from collide_rules import (
@@ -664,6 +666,267 @@ def exp_tier(exp: int) -> dict:
     return {"name": "未知", "range": (0, 0), "exp_mod": (1.0, 1.2), "desc": ""}
 
 
+# ── Clash 血條（v2 多打一）────────────────────────────────
+
+# 單位常數：所有數值以 ticks 儲存，B 只是顯示單位（血條進度條），不入 schema。
+TICKS_PER_B = 10            # 1B = 10 ticks（使 0.2/1/2/2.5/4/5 皆為整數）
+CHIP_TICKS = 2              # 僵持扣血一次 = 0.2B
+RETREAT_FLOOR_RATIO = 0.2   # 擊退線 = MaxHP 的 20%
+
+# 階級參數（MaxHP / Cap 皆以 ticks 計；於 battle_id 建立時凍結）
+CLASH_TIER_SPECS = {
+    "雜兵": {"max_hp_ticks": 50, "cap_ticks": 25},    # 5B / 2.5B
+    "重點": {"max_hp_ticks": 120, "cap_ticks": 40},   # 12B / 4B
+    "Boss": {"max_hp_ticks": 240, "cap_ticks": 50},   # 24B / 5B
+}
+
+# 終局狀態
+CLASH_OUTCOME_ACTIVE = "active"
+CLASH_OUTCOME_DEFEATED = "defeated"
+CLASH_OUTCOME_RETREATED = "retreated"
+CLASH_OUTCOME_SEALED = "sealed"
+
+
+def compute_villain_guard(constitution_hidden: float, domain_mod: float = 1.0) -> float:
+    """Villain_Guard（反派防禦閾值）= 體質隱藏分數 × Domain_Mod。
+
+    純計算、零新增輸入（皆來自既有欄位）。自動偵測的反派一律以此式計算，
+    不進入 calibrate_roster 校準流程。
+    """
+    return round(float(constitution_hidden) * float(domain_mod), 2)
+
+
+def retreat_floor_ticks(max_hp_ticks: int) -> int:
+    """擊退線 = MaxHP × 20%（雜兵 10 / 重點 24 / Boss 48）。"""
+    return int(max_hp_ticks * RETREAT_FLOOR_RATIO)
+
+
+def verdict_to_delta_ticks(
+    atk_bp: float,
+    villain_guard: float,
+    *,
+    holding_back: bool = False,
+) -> tuple[int, str]:
+    """verdict→delta 純函數：r = Atk_BP / Villain_Guard → 扣血 ticks。
+
+    規則：
+      r ≥ 2.0        碾壓：2B = 20 ticks（留手 → 降級為壓制 10 ticks）
+      1.0 < r ≤ 2.0  壓制：1B = 10 ticks
+      0.9 ≤ r ≤ 1.0  僵持：chip = CHIP_TICKS（2 ticks）
+      r < 0.9        無效：0 ticks
+
+    Args:
+        atk_bp: 玩家最終威力（已含留手以外的所有修正）。
+        villain_guard: 反派防禦閾值（> 0，見 compute_villain_guard）。
+        holding_back: 玩家留手（只影響碾壓降級，不影響威力公式本身）。
+
+    Returns:
+        (delta_ticks, verdict_label)
+    """
+    guard = float(villain_guard)
+    if guard <= 0:
+        return 0, "無效"
+    r = float(atk_bp) / guard
+    if r >= 2.0:
+        if holding_back:
+            return TICKS_PER_B, "壓制（留手，碾壓降級）"
+        return TICKS_PER_B * 2, "碾壓"
+    if r > 1.0:
+        return TICKS_PER_B, "壓制"
+    if r >= 0.9:
+        return CHIP_TICKS, "僵持（chip）"
+    return 0, "無效"
+
+
+def clamp_chip(current_hp_ticks: int, retreat_floor: int) -> int:
+    """chip 截斷：最低只到擊退線，不跨線歸零。"""
+    return min(CHIP_TICKS, max(0, current_hp_ticks - retreat_floor))
+
+
+def aggregate_clash_deltas(
+    deltas: list[int],
+    *,
+    cap_ticks: int,
+    current_hp_ticks: int,
+) -> int:
+    """單節點聚合：min(Σdelta, Cap_tier, current_hp_ticks)。
+
+    剩餘血量截斷——扣減後絕不低於 0；觸底即終局（由 resolve_clash_hp 判定）。
+    """
+    total = sum(max(0, int(d)) for d in deltas)
+    return min(total, cap_ticks, current_hp_ticks)
+
+
+def resolve_clash_hp(
+    current_hp_ticks: int,
+    delta_ticks: int,
+    *,
+    retreat_floor: int,
+    chip_only: bool,
+) -> tuple[int, str]:
+    """套用節點扣減，回傳 (新血量, 終局狀態)。
+
+    chip 路徑（chip_only）：最低只到擊退線，停在線上 = active + at_retreat_floor
+    （由 resolve_clash_node 標記；擊退由中之人宣告，本函式不自動終局）。
+    碾壓/壓制路徑（非 chip）：可跨過擊退線扣至 0，歸零 = defeated（打敗）。
+
+    Args:
+        current_hp_ticks: 節點前血量。
+        delta_ticks: 節點總扣減（chip 路徑需已過 clamp_chip 截斷）。
+        retreat_floor: 擊退線 ticks。
+        chip_only: 該節點是否為全員僵持的 chip 路徑。
+    """
+    if chip_only:
+        new_hp = max(current_hp_ticks - delta_ticks, retreat_floor)
+        # 共識 A2：chip 永不自動終局——觸底只停在擊退線，
+        # outcome 一律 active（retreated 只能由中之人宣告後才寫入）。
+        return new_hp, CLASH_OUTCOME_ACTIVE
+    new_hp = max(current_hp_ticks - delta_ticks, 0)
+    outcome = CLASH_OUTCOME_DEFEATED if new_hp == 0 else CLASH_OUTCOME_ACTIVE
+    return new_hp, outcome
+
+
+def resolve_clash_node(
+    atk_bp_list: list[float],
+    villain_guard: float,
+    *,
+    cap_ticks: int,
+    current_hp_ticks: int,
+    retreat_floor: int,
+    holding_back: list[bool] | None = None,
+) -> dict:
+    """v2 多打一單節點結算（純函式，一次對撞 = 一個節點）。
+
+    流程：
+      1. 逐玩家獨立 verdict→delta（各自對同一 Villain_Guard）。
+      2. chip 判定：僅當**沒有任何玩家** r > 1.0（全員僵持或無效）→ chip 路徑，
+         節點總扣減 = CHIP_TICKS（一次性），並截斷至擊退線；
+         停在擊退線 = active + at_retreat_floor（擊退由中之人宣告，不自動終局）。
+      3. 有玩家 r > 1.0 → 破防節點：**只聚合破防玩家（r>1.0）的 delta**，
+         僵持(chip 2)/無效(0) 玩家的扣減不加入節點（共識 A1：破防節點不給 chip）；
+         節點總扣減 = min(Σ破防delta, Cap_tier, 剩餘血量)。
+
+    Returns:
+        dict: deltas 逐玩家扣減、verdicts 逐玩家判定、total_delta 節點總扣減、
+              chip 是否 chip 路徑、new_hp_ticks 新血量、at_retreat_floor 是否停在擊退線、
+              outcome 終局狀態。
+    """
+    holding_back = holding_back or [False] * len(atk_bp_list)
+    deltas: list[int] = []
+    verdicts: list[str] = []
+    any_breakthrough = False
+    for i, atk_bp in enumerate(atk_bp_list):
+        delta, verdict = verdict_to_delta_ticks(
+            atk_bp, villain_guard, holding_back=bool(holding_back[i])
+        )
+        deltas.append(delta)
+        verdicts.append(verdict)
+        if delta >= TICKS_PER_B:  # 碾壓 20 / 壓制 10 → r > 1.0，破防
+            any_breakthrough = True
+
+    if not any_breakthrough:
+        chip_delta = clamp_chip(current_hp_ticks, retreat_floor)
+        new_hp, outcome = resolve_clash_hp(
+            current_hp_ticks, chip_delta, retreat_floor=retreat_floor, chip_only=True
+        )
+        return {
+            "deltas": deltas,
+            "verdicts": verdicts,
+            "total_delta": chip_delta,
+            "chip": True,
+            "new_hp_ticks": new_hp,
+            "at_retreat_floor": new_hp <= retreat_floor,
+            "outcome": outcome,
+        }
+
+    # 破防節點：僵持(chip)/無效的扣減不加入聚合（共識 A1）
+    breakthrough_deltas = [d for d in deltas if d >= TICKS_PER_B]
+    total = aggregate_clash_deltas(
+        breakthrough_deltas, cap_ticks=cap_ticks, current_hp_ticks=current_hp_ticks
+    )
+    new_hp, outcome = resolve_clash_hp(
+        current_hp_ticks, total, retreat_floor=retreat_floor, chip_only=False
+    )
+    return {
+        "deltas": deltas,
+        "verdicts": verdicts,
+        "total_delta": total,
+        "chip": False,
+        "new_hp_ticks": new_hp,
+        "at_retreat_floor": False,
+        "outcome": outcome,
+    }
+
+
+# ── Clash 血條可視化（B 僅顯示用，不入 schema）────────────
+
+def clash_b_display(ticks: int) -> str:
+    """ticks → B 顯示字串：240 → '24'、235 → '23.5'、2 → '0.2'。"""
+    b = int(ticks) / TICKS_PER_B
+    s = f"{b:.1f}"
+    return s[:-2] if s.endswith(".0") else s
+
+
+_ASCII_FALLBACK = {
+    "█": "#", "░": "-", "−": "-", "–": "-", "—": "-", "─": "-", "━": "-", "…": "...",
+    "❌": "x", "💨": "~", "🔒": "#",
+}
+
+
+def _enc_safe(text, encoding):
+    """逐字元把字串降到目標編碼可表示；不可表示者用 ASCII 近似（不拋錯）。
+
+    例：cp950 有 █（U+2588）但無 ░（U+2591）→ 空槽降級為 '-'；
+    終局標籤 emoji（❌／💨／🔒）亦一併降級。
+    """
+    enc = encoding or "utf-8"
+    out = []
+    for ch in text:
+        try:
+            ch.encode(enc)
+            out.append(ch)
+        except (UnicodeEncodeError, LookupError, TypeError):
+            out.append(_ASCII_FALLBACK.get(ch, "?"))
+    return "".join(out)
+
+
+def enc_safe_for_stream(text, stream=None):
+    """把字串降到「某輸出串流」可表示的編碼——**只在輸出邊界使用**。
+
+    設計原則：字串本身保持**全保真**（`░`、emoji 保留），因為產物要送
+    Discord（UTF-8）。唯有寫入 console / legacy log 等窄編碼串流時，才經此
+    函式降級，確保 cp950 下 print 不拋錯。stream 省略時用 sys.stdout。
+    """
+    import sys as _sys
+
+    stream = stream if stream is not None else _sys.stdout
+    return _enc_safe(text, getattr(stream, "encoding", None) or "utf-8")
+
+
+def format_clash_hp_bar(current_hp_ticks: int, max_hp_ticks: int, *, width: int = 10) -> str:
+    """訊息文字進度條（spec 5.6.4 可視化）：`██████░░░░ 12B/24B`。
+
+    **全保真**：保留 `█`／`░`（供 Discord UTF-8 顯示）；如需寫入窄編碼串流，
+    請於輸出邊界呼叫 `enc_safe_for_stream`。此為 runtime 實際使用的渲染函式。
+    """
+    max_hp = max(1, int(max_hp_ticks))
+    cur = max(0, min(int(current_hp_ticks), max_hp))
+    filled = int(round(cur / max_hp * width))
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{bar} {clash_b_display(cur)}B/{clash_b_display(max_hp)}B"
+
+
+def clash_outcome_label(outcome: str, villain_name: str = "") -> str:
+    """終局標註：歸零 = 打敗、觸擊退線 = 擊退。血條不刪除，狀態即結局。"""
+    name = villain_name or "反派"
+    return {
+        CLASH_OUTCOME_DEFEATED: f"❌ {name} 已被擊敗（HP 歸零）",
+        CLASH_OUTCOME_RETREATED: f"💨 {name} 被擊退（守住 20% 擊退線）",
+        CLASH_OUTCOME_SEALED: f"🔒 {name} 已被封印",
+        CLASH_OUTCOME_ACTIVE: "",
+    }.get(outcome, "")
+
+
 if __name__ == "__main__":
     # 簡易自測
     hs = hidden_score("B", 1.0)
@@ -773,3 +1036,79 @@ if __name__ == "__main__":
     # 光屬性但護盾無 exempt → 正常擋
     a6, d6, log6 = apply_effects(20.0, 12.0, [], [{"type": "shield", "absorb": 5.0, "blocks": "all", "note": "氣泡"}], atk_kind="magic", atk_element="光")
     assert a6 == 15.0, f"無 exempt 護盾應正常擋光，got atk={a6}"
+
+    # ===== Clash v2 血條系統：verdict→delta 純函數 =====
+    # 1. verdict_to_delta_ticks 閾值（guard = 10.0）
+    assert compute_villain_guard(7.5, 1.4) == 10.5, "Villain_Guard 應為 體質隱藏 × Domain_Mod"
+    assert retreat_floor_ticks(50) == 10, "雜兵擊退線應為 10 ticks"
+    assert retreat_floor_ticks(120) == 24, "重點擊退線應為 24 ticks"
+    assert retreat_floor_ticks(240) == 48, "Boss 擊退線應為 48 ticks"
+    assert verdict_to_delta_ticks(20.0, 10.0) == (20, "碾壓"), "r=2.0 應為碾壓 20 ticks"
+    assert verdict_to_delta_ticks(21.0, 10.0) == (20, "碾壓"), "r>2.0 應為碾壓 20 ticks"
+    assert verdict_to_delta_ticks(19.9, 10.0) == (10, "壓制"), "1.0<r<2.0 應為壓制 10 ticks"
+    assert verdict_to_delta_ticks(10.0, 10.0) == (2, "僵持（chip）"), "r=1.0 應為 chip 2 ticks"
+    assert verdict_to_delta_ticks(9.0, 10.0) == (2, "僵持（chip）"), "r=0.9 應為 chip 2 ticks"
+    assert verdict_to_delta_ticks(8.9, 10.0) == (0, "無效"), "r<0.9 應為 0 ticks"
+    assert verdict_to_delta_ticks(20.0, 10.0, holding_back=True) == (10, "壓制（留手，碾壓降級）"), "留手應把碾壓降級為壓制"
+
+    # 2. clamp_chip：chip 只到擊退線，不跨線
+    assert clamp_chip(49, 48) == 1, "貼近擊退線時 chip 應截斷為 1 ticks"
+    assert clamp_chip(48, 48) == 0, "已達擊退線時 chip 應為 0 ticks"
+    assert clamp_chip(240, 48) == 2, "正常距離 chip 應為 2 ticks"
+
+    # 3. Boss chip 節點數：240 → 擊退線 48，每節點 2 ticks → 96 節點，永不低於 48
+    boss_floor = retreat_floor_ticks(240)
+    hp = 240
+    chip_nodes = 0
+    while hp > boss_floor:
+        node = resolve_clash_node([10.0], 10.0, cap_ticks=50, current_hp_ticks=hp, retreat_floor=boss_floor)
+        assert node["chip"] is True, "全員僵持節點應為 chip 路徑"
+        hp = node["new_hp_ticks"]
+        chip_nodes += 1
+    assert chip_nodes == 96, f"Boss 240→擊退線應為 96 個 chip 節點，got {chip_nodes}"
+    assert hp == boss_floor == 48, f"chip 路徑應停在擊退線，got hp={hp}"
+    assert node["outcome"] == CLASH_OUTCOME_ACTIVE, "chip 觸底不得自動終局（A2：擊退由中之人宣告）"
+    assert node["at_retreat_floor"] is True, "chip 停在擊退線應標記 at_retreat_floor"
+    print("clash chip path: 96 nodes -> outcome =", node["outcome"], "at_retreat_floor =", node["at_retreat_floor"], "hp =", hp)
+
+    # 4. 碾壓/壓制路徑可跨過擊退線扣至 0 → defeated
+    h = resolve_clash_node([20.0], 10.0, cap_ticks=50, current_hp_ticks=60, retreat_floor=boss_floor)
+    assert h["chip"] is False and h["new_hp_ticks"] == 40, "碾壓 20 ticks 應從 60 扣到 40（跨線但未歸零）"
+    assert h["outcome"] == CLASH_OUTCOME_ACTIVE
+    h2 = resolve_clash_node([20.0], 10.0, cap_ticks=50, current_hp_ticks=40, retreat_floor=boss_floor)
+    assert h2["outcome"] == CLASH_OUTCOME_ACTIVE and h2["new_hp_ticks"] == 20, "40-20 應為 20（尚未歸零）"
+    h3 = resolve_clash_node([20.0], 10.0, cap_ticks=50, current_hp_ticks=20, retreat_floor=boss_floor)
+    assert h3["outcome"] == CLASH_OUTCOME_DEFEATED and h3["new_hp_ticks"] == 0, "歸零應為 defeated"
+    print("clash breakthrough: 60 -> 40 -> 20 -> 0 =", h3["outcome"])
+
+    # 5. 多打一：逐玩家獨立判定 + Cap_tier 截斷
+    multi = resolve_clash_node([20.0, 12.0, 5.0], 10.0, cap_ticks=50, current_hp_ticks=240, retreat_floor=boss_floor)
+    # 20→碾壓20, 12→壓制10, 5→無效0；Σ=30 < cap 50 → 扣 30
+    assert multi["deltas"] == [20, 10, 0], f"逐玩家 delta 應為 [20,10,0]，got {multi['deltas']}"
+    assert multi["total_delta"] == 30 and multi["new_hp_ticks"] == 210, f"Σdelta 應為 30，got {multi}"
+    cap_multi = resolve_clash_node([20.0, 20.0, 20.0], 10.0, cap_ticks=50, current_hp_ticks=240, retreat_floor=boss_floor)
+    assert cap_multi["total_delta"] == 50, f"Σ=60 應被 Cap 50 截斷，got {cap_multi['total_delta']}"
+    # chip 判定：只要有一人 r>1.0 就不走 chip 路徑
+    assert multi["chip"] is False and cap_multi["chip"] is False, "有破防玩家時不得為 chip 路徑"
+    all_chip = resolve_clash_node([10.0, 9.0], 10.0, cap_ticks=50, current_hp_ticks=240, retreat_floor=boss_floor)
+    assert all_chip["chip"] is True and all_chip["total_delta"] == 2, "全員僵持應走 chip 路徑只扣 2 ticks"
+    # A1：破防節點不給 chip——[碾壓20, 僵持2] 總扣減必須是 20，不是 22
+    mix = resolve_clash_node([20.0, 9.0], 10.0, cap_ticks=50, current_hp_ticks=240, retreat_floor=boss_floor)
+    assert mix["chip"] is False and mix["total_delta"] == 20, f"破防節點應排除僵持玩家的 chip，got {mix['total_delta']}"
+    assert mix["deltas"] == [20, 2], "逐玩家 delta 仍應顯示原始判定（含僵持玩家的 2）"
+    print("clash multi-vs-one: deltas =", multi["deltas"], "cap 截斷 ->", cap_multi["total_delta"], "| A1 mix ->", mix["total_delta"])
+
+    # 6. 血條可視化：B 顯示 + 進度條
+    assert clash_b_display(240) == "24" and clash_b_display(235) == "23.5" and clash_b_display(2) == "0.2"
+    bar24 = format_clash_hp_bar(240, 240)
+    assert bar24 == "██████████ 24B/24B", f"滿血進度條應為 10 格實心，got {bar24!r}"
+    bar12 = format_clash_hp_bar(120, 240)
+    assert bar12 == "█████░░░░░ 12B/24B", f"半血進度條應為 5 格實心，got {bar12!r}"
+    bar0 = format_clash_hp_bar(0, 240)
+    assert bar0 == "░░░░░░░░░░ 0B/24B", f"歸零進度條應全空，got {bar0!r}"
+    # 全保真斷言：產物保留 ░（供 Discord）；編碼安全只在輸出邊界（見 enc_safe_for_stream）
+    assert "░" in bar12 and "█" in bar24, "血條須全保真（保留 ░）"
+    assert clash_outcome_label(CLASH_OUTCOME_DEFEATED, "暗影魔狼") == "❌ 暗影魔狼 已被擊敗（HP 歸零）"
+    assert clash_outcome_label(CLASH_OUTCOME_RETREATED, "暗影魔狼") == "💨 暗影魔狼 被擊退（守住 20% 擊退線）"
+    print(enc_safe_for_stream(f"clash hp bar: {bar24} | {bar12} | {bar0}"))
+    print("ALL CLASH v2 ENGINE TESTS PASSED")

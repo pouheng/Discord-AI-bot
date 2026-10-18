@@ -20,20 +20,13 @@ import os
 import datetime
 import json
 import traceback
+from llm_models import chat_create, has_credentials
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 PROMPT_LOG_DIR = os.path.join(SCRIPT_DIR, "prompt_logs")
 ERROR_LOG_DIR = os.path.join(SCRIPT_DIR, "error_logs")
-_client = (
-    AsyncOpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com/v1",
-        timeout=120.0,
-    )
-    if DEEPSEEK_API_KEY
-    else None
-)
+# 客戶端改由 llm_models.get_client() 依來源即時提供（見下方呼叫點）。
 
 
 def _log_error(event: str, detail: str, **extra):
@@ -106,7 +99,7 @@ async def _fetch_history(channel, limit: int = 40) -> str:
 
 
 def register_commands(bot: commands.Bot):
-    if not _client:
+    if not has_credentials():
         print("[神之眼] 警告：DeepSeek API 未設定，指令將無法使用")
 
     @bot.tree.command(
@@ -134,7 +127,7 @@ def register_commands(bot: commands.Bot):
                 tb=traceback.format_exc()[:500],
             )
 
-        if not _client:
+        if not has_credentials():
             await interaction.followup.send("❌ DeepSeek API 未設定")
             return
 
@@ -158,8 +151,8 @@ def register_commands(bot: commands.Bot):
 
         try:
             _append_gods_eye_log("請求（已送出，等待回應）", _GODS_EYE_SYSTEM, prompt, "(尚未回應)")
-            resp = await _client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "gods_eye", timeout=120.0,
                 messages=[
                     {"role": "system", "content": _GODS_EYE_SYSTEM},
                     {"role": "user", "content": prompt},

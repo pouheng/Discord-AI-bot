@@ -1,6 +1,7 @@
 """/say 指令模組 — 讓角色主動加入對話（完整三階段流程）"""
 
 import discord, json, re, os, datetime
+from llm_models import chat_create
 
 SAY_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "say_log.jsonl")
 
@@ -29,7 +30,6 @@ def register_say(bot):
     @bot.tree.command(name="say", description="讓角色主動加入對話（完整三階段流程）")
     async def cmd_say(interaction: discord.Interaction):
         from main import (
-            client,
             DB_FILE,
             get_character_name,
             load_prompt_config,
@@ -101,8 +101,8 @@ def register_say(bot):
 輸出 JSON：{{"suitable": true/false, "reason": "原因", "lore_topics": []}}"""
 
         try:
-            resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "say",
                 messages=[
                     {"role": "system", "content": "只輸出 JSON。"},
                     {"role": "user", "content": phase1_prompt},
@@ -181,8 +181,8 @@ def register_say(bot):
 不輸出 <planning> = 錯誤"""
 
         try:
-            resp = await client.chat.completions.create(
-                model="deepseek-v4-flash",
+            resp = await chat_create(
+                "say",
                 messages=[
                     {"role": "system", "content": phase2_system},
                     {
