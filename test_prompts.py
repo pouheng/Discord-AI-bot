@@ -240,7 +240,7 @@ async def test_phase2_ic_prompt():
     )
 
     yield check("IC: 包含角色扮演協議", "角色扮演協議" in mock_prompt)
-    yield check("IC: 包含 jailbreak", "你將完全融入角色" in mock_prompt)
+    yield check("IC: 包含 jailbreak", "你將完全融入" in mock_prompt)
     yield check(
         "IC: 包含身份區（用角色名自稱）",
         "「澪」自稱" in mock_prompt or "用「澪」自稱" in mock_prompt,

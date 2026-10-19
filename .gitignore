@@ -61,3 +61,4 @@ backup/
 *.db-wal
 llm_call_debug.jsonl
 watchdog_state.json
+prompt_blocks_history/

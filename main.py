@@ -14,6 +14,7 @@ import os
 import aiofiles
 import autopilot
 import tarot
+import prompt_blocks
 from dotenv import load_dotenv
 from db import get_db, init_db as _db_init, DB_FILE
 from parsers import extract_json, parse_learn_tags, parse_mem_tag, strip_planning, strip_mem_learn_tags, strip_html_tags, strip_body_marker
@@ -3515,7 +3516,7 @@ async def _present_persons_from_memories(combined_memories: str, limit: int = 4)
     return names
 
 
-async def build_phase2_system_prompt(
+async def _legacy_build_phase2_system_prompt(
     channel_type: str,
     pcfg: dict,
     enable_ic_style: bool,
@@ -3529,7 +3530,7 @@ async def build_phase2_system_prompt(
     quests_text: str = "",
     lore_speculation: str = "",
 ) -> str:
-    """建立 Phase 2 角色扮演系統提示詞
+    """（legacy）建立 Phase 2 角色扮演系統提示詞
     注意：靜態規則（身份、文風、planning）在上方組裝，
     動態資料（記憶、世界觀、場景）在下方注入。
     """
@@ -3771,6 +3772,81 @@ async def build_phase2_system_prompt(
 """
 
     return phase2_system
+
+
+async def _build_phase2_ctx(channel_type: str, pcfg: dict, enable_ic_style: bool,
+                            channel_context: str, channel_note: str, ic_context_text: str,
+                            combined_memories: str, lore_text: str, self_memories: str,
+                            server_rules_text: str, quests_text: str,
+                            lore_speculation: str) -> tuple[str, dict]:
+    """組出 prompt_blocks 渲染所需的 ctx（含執行期解析的人物資料）。"""
+    channel = "ic" if channel_type != "out_of_character" else "ooc"
+    char_name = await get_character_name() or ""
+    char_identity = await get_character_identity() or ""
+    alias_text = await format_person_alias_map()
+    present_blocks = []
+    for p in await _present_persons_from_memories(combined_memories):
+        _t = await format_person_profiles(p)
+        if _t:
+            present_blocks.append(_t)
+    present_text = "\n".join(present_blocks)
+    char_profile = await format_character_profile(char_name) if char_name else ""
+    ctx = {
+        "channel_context": channel_context,
+        "channel_note": channel_note,
+        "ic_context_text": ic_context_text,
+        "combined_memories": combined_memories,
+        "lore_text": lore_text,
+        "self_memories": self_memories,
+        "server_rules_text": server_rules_text,
+        "quests_text": quests_text,
+        "lore_speculation": lore_speculation,
+        "alias_text": alias_text,
+        "present_text": present_text,
+        "char_profile": char_profile,
+        "char_name": char_name,
+        "char_identity": char_identity,
+        "today": datetime.datetime.now().strftime("%Y-%m-%d"),
+        "banned_words": "、".join(pcfg.get("banned_words", [])),
+        "enable_ic_style": enable_ic_style,
+        "has_server_rules": bool(server_rules_text),
+        "has_lore": bool(lore_text),
+        "has_speculation": bool(lore_speculation),
+        "has_present_profiles": bool(present_text),
+        "has_quests": bool(quests_text),
+        "has_self_memories": bool(self_memories),
+        "has_combined_memories": bool(combined_memories),
+        "has_char_name": bool(char_name),
+        "has_char_identity": bool(char_identity),
+        "has_ooc_persona": bool(pcfg.get("ooc_persona")),
+        "has_ooc_chat_examples": bool(pcfg.get("ooc_chat_examples")),
+        "has_social_awareness": bool(pcfg.get("social_awareness")),
+        "has_emojis": bool(pcfg.get("available_emojis")),
+    }
+    return channel, ctx
+
+
+async def build_phase2_system_prompt(
+    channel_type: str,
+    pcfg: dict,
+    enable_ic_style: bool,
+    channel_context: str,
+    channel_note: str,
+    ic_context_text: str,
+    combined_memories: str,
+    lore_text: str,
+    self_memories: str,
+    server_rules_text: str,
+    quests_text: str = "",
+    lore_speculation: str = "",
+) -> str:
+    """建立 Phase 2 系統提示詞（資料驅動：讀 prompt_blocks.json）。"""
+    channel, ctx = await _build_phase2_ctx(
+        channel_type, pcfg, enable_ic_style, channel_context, channel_note,
+        ic_context_text, combined_memories, lore_text, self_memories,
+        server_rules_text, quests_text, lore_speculation,
+    )
+    return prompt_blocks.render_system(channel, ctx)
 
 
 _processing_messages = set()
@@ -4370,6 +4446,35 @@ async def log_recalled_data(resolved_ids: list, recall_candidates: list,
     print(f"[DEBUG] 召回資料已寫入 {PROMPT_LOG_DIR}\\last_recalled_data.txt")
 
 
+async def _write_prompt_blocks_dump(channel_type, enable_ic_style, extra_segments,
+                                    all_context, current_user_name, clean_input_reply,
+                                    planning_instruction, fmt_body, priming_suffix,
+                                    phase2_char_name):
+    """寫出 last_prompt_blocks.json：最後一次 Phase 2 各注入區段的結構化內容。"""
+    segments = list(prompt_blocks.LAST_SEGMENTS or []) + list(extra_segments or [])
+    context_lines = []
+    for m in all_context:
+        role_tag = phase2_char_name if m["role"] == "assistant" else "USER"
+        context_lines.append({"role": role_tag, "content": m["content"]})
+    dump = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "channel_type": channel_type,
+        "channel": prompt_blocks.LAST_CHANNEL,
+        "enable_ic_style": enable_ic_style,
+        "segments": segments,
+        "context": context_lines,
+        "current_message": f"[{current_user_name}]: {clean_input_reply}",
+        "format_override": f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}",
+        "priming": priming_suffix,
+    }
+    os.makedirs(PROMPT_LOG_DIR, exist_ok=True)
+    async with aiofiles.open(
+        os.path.join(PROMPT_LOG_DIR, "last_prompt_blocks.json"), "w", encoding="utf-8",
+    ) as f:
+        await f.write(json.dumps(dump, ensure_ascii=False, indent=2))
+    print(f"[DEBUG] 結構化提示詞區段已寫入 {PROMPT_LOG_DIR}\\last_prompt_blocks.json")
+
+
 def phase2_slot(channel_type: str, enable_ic_style: bool) -> str:
     """IC，或 OOC 但被要求寫作（enable_ic_style）→ 劇情；其餘 OOC → 日常。"""
     return "plot" if (channel_type == "in_character" or enable_ic_style) else "default"
@@ -4475,22 +4580,31 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
         ic_context_text, combined_memories, lore_text, self_memories,
         server_rules_text, quests_text, lore_speculation,
     )
+    extra_segments = []
 
     if channel_type == "in_character":
         channel_summary = await get_channel_summary(str(message.channel.id))
         if channel_summary:
-            phase2_system += f"\n\n【目前故事摘要】\n{channel_summary}"
+            _seg = f"\n\n【目前故事摘要】\n{channel_summary}"
+            phase2_system += _seg
+            extra_segments.append({"id": "_ext_summary", "title": "目前故事摘要",
+                                   "kind": "dynamic", "rendered": _seg})
         auto_injection = await autopilot.get_autopilot_injection(message, channel_type)
         if auto_injection:
             phase2_system += auto_injection
+            extra_segments.append({"id": "_ext_autopilot", "title": "Autopilot 注入",
+                                   "kind": "dynamic", "rendered": auto_injection})
 
     if tarot_drawn:
         cards_str = "、".join(f"{c.get_display_name()}" for c in tarot_drawn["cards"])
         who = tarot_drawn["who_for"] or "你"
-        phase2_system += (
+        _seg = (
             f"\n\n【塔羅牌】\n你剛剛為了 {who} 抽了{tarot_drawn['spread']}牌：{cards_str}。\n"
             f"在回覆中自然地提起這張牌即可，不用嚴肅解讀。"
         )
+        phase2_system += _seg
+        extra_segments.append({"id": "_ext_tarot", "title": "塔羅牌",
+                               "kind": "dynamic", "rendered": _seg})
 
     phase2_messages = [{"role": "system", "content": phase2_system}]
     phase2_messages.extend(all_context)
@@ -4546,6 +4660,11 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
         await f.write(f"\n\n=== PRIMING ===\n{priming_suffix}")
     print(f"[DEBUG] Phase 2 完整提示詞已寫入 {PROMPT_LOG_DIR}\\last_prompt.txt")
+    await _write_prompt_blocks_dump(
+        channel_type, enable_ic_style, extra_segments, all_context,
+        current_user_name, clean_input_reply, planning_instruction, fmt_body,
+        priming_suffix, phase2_char_name,
+    )
 
     raw_content = await _call_phase2_with_retry(
         phase2_messages, label="Phase 2",
@@ -4647,6 +4766,12 @@ async def run_phase2_direct(
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
         await f.write(f"\n\n=== PRIMING ===\n{priming_suffix}")
+
+    await _write_prompt_blocks_dump(
+        channel_type, enable_ic_style, [], all_context,
+        current_user_name, clean_input_reply, planning_instruction, fmt_body,
+        priming_suffix, phase2_char_name,
+    )
 
     phase2_resp = await _call_phase2_with_retry(
         phase2_messages, label="Phase 2 direct",

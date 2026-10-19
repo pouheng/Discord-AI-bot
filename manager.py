@@ -153,6 +153,24 @@ def open_db_viewer():
         log("Opened DB Viewer")
 
 
+def open_prompt_editor():
+    """啟動 prompt_ui.py（Phase 2 提示詞查看/編輯器）並開瀏覽器。"""
+    script = os.path.join(SCRIPT_DIR, "prompt_ui.py")
+    if not os.path.exists(script):
+        log("prompt_ui.py 不存在")
+        return
+    subprocess.Popen(
+        ["python", "prompt_ui.py"],
+        cwd=SCRIPT_DIR,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    time.sleep(1.2)
+    import webbrowser
+
+    webbrowser.open("http://127.0.0.1:8788")
+    log("Opened Prompt Editor (http://127.0.0.1:8788)")
+
+
 def run_review():
     log("Running full prompt review (all 3 phases)...")
 
@@ -588,6 +606,7 @@ class BotManagerGUI:
             ("Open Logs", open_logs),
             ("Maint Log", open_maint_logs),
             ("Open DB", open_db),
+            ("Prompt Editor", open_prompt_editor),
         ]
         op_btn_row1 = ttk.Frame(op_frame)
         op_btn_row1.pack(fill=tk.X, pady=2)
