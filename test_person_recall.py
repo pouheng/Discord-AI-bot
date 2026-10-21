@@ -34,6 +34,7 @@ with patch("discord.ext.commands.Bot") as mock_bot:
         spec.loader.exec_module(mod)
 
 import main
+import memory
 
 SUCCESS = 0
 FAIL = 0
@@ -82,9 +83,9 @@ async def fake_get_person_memory(canonical, limit=8):
     return MEM.get(canonical, "（無記錄）")
 
 
-main._collect_known_person_names = fake_collect
-main.get_character_name = fake_char_name
-main.get_person_memory = fake_get_person_memory
+memory._collect_known_person_names = fake_collect
+memory.get_person_memory = fake_get_person_memory
+memory.character_name_provider = fake_char_name
 
 
 async def run():

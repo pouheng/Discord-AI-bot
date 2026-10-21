@@ -45,6 +45,16 @@ _Await_: NPC management, background tasks
 _Await_: Response引导, format引导
 
 **Image Reader（圖片分析）**：
-透過本地 ollama + Gemma4 12B 分析用戶分享的圖片，產生結構化描述（[類型]/[描述]/[表情]/[姿勢]/[環境]/[情緒]），注入 prompt 的 context 區塊，讓 AI 角色「看到」圖片。使用 `/readimg` slash command 觸發。
+分析用戶分享的圖片並產生結構化描述（[類型]/[描述]/[表情]/[姿勢]/[環境]/[情緒]），注入 prompt 的 context 區塊，讓 AI 角色「看到」圖片。使用 `/readimg` slash command 觸發。讀圖 provider 可切換：`config.json` 的 `image_reader.provider` = `ollama`（本地 Gemma4、不上傳，預設）或 `deepseek`（雲端 vision、較快但圖片會上傳）。
 
 _Await_: Vision analysis, image description
+
+**Web Reader（網頁讀取）**：
+自動偵測使用者訊息（含被回覆訊息）中的 http(s) 連結，透過 `web_reader.py` 抓取網頁（httpx + bs4；擋私有/本機位址）→ 交由 LLM 摘要 → 以「用戶分享的網頁內容」區塊注入 Phase 2，讓角色「看得到」連結內容。紀錄寫入 `web_logs/`。由 `config.json` 的 `web_reader` 控制。
+
+_Await_: URL reader, link reader
+
+**記憶模組（Memory module）**：
+擁有 `memories` 資料表的模組（`memory.py`）：含建表/欄位遷移與所有 SQL 存取。介面是記憶的 save / get / search / recall；實作吸收去重、語意合併、字首相似、`__BOT__` 自記憶疊加與重複分組。角色自身記憶以 `user_id='__BOT__'` 存在同一張表。對外只依賴 db（連線）與 profiles（人物別名解析）。
+
+_Await_: memory table, memory store, recall module

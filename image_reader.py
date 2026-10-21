@@ -48,7 +48,141 @@ def cleanup_expired_cache():
         _image_cache.pop(k, None)
 
 
-async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dict:
+_ANALYSIS_PROMPT = (
+    "分析這張圖片並用以下格式輸出：\n\n"
+    "[識別] 如果你認得出這是什麼角色、作品、梗圖、或 meme，直接寫出名稱。不確定就寫「不確定」。\n"
+    "[類型] 角色/場景/物品/其他\n"
+    "[描述] 一句話描述圖片內容\n"
+    "[表情] 角色的表情（如適用）\n"
+    "[姿勢] 角色的姿勢（如適用）\n"
+    "[環境] 背景環境（如適用）\n"
+    "[情緒] 整體氛圍\n\n"
+    "如果圖片包含文字（如對話截圖、meme），請在[描述]中說明文字內容。\n"
+    "只輸出結構化描述，不要加額外解釋。"
+)
+
+
+def _strip_thinking(raw_text: str) -> tuple[str, str]:
+    """剝離 <thinking>...</thinking>，回傳 (thinking, description)。"""
+    import re
+
+    thinking = ""
+    description = raw_text
+    m = re.search(r"<thinking>(.*?)</thinking>", raw_text, re.DOTALL)
+    if m:
+        thinking = m.group(1).strip()
+        description = raw_text[m.end():].strip()
+    return thinking, description
+
+
+def _guess_mime(filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
+    return {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+        "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp",
+    }.get(ext, "image/jpeg")
+
+
+def _resized_jpeg_b64(image_bytes: bytes, max_side: int) -> tuple[str, str]:
+    """縮到 max_side 內並轉 JPEG；失敗則回原圖 base64（mime 為空）。"""
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    mime = ""
+    try:
+        from PIL import Image as _PILImage
+        import io as _io
+
+        img = _PILImage.open(_io.BytesIO(image_bytes))
+        if max(img.size) > max_side:
+            ratio = max_side / max(img.size)
+            img = img.resize(
+                (int(img.size[0] * ratio), int(img.size[1] * ratio)),
+                _PILImage.LANCZOS,
+            )
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        mime = "image/jpeg"
+    except Exception:
+        pass
+    return b64, mime
+
+
+async def _read_with_deepseek(image_bytes: bytes, filename: str, image_cfg: dict) -> dict:
+    """用 DeepSeek（OpenAI 相容 vision）讀圖。圖片會上傳到服務端。"""
+    start = time.time()
+    try:
+        from llm_models import get_client, get_model
+    except Exception as e:
+        return {"success": False, "description": "", "thinking": "",
+                "error": f"無法載入 LLM 用戶端: {e}", "elapsed": 0.0}
+
+    max_side = int(image_cfg.get("max_side", 1024))
+    b64, mime = _resized_jpeg_b64(image_bytes, max_side)
+    mime = mime or _guess_mime(filename)
+    model = (image_cfg.get("deepseek_model") or "").strip() or get_model("default")
+    max_tokens = int(image_cfg.get("deepseek_max_tokens", 800))
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": _ANALYSIS_PROMPT},
+            {"type": "image_url",
+             "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ],
+    }]
+    # 讀圖不需要思考鏈；thinking 常把 token 吃光導致 content 空字串。
+    # 先關 thinking，仍空就把預算放大再試一次。
+    attempts = [
+        {"max_tokens": max_tokens, "extra_body": {"thinking": {"type": "disabled"}}},
+        {"max_tokens": max(max_tokens, 2000),
+         "extra_body": {"thinking": {"type": "disabled"}}},
+    ]
+    last_note = ""
+    try:
+        client = get_client(timeout=image_cfg.get("timeout", 120))
+        for i, opts in enumerate(attempts, 1):
+            resp = await client.chat.completions.create(
+                model=model,
+                temperature=0.2,
+                messages=messages,
+                **opts,
+            )
+            choice = resp.choices[0] if resp.choices else None
+            msg = choice.message if choice else None
+            raw = (getattr(msg, "content", None) or "").strip()
+            reasoning = getattr(msg, "reasoning_content", None) or ""
+            finish = getattr(choice, "finish_reason", None)
+            if raw:
+                thinking, description = _strip_thinking(raw)
+                if description:
+                    return {"success": True, "description": description,
+                            "thinking": thinking, "error": "",
+                            "elapsed": time.time() - start}
+            last_note = (
+                f"finish_reason={finish}, content_len={len(raw)}, "
+                f"reasoning_len={len(reasoning)}"
+            )
+            print(f"[讀圖] DeepSeek 空內容 attempt {i}/{len(attempts)} ({last_note})")
+        return {"success": False, "description": "", "thinking": "",
+                "error": f"DeepSeek 回傳空內容（{last_note}）",
+                "elapsed": time.time() - start}
+    except Exception as e:
+        return {"success": False, "description": "", "thinking": "",
+                "error": f"DeepSeek 讀圖失敗: {type(e).__name__}: {e}",
+                "elapsed": time.time() - start}
+
+
+async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict,
+                     image_cfg: dict | None = None) -> dict:
+    """讀圖入口：依 image_cfg['provider'] 分派 ollama（預設，本地）或 deepseek（雲端）。"""
+    image_cfg = image_cfg or {}
+    if (image_cfg.get("provider") or "ollama").lower() == "deepseek":
+        return await _read_with_deepseek(image_bytes, filename, image_cfg)
+    return await _read_with_ollama(image_bytes, filename, ollama_cfg or {})
+
+
+async def _read_with_ollama(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dict:
     """
     透過 ollama + Gemma4 分析圖片，回傳結構化描述。
 
@@ -71,18 +205,9 @@ async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dic
         client = _ollama.Client(host=host)
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        prompt = (
-            "分析這張圖片並用以下格式輸出：\n\n"
-            "[識別] 如果你認得出這是什麼角色、作品、梗圖、或 meme，直接寫出名稱。不確定就寫「不確定」。\n"
-            "[類型] 角色/場景/物品/其他\n"
-            "[描述] 一句話描述圖片內容\n"
-            "[表情] 角色的表情（如適用）\n"
-            "[姿勢] 角色的姿勢（如適用）\n"
-            "[環境] 背景環境（如適用）\n"
-            "[情緒] 整體氛圍\n\n"
-            "如果圖片包含文字（如對話截圖、meme），請在[描述]中說明文字內容。\n"
-            "只輸出結構化描述，不要加額外解釋。"
-        )
+        prompt = _ANALYSIS_PROMPT
+        keep_alive = ollama_cfg.get("keep_alive", "30m")
+        num_predict = ollama_cfg.get("num_predict", 768)
 
         def _call():
             return client.chat(
@@ -92,6 +217,8 @@ async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dic
                     "content": prompt,
                     "images": [image_b64],
                 }],
+                keep_alive=keep_alive,
+                options={"num_predict": num_predict},
             )
 
         # 高解析度圖片容易超時，先縮小到 768px 以內並轉 JPEG 壓縮
@@ -101,8 +228,9 @@ async def read_image(image_bytes: bytes, filename: str, ollama_cfg: dict) -> dic
             import io as _io
             _img = _PILImage.open(_io.BytesIO(image_bytes))
             _max_side = max(_img.size)
-            if _max_side > 768:
-                _ratio = 768 / _max_side
+            _limit = int(ollama_cfg.get("max_side", 768))
+            if _max_side > _limit:
+                _ratio = _limit / _max_side
                 _new_size = (int(_img.size[0] * _ratio), int(_img.size[1] * _ratio))
                 _img = _img.resize(_new_size, _PILImage.LANCZOS)
                 if _img.mode in ("RGBA", "P", "LA"):

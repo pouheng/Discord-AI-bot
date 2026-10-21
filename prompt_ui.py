@@ -4,15 +4,18 @@
     python prompt_ui.py            # http://127.0.0.1:8788
     python prompt_ui.py --port 9000
 
-- 檢視：讀 prompt_logs/last_prompt_blocks.json，顯示上一次 Phase 2 的所有注入區段（含 OOC/IC）。
+- 檢視：讀 prompt_logs/last_prompt_blocks.json，顯示上一次 Phase 2 的所有注入區段（含 OOC/IC）；
+  讀不到結構化快照時退回解析 prompt_logs/last_prompt.txt 全文。
 - 編輯：讀寫 prompt_blocks.json（OOC／IC 兩個分頁），可新增/修改/啟停/排序條目。
 - 歷史：每次儲存寫一份快照到 prompt_blocks_history/，可檢視與回滾。
 
 僅綁定 127.0.0.1。
 """
 import argparse
+import datetime
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -26,6 +29,7 @@ import prompt_blocks  # noqa: E402
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROMPT_LOG_DIR = os.path.join(SCRIPT_DIR, "prompt_logs")
 LAST_DUMP = os.path.join(PROMPT_LOG_DIR, "last_prompt_blocks.json")
+RAW_PROMPT = os.path.join(PROMPT_LOG_DIR, "last_prompt.txt")
 
 PLACEHOLDERS = ["today", "char_name", "banned_words"]
 
@@ -48,12 +52,66 @@ def get_data():
     }
 
 
+_SECTION_RE = re.compile(r"^=== (.+?) ===[ \t]*$", re.M)
+
+
+def _parse_sections(text: str) -> dict[str, str]:
+    """把 last_prompt.txt 依 '=== 區段 ===' 標題切成 dict。"""
+    marks = list(_SECTION_RE.finditer(text))
+    secs: dict[str, str] = {}
+    for i, m in enumerate(marks):
+        start = m.end()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        secs[m.group(1).strip()] = text[start:end].strip("\n")
+    return secs
+
+
+def _dump_from_raw_prompt() -> dict:
+    """讀不到結構化快照時，改用 last_prompt.txt 全文拼出檢視資料。"""
+    with open(RAW_PROMPT, "r", encoding="utf-8") as f:
+        secs = _parse_sections(f.read())
+    context = []
+    for line in secs.get("CONTEXT", "").splitlines():
+        mm = re.match(r"^\[(.+?)\]\s?(.*)$", line)
+        if mm:
+            context.append({"role": mm.group(1), "content": mm.group(2)})
+        elif line.strip() and context:
+            context[-1]["content"] += "\n" + line
+    fmt = secs.get("FORMAT OVERRIDE (injected user msg)",
+                   secs.get("FORMAT OVERRIDE", ""))
+    priming = secs.get("PRIMING", "")
+    mtime = datetime.datetime.fromtimestamp(
+        os.path.getmtime(RAW_PROMPT)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "timestamp": mtime,
+        # IC 的 priming 以「開始回應」開頭；OOC 以「喔好，收到了」開頭
+        "channel_type": "in_character" if priming.strip().startswith("開始回應") else "out_of_character",
+        "channel": "",
+        "enable_ic_style": False,
+        "segments": [{
+            "title": "SYSTEM（完整）",
+            "kind": "static",
+            "included": True,
+            "condition": [],
+            "rendered": secs.get("SYSTEM", ""),
+        }],
+        "context": context,
+        "current_message": secs.get("CURRENT MESSAGE", ""),
+        "format_override": fmt,
+        "priming": priming,
+        "raw_fallback": True,
+    }
+
+
 @app.get("/api/last")
 def get_last():
-    if not os.path.exists(LAST_DUMP):
-        return {"empty": True}
-    with open(LAST_DUMP, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if os.path.exists(LAST_DUMP):
+        with open(LAST_DUMP, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if os.path.exists(RAW_PROMPT):
+        return _dump_from_raw_prompt()
+    return {"empty": True}
 
 
 @app.post("/api/save")
@@ -167,7 +225,8 @@ function render() {
 function renderView(m) {
   if (!LAST || LAST.empty) { m.innerHTML = '<p class="muted">尚無紀錄（bot 還沒產生過 Phase 2 提示詞）。</p>'; return; }
   const badge = `<span class="badge ${LAST.channel_type==='in_character'?'static':'dynamic'}">${LAST.channel_type} / ${LAST.channel||''}${LAST.enable_ic_style?' · IC風格':''}</span>`;
-  m.innerHTML = `<p>時間：${LAST.timestamp} &nbsp; ${badge} &nbsp;<span class="muted">一次 OOC/IC 只能看最近一次</span></p>`;
+  const srcNote = LAST.raw_fallback ? ' &nbsp;<span class="warn">（來源：last_prompt.txt 全文，非結構化快照）</span>' : '';
+  m.innerHTML = `<p>時間：${LAST.timestamp} &nbsp; ${badge} &nbsp;<span class="muted">一次 OOC/IC 只能看最近一次</span>${srcNote}</p>`;
   for (const s of LAST.segments) {
     const d = document.createElement("div"); d.className = "seg" + (s.included===false?" off":"");
     const cond = (s.condition&&s.condition.length)? ` · 條件：${s.condition.join(" 且 ")}` : "";

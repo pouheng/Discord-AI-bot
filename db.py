@@ -29,26 +29,10 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            user_id TEXT,
-            user_name TEXT,
-            topic TEXT,
-            content TEXT,
-            context TEXT DEFAULT 'ic',
-            mem_type TEXT DEFAULT ''
-        )
-    """)
-    try:
-        cursor.execute("ALTER TABLE memories ADD COLUMN context TEXT DEFAULT 'ic'")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE memories ADD COLUMN mem_type TEXT DEFAULT ''")
-    except Exception:
-        pass
+    # memories 表由記憶模組擁有（延後匯入避免與記憶模組的 db 依賴形成循環）
+    from memory import create_memories_table
+
+    create_memories_table(cursor)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS world_lore (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

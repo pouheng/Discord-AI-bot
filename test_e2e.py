@@ -1,5 +1,5 @@
 """End-to-end virtual request test — 模擬 Discord 訊息經過 on_message 全管線"""
-import sys, os, asyncio, unittest.mock as mock
+import sys, os, asyncio, tempfile, unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("DISCORD_TOKEN", "fake")
@@ -67,6 +67,8 @@ def _make_ref():
 
 
 def _default_mocks():
+    # 測試不得污染正式 prompt_logs/（會蓋掉編輯器的「上次提示詞」快照）
+    main.PROMPT_LOG_DIR = tempfile.mkdtemp(prefix="mio_test_logs_")
     main.get_character_name = mock.AsyncMock(return_value="Mio")
     main.get_all_lore_full = mock.AsyncMock(return_value="")
     main.get_self_memory_raw = mock.AsyncMock(return_value=[])

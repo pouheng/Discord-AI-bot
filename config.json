@@ -99,7 +99,25 @@
   "ollama": {
     "host": "http://localhost:11434",
     "model": "gemma4:12b",
-    "timeout": 180
+    "timeout": 180,
+    "keep_alive": "30m",
+    "max_side": 768,
+    "num_predict": 768
+  },
+  "image_reader": {
+    "provider": "deepseek",
+    "deepseek_model": "",
+    "deepseek_max_tokens": 800,
+    "max_side": 1024,
+    "timeout": 120
+  },
+  "web_reader": {
+    "enabled": true,
+    "timeout": 10,
+    "max_bytes": 500000,
+    "max_links": 2,
+    "max_text_chars": 6000,
+    "block_private": true
   },
   "google_sheets": {
     "spreadsheet_id": "15ZRL5Hx6bIlkuNZ6xiTc56_GTBZrKRzizdm34tLaMjY"
