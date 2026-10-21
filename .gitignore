@@ -31,6 +31,7 @@ start.bat
 # ── 憑證 / secrets：絕對不可提交 ──
 # Google OAuth 與 Discord bot token
 token.json
+drive_token.json
 credentials.json
 client_secret_*.json
 service_account*.json

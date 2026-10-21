@@ -110,7 +110,7 @@ def prune(service, keep: int) -> int:
     """刪除資料夾內較舊的 rp_memory_*.db，保留最近 keep 份。回傳刪除數。"""
     folder_id = _get_or_create_folder(service)
     q = (f"'{folder_id}' in parents and "
-         f"name contains 'rp_memory_' and name endswith '.db' and trashed=false")
+         f"name contains 'rp_memory_' and trashed=false")
     res = service.files().list(q=q, fields="files(id,name,createdTime)",
                                orderBy="createdTime desc", pageSize=100).execute()
     files = res.get("files", [])
@@ -124,7 +124,7 @@ def prune(service, keep: int) -> int:
 def list_backups(service) -> list:
     folder_id = _get_or_create_folder(service)
     q = (f"'{folder_id}' in parents and "
-         f"name contains 'rp_memory_' and name endswith '.db' and trashed=false")
+         f"name contains 'rp_memory_' and trashed=false")
     res = service.files().list(q=q, fields="files(id,name,size,createdTime)",
                                orderBy="createdTime desc", pageSize=100).execute()
     return res.get("files", [])
