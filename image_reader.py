@@ -113,7 +113,7 @@ async def _read_with_deepseek(image_bytes: bytes, filename: str, image_cfg: dict
     """用 DeepSeek（OpenAI 相容 vision）讀圖。圖片會上傳到服務端。"""
     start = time.time()
     try:
-        from llm_models import get_client, get_model
+        from llm_models import get_client, get_model, model_chain
     except Exception as e:
         return {"success": False, "description": "", "thinking": "",
                 "error": f"無法載入 LLM 用戶端: {e}", "elapsed": 0.0}
@@ -131,39 +131,50 @@ async def _read_with_deepseek(image_bytes: bytes, filename: str, image_cfg: dict
              "image_url": {"url": f"data:{mime};base64,{b64}"}},
         ],
     }]
-    # 讀圖不需要思考鏈；thinking 常把 token 吃光導致 content 空字串。
-    # 先關 thinking，仍空就把預算放大再試一次。
-    attempts = [
-        {"max_tokens": max_tokens, "extra_body": {"thinking": {"type": "disabled"}}},
-        {"max_tokens": max(max_tokens, 2000),
-         "extra_body": {"thinking": {"type": "disabled"}}},
-    ]
+    # 讀圖不需要長篇推理；部分模型（only_reasoning）不能關 thinking，
+    # 所以不強制關，改為「逐次放大預算 + 每次獨立容錯」。
+    attempts = [max(max_tokens, 2000), max(max_tokens, 4000)]
     last_note = ""
     try:
+        routes = model_chain("default", model) or [model]
+    except Exception:
+        routes = [model]
+    try:
         client = get_client(timeout=image_cfg.get("timeout", 120))
-        for i, opts in enumerate(attempts, 1):
-            resp = await client.chat.completions.create(
-                model=model,
-                temperature=0.2,
-                messages=messages,
-                **opts,
-            )
-            choice = resp.choices[0] if resp.choices else None
-            msg = choice.message if choice else None
-            raw = (getattr(msg, "content", None) or "").strip()
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            finish = getattr(choice, "finish_reason", None)
-            if raw:
-                thinking, description = _strip_thinking(raw)
-                if description:
-                    return {"success": True, "description": description,
-                            "thinking": thinking, "error": "",
-                            "elapsed": time.time() - start}
-            last_note = (
-                f"finish_reason={finish}, content_len={len(raw)}, "
-                f"reasoning_len={len(reasoning)}"
-            )
-            print(f"[讀圖] DeepSeek 空內容 attempt {i}/{len(attempts)} ({last_note})")
+        for ri, route_model in enumerate(routes, 1):
+            if ri > 1:
+                print(f"[讀圖] 切換線路 → {route_model}")
+            for i, budget in enumerate(attempts, 1):
+                try:
+                    resp = await client.chat.completions.create(
+                        model=route_model,
+                        temperature=0.2,
+                        max_tokens=budget,
+                        messages=messages,
+                    )
+                except Exception as e:
+                    last_note = (
+                        f"route {ri}/{len(routes)} ({route_model}) attempt {i} error: "
+                        f"{type(e).__name__}: {str(e)[:120]}"
+                    )
+                    print(f"[讀圖] DeepSeek {last_note}")
+                    break  # 這條線路壞了 → 換下一條
+                choice = resp.choices[0] if resp.choices else None
+                msg = choice.message if choice else None
+                raw = (getattr(msg, "content", None) or "").strip()
+                reasoning = getattr(msg, "reasoning_content", None) or ""
+                finish = getattr(choice, "finish_reason", None)
+                if raw:
+                    thinking, description = _strip_thinking(raw)
+                    if description:
+                        return {"success": True, "description": description,
+                                "thinking": thinking, "error": "",
+                                "elapsed": time.time() - start}
+                last_note = (
+                    f"route {ri}/{len(routes)} ({route_model}) finish_reason={finish}, "
+                    f"content_len={len(raw)}, reasoning_len={len(reasoning)}"
+                )
+                print(f"[讀圖] DeepSeek 空內容 ({last_note})")
         return {"success": False, "description": "", "thinking": "",
                 "error": f"DeepSeek 回傳空內容（{last_note}）",
                 "elapsed": time.time() - start}

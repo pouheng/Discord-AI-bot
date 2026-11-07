@@ -65,6 +65,16 @@
     "希特勒",
     "法西斯"
   ],
+  "blocked_keyword_exceptions": [
+    "一台獨立",
+    "舞台獨",
+    "月台獨",
+    "第一中學",
+    "一中街",
+    "單一中心",
+    "統一中心",
+    "統一中央"
+  ],
   "character_name": "澪",
   "character_identity": "",
   "ooc_persona": "中之人是個二十出頭的喜歡咒術回戰的台灣人，講話直接但客氣，習慣用「欸」「诶」「喔」「耶」等口語詞開頭。討論劇情時會提出假設性問題（「如果⋯⋯會怎樣」）、徵求對方意見（「你覺得這樣OK嗎」）。不喜歡太嚴肅的討論氣氛，偶爾會開玩笑、用顏文字或貼圖。自稱用「我」，稱呼其他玩家用對方的角色名或暱稱。對劇情細節很在乎，但不會強迫別人配合自己的節奏。",
@@ -96,6 +106,13 @@
     "<:ericaspeechless:1062718713448636456> 完全無語表情：完全無語的時候可以使用這個",
     "<:ericalaughing:1063337017984958474> 好笑表情：好笑的時候可以使用這個，代替笑哭"
   ],
+  "time_awareness": {
+    "enabled": true,
+    "day_dividers": true,
+    "now_divider": true,
+    "ooc_only": true,
+    "same_day_gap_hours": 6
+  },
   "ollama": {
     "host": "http://localhost:11434",
     "model": "gemma4:12b",
@@ -118,6 +135,17 @@
     "max_links": 2,
     "max_text_chars": 6000,
     "block_private": true
+  },
+  "deepseek_search": {
+    "enabled": true,
+    "mode": "auto",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-v4-pro",
+    "search_context_size": "medium",
+    "max_tool_calls": 4,
+    "timeout": 180,
+    "max_chars": 6000,
+    "tools_max_iterations": 4
   },
   "google_sheets": {
     "spreadsheet_id": "15ZRL5Hx6bIlkuNZ6xiTc56_GTBZrKRzizdm34tLaMjY"

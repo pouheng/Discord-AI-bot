@@ -30,6 +30,7 @@ from profiles import (
 from prompts import build_style_block, build_banned_str, build_expr_str, build_safety_str
 import image_reader
 import web_reader
+import deepseek_search
 from llm_models import get_model, get_client
 import llm_models
 import memory
@@ -176,6 +177,11 @@ DEFAULT_PROMPT_CONFIG = {
         "希特勒",
         "法西斯",
     ],
+    # 無害但會被上面的子字串誤命中的詞（比對前先移除）
+    "blocked_keyword_exceptions": [
+        "一台獨立", "舞台獨", "月台獨",
+        "第一中學", "一中街", "單一中心", "統一中心", "統一中央",
+    ],
     "planning_template": (
         # 保留舊 key 作為 IC 預設
         "回顧當前情況：\n"
@@ -280,6 +286,204 @@ def llm_effort(effort: str) -> dict:
     raise ValueError(f"未知的思考強度: {effort!r}（可用 off/low/high）")
 
 
+def _now_text() -> str:
+    """目前時間（含週幾），供「時間感知」注入用，例：2026-10-19（週日）21:35。"""
+    n = datetime.datetime.now()
+    return f"{n.strftime('%Y-%m-%d')}（週{'一二三四五六日'[n.weekday()]}）{n.strftime('%H:%M')}"
+
+
+# ── 時間感知：在歷史對話中插入「日期分隔」──────────────────────────
+# 目的：讓模型在 OOC 時能感知「昨天的訊息 / 今天的訊息」是不同的一天，
+# 而不是把所有歷史都當成剛剛發生。做法是插入 role="system" 的分隔訊息
+# （OpenAI 相容 API 允許訊息中間出現 system；DeepSeek 會當成 in-history 更新）。
+
+_WEEKDAY_CN = "一二三四五六日"
+
+
+def _msg_ts(msg) -> str:
+    """取 Discord 訊息的建立時間（本地時區字串）；拿不到就回空字串。"""
+    dt = getattr(msg, "created_at", None)
+    if not isinstance(dt, datetime.datetime):
+        return ""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_ts(raw) -> datetime.datetime | None:
+    if isinstance(raw, datetime.datetime):
+        dt = raw
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(raw)
+    except Exception:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _day_label(day: datetime.date) -> str:
+    return f"{day.strftime('%Y-%m-%d')}（週{_WEEKDAY_CN[day.weekday()]}）"
+
+
+def _relative_day_label(day: datetime.date, today: datetime.date) -> str:
+    delta = (today - day).days
+    if delta == 0:
+        return "今天"
+    if delta == 1:
+        return "昨天"
+    if delta == 2:
+        return "前天"
+    if delta > 2:
+        return f"{delta} 天前"
+    return f"{-delta} 天後"
+
+
+def _format_gap(delta: datetime.timedelta) -> str:
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return ""
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} 天")
+    if hours:
+        parts.append(f"{hours} 小時")
+    if mins and not days:
+        parts.append(f"{mins} 分鐘")
+    return " ".join(parts)
+
+
+def _divider_msg(text: str) -> dict:
+    return {"role": "system", "content": text, "ts": "", "msg_id": 0}
+
+
+def _day_divider_text(day: datetime.date, today: datetime.date, gap,
+                      *, first: bool = False) -> str:
+    info = [_day_label(day), _relative_day_label(day, today)]
+    if gap is not None:
+        g = _format_gap(gap)
+        if g:
+            info.append(f"距上一則 {g}")
+    head = "｜".join(info)
+    line = "━" * 16
+    if first:
+        return (
+            f"{line}\n"
+            f"【歷史起點】以下對話發生於 {head}。\n"
+            f"{line}"
+        )
+    return (
+        f"{line}\n"
+        f"【日期分隔】以下對話開始於 {head}。\n"
+        "（以上屬於更早的日期，以下屬於新的一天，請把它們視為不同日子。）\n"
+        f"{line}"
+    )
+
+
+def _gap_divider_text(day: datetime.date, today: datetime.date, gap) -> str:
+    g = _format_gap(gap)
+    return (
+        "── ── ── ── ──\n"
+        f"【時間分隔】以下對話開始於 {_day_label(day)}"
+        f"｜{_relative_day_label(day, today)}"
+        + (f"｜距上一則 {g}" if g else "")
+        + "。\n"
+        "── ── ── ── ──"
+    )
+
+
+def insert_day_dividers(context: list, now: datetime.datetime | None = None,
+                        gap_hours: float = 6) -> list:
+    """在歷史訊息之間插入日期分隔與長時間間隔標記（回傳新 list）。
+
+    只處理有 `ts` 的訊息；沒有時間的（例如討論串標題保底）原樣保留。
+    """
+    if not context:
+        return context
+    now = now or datetime.datetime.now()
+    today = now.date()
+    out: list = []
+    prev_dt = None
+    prev_day = None
+    gap_secs = max(0.0, float(gap_hours or 0)) * 3600
+
+    for m in context:
+        dt = _parse_ts(m.get("ts"))
+        if dt is None:
+            out.append(m)
+            continue
+        day = dt.date()
+        gap = (dt - prev_dt) if prev_dt is not None else None
+        if prev_day is None:
+            out.append(_divider_msg(_day_divider_text(day, today, gap, first=True)))
+        elif day != prev_day:
+            out.append(_divider_msg(_day_divider_text(day, today, gap)))
+        elif gap_secs and gap is not None and gap.total_seconds() >= gap_secs:
+            out.append(_divider_msg(_gap_divider_text(day, today, gap)))
+        out.append(m)
+        prev_dt = dt
+        prev_day = day
+    return out
+
+
+def _now_divider_text(context: list, now: datetime.datetime | None = None) -> str:
+    """在「目前訊息」前標出此刻時間，以及距離上一則歷史訊息多久。"""
+    now = now or datetime.datetime.now()
+    today = now.date()
+    info = [f"{_day_label(today)} {now.strftime('%H:%M')}", "現在"]
+    gap = None
+    for m in reversed(context or []):
+        dt = _parse_ts(m.get("ts"))
+        if dt is not None:
+            gap = now - dt
+            break
+    if gap is not None:
+        g = _format_gap(gap)
+        if g:
+            info.append(f"距上一則 {g}")
+    line = "━" * 16
+    return (
+        f"{line}\n"
+        f"【現在】{'｜'.join(info)}。接下來是剛剛收到的訊息。\n"
+        f"{line}"
+    )
+
+
+def _time_awareness_cfg(pcfg: dict) -> dict:
+    raw = (pcfg or {}).get("time_awareness") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        gap_h = float(raw.get("same_day_gap_hours", 6))
+    except (TypeError, ValueError):
+        gap_h = 6.0
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "day_dividers": bool(raw.get("day_dividers", True)),
+        "now_divider": bool(raw.get("now_divider", True)),
+        "ooc_only": bool(raw.get("ooc_only", True)),
+        "same_day_gap_hours": gap_h,
+    }
+
+
+def _time_awareness_for(pcfg: dict, channel_type: str) -> dict | None:
+    """回傳生效的時間感知設定；未啟用或此頻道不適用時回 None。"""
+    cfg = _time_awareness_cfg(pcfg)
+    if not cfg["enabled"]:
+        return None
+    if cfg["ooc_only"] and channel_type != "out_of_character":
+        return None
+    return cfg
+
+
 _LLM_DEBUG_LOG = os.path.join(SCRIPT_DIR, "llm_call_debug.jsonl")
 
 
@@ -299,52 +503,92 @@ def _llm_debug_log(record: dict) -> None:
 
 async def _llm_create_with_retry(call_kwargs: dict, *, label: str, retries: int = 4,
                                  slot: str = "default"):
-    """呼叫 API；暫時性錯誤（429／5xx／逾時／連線）做退避重試。
+    """呼叫 API；暫時性錯誤做退避重試；線路失敗時自動切換（三線路）。
 
-    重試用盡、或遇到永久錯誤（4xx）→ 一律退回預設 DeepSeek
-    （來源：DEFAULT_BASE_URL + .env key；模型：該 slot 的預設 ID）一次。
+    同一閘道內依 models.json 的 fallback_models 依序嘗試
+    （如 global:deepseek-v4.1-flash → global:deepseek-v4.1-flash-sg → cn:deepseek-v4.1-flash）。
+    遇到 5xx／限流／逾時／連線／401 等「這條線路壞了」的錯誤，立刻換下一條，
+    不浪費時間在同一條線路退避；全部線路都失敗才退回預設 DeepSeek 一次。
     """
     import openai as _oa
 
+    primary_model = call_kwargs.get("model") or llm_models.get_model(slot)
+    chain = llm_models.model_chain(slot, primary_model) or [primary_model]
     last_exc: Exception | None = None
-    for attempt in range(retries):
-        try:
-            # 硬性逾時：供應商收下請求卻不回內容時（keep-alive 讓讀取逾時失效），
-            # 這是最後一道牆，避免整個訊息處理卡死。
-            return await asyncio.wait_for(
-                get_client(timeout=LLM_CALL_TIMEOUT, max_retries=0).chat.completions.create(**call_kwargs),
-                timeout=LLM_CALL_TIMEOUT,
-            )
-        except _oa.RateLimitError as e:
-            last_exc = e
-            wait = 2.0 * (attempt + 1)
-            _llm_debug_log({"event": "rate_limit", "label": label, "attempt": attempt,
-                            "detail": str(e)[:300]})
-            print(f"[LLM] {label} 429 限流，{wait:.0f}s 後重試")
-            await asyncio.sleep(wait)
-        except _oa.InternalServerError as e:
-            # 5xx（含閘道 no_healthy_account 這類上游暫時不可用）→ 退避重試
-            last_exc = e
-            wait = 2.0 * (attempt + 1)
-            _llm_debug_log({"event": "server_error", "label": label, "attempt": attempt,
-                            "status": getattr(e, "status_code", None), "detail": str(e)[:300]})
-            print(f"[LLM] {label} 5xx（{getattr(e, 'status_code', None)}），{wait:.0f}s 後重試")
-            await asyncio.sleep(wait)
-        except (asyncio.TimeoutError, _oa.APITimeoutError, _oa.APIConnectionError) as e:
-            last_exc = e
-            wait = 1.5 * (attempt + 1)
-            _llm_debug_log({"event": "transient", "label": label, "attempt": attempt,
-                            "type": type(e).__name__, "detail": str(e)[:300]})
-            print(f"[LLM] {label} {type(e).__name__}，{wait:.0f}s 後重試")
-            await asyncio.sleep(wait)
-        except Exception as e:
-            # 永久錯誤（400/404 等）不重試，直接進回退
-            last_exc = e
-            _llm_debug_log({"event": "permanent_error", "label": label,
-                            "type": type(e).__name__, "detail": str(e)[:300]})
+    abort = False
+
+    for mi, model in enumerate(chain):
+        if mi > 0:
+            print(f"[LLM] {label} 切換線路 → {model}")
+            _llm_debug_log({"event": "route_fallback", "label": label, "model": model})
+        kwargs = dict(call_kwargs)
+        kwargs["model"] = model
+        last_route = mi == len(chain) - 1
+        for attempt in range(retries):
+            try:
+                # 硬性逾時：供應商收下請求卻不回內容時（keep-alive 讓讀取逾時失效），
+                # 這是最後一道牆，避免整個訊息處理卡死。
+                return await asyncio.wait_for(
+                    get_client(timeout=LLM_CALL_TIMEOUT, max_retries=0).chat.completions.create(**kwargs),
+                    timeout=LLM_CALL_TIMEOUT,
+                )
+            except _oa.RateLimitError as e:
+                last_exc = e
+                if not last_route:
+                    print(f"[LLM] {label} 429 → 換線路")
+                    _llm_debug_log({"event": "rate_limit_switch", "label": label,
+                                    "model": model, "detail": str(e)[:300]})
+                    break
+                wait = 2.0 * (attempt + 1)
+                _llm_debug_log({"event": "rate_limit", "label": label, "attempt": attempt,
+                                "detail": str(e)[:300]})
+                print(f"[LLM] {label} 429 限流，{wait:.0f}s 後重試")
+                await asyncio.sleep(wait)
+            except _oa.InternalServerError as e:
+                # 5xx（含閘道 no_healthy_account）→ 直接換線路
+                last_exc = e
+                if not last_route:
+                    print(f"[LLM] {label} 5xx（{getattr(e, 'status_code', None)}）→ 換線路")
+                    _llm_debug_log({"event": "server_error_switch", "label": label,
+                                    "model": model, "status": getattr(e, "status_code", None),
+                                    "detail": str(e)[:300]})
+                    break
+                wait = 2.0 * (attempt + 1)
+                _llm_debug_log({"event": "server_error", "label": label, "attempt": attempt,
+                                "status": getattr(e, "status_code", None), "detail": str(e)[:300]})
+                print(f"[LLM] {label} 5xx（{getattr(e, 'status_code', None)}），{wait:.0f}s 後重試")
+                await asyncio.sleep(wait)
+            except (asyncio.TimeoutError, _oa.APITimeoutError, _oa.APIConnectionError) as e:
+                last_exc = e
+                if not last_route:
+                    print(f"[LLM] {label} {type(e).__name__} → 換線路")
+                    _llm_debug_log({"event": "transient_switch", "label": label,
+                                    "model": model, "type": type(e).__name__,
+                                    "detail": str(e)[:300]})
+                    break
+                wait = 1.5 * (attempt + 1)
+                _llm_debug_log({"event": "transient", "label": label, "attempt": attempt,
+                                "type": type(e).__name__, "detail": str(e)[:300]})
+                print(f"[LLM] {label} {type(e).__name__}，{wait:.0f}s 後重試")
+                await asyncio.sleep(wait)
+            except (_oa.AuthenticationError, _oa.PermissionDeniedError, _oa.NotFoundError) as e:
+                # 這條線路的憑證/模型不可用 → 換下一條
+                last_exc = e
+                print(f"[LLM] {label} {type(e).__name__} → 換線路")
+                _llm_debug_log({"event": "auth_switch", "label": label, "model": model,
+                                "type": type(e).__name__, "detail": str(e)[:300]})
+                break
+            except Exception as e:
+                # 永久錯誤（400 等）不重試，也不換線路
+                last_exc = e
+                _llm_debug_log({"event": "permanent_error", "label": label,
+                                "type": type(e).__name__, "detail": str(e)[:300]})
+                abort = True
+                break
+        if abort:
             break
 
-    # ── 回退：任何錯誤都退回預設 DeepSeek（來源 + 該 slot 的預設模型）一次 ──
+    # ── 回退：三線路都失敗 → 退回預設 DeepSeek（來源 + 該 slot 的預設模型）一次 ──
     fb_model = llm_models.fallback_model(slot)
     if llm_models.is_default_source() and call_kwargs.get("model") == fb_model:
         raise last_exc  # 本來就是預設，回退同一組沒有意義
@@ -352,7 +596,7 @@ async def _llm_create_with_retry(call_kwargs: dict, *, label: str, retries: int 
     fb_kwargs["model"] = fb_model
     try:
         _llm_debug_log({"event": "fallback", "label": label, "model": fb_model})
-        print(f"[LLM] {label} 回退預設模型 {fb_model}")
+        print(f"[LLM] {label} 三線路皆失敗，回退預設模型 {fb_model}")
         return await asyncio.wait_for(
             llm_models.get_fallback_client(timeout=LLM_CALL_TIMEOUT).chat.completions.create(**fb_kwargs),
             timeout=LLM_CALL_TIMEOUT,
@@ -2306,7 +2550,10 @@ async def fetch_reply_chain(
                 else:
                     clean_content = f"{reply_marker}\n{clean_content}"
                 chain.insert(
-                    0, {"role": role, "content": clean_content, "msg_id": parent_msg.id}
+                    0, {"role": role, "content": clean_content,
+                        "msg_id": parent_msg.id, "ts": _msg_ts(parent_msg),
+                        "name": (char_name if role == "assistant"
+                                 else parent_msg.author.display_name)}
                 )
 
                 if (
@@ -2378,6 +2625,8 @@ async def fetch_recent_messages(
                             else formatted_starter
                         ),
                         "msg_id": starter.id,
+                        "ts": _msg_ts(starter),
+                        "name": name,
                     }
                 )
         except Exception as e:
@@ -2415,6 +2664,8 @@ async def fetch_recent_messages(
                     "role": role,
                     "content": f"[{name}]: {clean}" if role == "user" else clean,
                     "msg_id": msg.id,
+                    "ts": _msg_ts(msg),
+                    "name": name,
                 },
             )
     except Exception as e:
@@ -2579,7 +2830,8 @@ async def run_phase1(
     lore_full: str = "",
 ) -> tuple:
     """Phase 1：記憶召回分析。
-    回傳 (phase1_json, recall_user_ids, lore_topics, lore_notes, recall_threads, load_plot, enable_ic_style, supplement)"""
+    回傳 (phase1_json, recall_user_ids, lore_topics, lore_notes, recall_threads,
+          load_plot, enable_ic_style, supplement, need_web_search, web_search_query)"""
     candidates_text = "\n".join(
         f"- {c['name']} (id: {c['id']})" for c in recall_candidates
     )
@@ -2628,6 +2880,12 @@ async def run_phase1(
 - 使用者未指定日期或期間時，recall_date_range 設為 null。
 - ⚠️ 只是問「你還記得 X 嗎」這類點名查詢不算日期區間召回，不要填。
 
+【網路搜尋判斷 - need_web_search】
+- 只有在需要「資料庫以外的即時／外部資訊」時才設 true：最新新聞、近期事件、價格／匯率／天氣、某網站的內容、需要上網查證的事實、使用者要求你去看某個連結。
+- 角色扮演、劇情、人物關係、設定討論、閒聊、開玩笑、單純回應情緒 → false。
+- 不確定 → false（不要為了多做事而開）。
+- 若 true，web_search_query 給一句「具體、可直接丟搜尋引擎」的查詢（不要放角色名、RP 用語或「澪」）。
+
 【輸出格式】
 純 JSON（不加 ```）。
 - recall：陣列，每個元素是 {"id": "使用者ID數字"}；也可填 NPC 正名（如 "甲"），系統會依身份對照表解析
@@ -2636,6 +2894,8 @@ async def run_phase1(
 - load_plot：布林值
 - enable_ic_style：布林值
 - recall_date_range：物件 {"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}，無則 null
+- need_web_search：布林值（是否需要即時網路搜尋）
+- web_search_query：字串；need_web_search=true 時給具體查詢，否則空字串
 - lore_notes：陣列，每個元素可以是：
   - 關聯到某個 topic 的註釋：{"topic":"條目名稱","note":"註釋內容"}
   - 或自由註釋（無 topic）：{"note":"自由註釋內容"}
@@ -2654,7 +2914,7 @@ async def run_phase1(
    若同一 topic 有多條相關條目，優先選取時間最新或內容最完整的，同 topic 最多選 2 條。
 
 正確範例：
-{"recall":[{"id":"1083341557677183036"}],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_topics":[],"lore_notes":[{"note":"自由註釋"}],"supplement":[{"category":"世界觀","topic":"魔法","content":"這世界的人都會覺醒1種個人魔法...","note":"與當前對話直接相關"},{"category":"角色能力","topic":"機械義手","content":"澪的右手為機械義手..."}]}"""
+{"recall":[{"id":"1083341557677183036"}],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_topics":[],"need_web_search":false,"web_search_query":"","lore_notes":[{"note":"自由註釋"}],"supplement":[{"category":"世界觀","topic":"魔法","content":"這世界的人都會覺醒1種個人魔法...","note":"與當前對話直接相關"},{"category":"角色能力","topic":"機械義手","content":"澪的右手為機械義手..."}]}"""
 
     # ──────────────────────────────────────────────
     # 動態資料區（底部）：完整資料庫內容
@@ -2790,6 +3050,8 @@ async def run_phase1(
     recall_threads = []
     load_plot = False
     enable_ic_style = False
+    need_web_search = False
+    web_search_query = ""
     supplement = ""
     phase1_json = {}
     try:
@@ -2821,6 +3083,8 @@ async def run_phase1(
             recall_threads = []
         load_plot = phase1_json.get("load_plot", False)
         enable_ic_style = phase1_json.get("enable_ic_style", False)
+        need_web_search = bool(phase1_json.get("need_web_search", False))
+        web_search_query = str(phase1_json.get("web_search_query") or "").strip()
         supplement = phase1_json.get("supplement", "")
     except json.JSONDecodeError:
         print("[Phase 1] JSON 解析失敗，只召回觸發者。")
@@ -2834,6 +3098,8 @@ async def run_phase1(
         load_plot,
         enable_ic_style,
         supplement,
+        need_web_search,
+        web_search_query,
     )
 
 
@@ -2926,7 +3192,7 @@ async def _legacy_build_phase2_system_prompt(
 
 {ooc_identity}{ooc_persona_block}{ooc_examples_block}
 【⚠️ 時間感知 — 必須遵守】
-今天是 {datetime.datetime.now().strftime("%Y-%m-%d")}。回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
+現在時間是 {_now_text()}。判斷早/午/晚、問候與作息時以此為準；回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
 
 【安全規則 - 嚴格遵守】
 {safety_str_ooc}
@@ -3031,7 +3297,7 @@ async def _legacy_build_phase2_system_prompt(
 - 用戶的文字訊息就是純文字，除非訊息中明確包含附件（Discord 附件格式），否則回覆中不應提及任何視覺元素。
 
 【⚠️ 時間感知 — 必須遵守】
-今天是 {datetime.datetime.now().strftime("%Y-%m-%d")}。回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
+現在時間是 {_now_text()}。判斷早/午/晚、問候與作息時以此為準；回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
 {("【可用表情符號】\n" + "\n".join(pcfg.get("available_emojis", []))) if pcfg.get("available_emojis", []) else ""}
 
 【文風規則】
@@ -3148,6 +3414,7 @@ async def _build_phase2_ctx(channel_type: str, pcfg: dict, enable_ic_style: bool
         "char_name": char_name,
         "char_identity": char_identity,
         "today": datetime.datetime.now().strftime("%Y-%m-%d"),
+        "now": _now_text(),
         "banned_words": "、".join(pcfg.get("banned_words", [])),
         "enable_ic_style": enable_ic_style,
         "has_server_rules": bool(server_rules_text),
@@ -3306,13 +3573,34 @@ async def gather_context(message: discord.Message, channel_type: str, is_explici
             await write_last_ic_channel(message.guild.id, message.channel.id)
 
     seen_content = set()
+    seen_ids = set()
     all_context = []
     for m in reply_chain_messages + recent_messages:
+        mid = m.get("msg_id") or 0
+        if mid:
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
         key = m["content"][:150]
         if key not in seen_content:
             seen_content.add(key)
             all_context.append(m)
     all_context.sort(key=lambda m: m.get("msg_id", 0))
+
+    # 時間感知：在歷史中插入「日期分隔」讓模型知道哪些是昨天、哪些是今天。
+    try:
+        pcfg = await load_prompt_config()
+        tw = _time_awareness_for(pcfg, channel_type)
+        if tw and tw["day_dividers"]:
+            before = len(all_context)
+            all_context = insert_day_dividers(
+                all_context, gap_hours=tw["same_day_gap_hours"]
+            )
+            added = len(all_context) - before
+            if added:
+                print(f"[上下文] 已插入 {added} 個日期分隔（{channel_type}）")
+    except Exception as e:
+        print(f"[上下文] 日期分隔插入失敗（不影響回覆）: {e}")
 
     recall_candidates = [
         {"id": str(message.author.id), "name": message.author.display_name}
@@ -3507,7 +3795,10 @@ async def _write_prompt_blocks_dump(channel_type, enable_ic_style, extra_segment
     segments = list(prompt_blocks.LAST_SEGMENTS or []) + list(extra_segments or [])
     context_lines = []
     for m in all_context:
-        role_tag = phase2_char_name if m["role"] == "assistant" else "USER"
+        if m.get("role") == "system":
+            role_tag = "系統分隔"
+        else:
+            role_tag = phase2_char_name if m["role"] == "assistant" else "USER"
         context_lines.append({"role": role_tag, "content": m["content"]})
     dump = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3713,36 +4004,26 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
     current_user_name = message.author.display_name
     phase2_char_name = await get_character_name() or "角色"
 
-    if channel_type == "out_of_character":
-        planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
-        fmt_body = "2. 正文（自然對話）\n"
-        priming_suffix = "喔好，收到了，我現在會開始思考、開始回應："
-    else:
-        planning_instruction = "1. <planning>當前情況分析</planning>"
-        fmt_body = f"2. {phase2_char_name}的台詞\n"
-        priming_suffix = f"開始回應： {phase2_char_name}的台詞"
+    tw = _time_awareness_for(pcfg, channel_type)
+    now_divider = (
+        _now_divider_text(all_context)
+        if tw and tw["now_divider"]
+        else ""
+    )
 
     img_block = ""
     if image_description:
         img_block = f"\n\n【用戶分享的圖片分析結果】\n{image_description}"
 
-    phase2_messages.append({
-        "role": "user",
-        "content": (
-            f"【你正在回覆 {current_user_name} 的訊息】\n"
-            "【系統格式指令】\n你接下來回覆的順序必須是：\n"
-            f"{planning_instruction}\n{fmt_body}\n"
-            "【分隔回覆】\n若你需要同時回覆不同的人，請在每段訊息前加上 [TO:該人的名稱]\n"
-            "例：[TO:頭皮慶]\n你的回覆...\n[TO:吳神月]\n你的回覆...\n"
-            "⚠️ [TO:] 僅限用於確定有在找你說話的人（回覆過你的訊息、@你、或直接提到你的角色名），"
-            "不要對歷史記錄中每個出現的人都一一回覆。\n"
-            "【回覆專注原則】\n"
-            f"你正在回覆的是 {current_user_name}。專注於他/她的訊息即可。\n"
-            "如果歷史中其他人在對話但沒有明確找你（沒有@你、沒有回覆你、沒有提到你的角色名），"
-            "不需要回應他們，也不需要為他們加上 [TO:]。"
-            f"{img_block}"
-        ),
-    })
+    roster = _reply_roster_text(all_context, current_user_name)
+    format_text, planning_instruction, fmt_body, priming_suffix = (
+        _reply_format_instruction(
+            channel_type, phase2_char_name, current_user_name, roster, img_block,
+        )
+    )
+    phase2_messages.append({"role": "user", "content": format_text})
+    if now_divider:
+        phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
         "role": "user",
         "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
@@ -3756,7 +4037,11 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
         await f.write("\n\n=== CONTEXT ===\n")
         for m in all_context:
             role_tag = phase2_char_name if m["role"] == "assistant" else "USER"
+            if m["role"] == "system":
+                role_tag = "系統分隔"
             await f.write(f"\n[{role_tag}] {m['content']}")
+        if now_divider:
+            await f.write(f"\n[系統分隔] {now_divider}")
         await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
@@ -3820,36 +4105,32 @@ async def run_phase2_direct(
     phase2_messages.extend(all_context)
     phase2_char_name = await get_character_name() or "角色"
 
-    if channel_type == "out_of_character":
-        planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
-        fmt_body = "2. 正文（自然對話）\n"
-        priming_suffix = "喔好，收到了，我現在會開始思考、開始回應："
-    else:
-        planning_instruction = "1. <planning>當前情況分析</planning>"
-        fmt_body = f"2. {phase2_char_name}的台詞\n"
-        priming_suffix = f"開始回應： {phase2_char_name}的台詞"
+    tw = _time_awareness_for(pcfg, channel_type)
+    now_divider = (
+        _now_divider_text(all_context)
+        if tw and tw["now_divider"]
+        else ""
+    )
 
     img_block = ""
     if image_description:
         img_block = f"\n\n【用戶分享的圖片分析結果】\n{image_description}"
 
+    roster = _reply_roster_text(all_context, current_user_name)
+    format_text, planning_instruction, fmt_body, priming_suffix = (
+        _reply_format_instruction(
+            channel_type, phase2_char_name, current_user_name, roster, img_block,
+        )
+    )
+    phase2_messages.append({"role": "user", "content": format_text})
+    if now_divider:
+        phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
         "role": "user",
-        "content": (
-            f"【你正在回覆 {current_user_name} 的訊息】\n"
-            "【系統格式指令】\n你接下來回覆的順序必須是：\n"
-            f"{planning_instruction}\n{fmt_body}\n"
-            "【分隔回覆】\n若你需要同時回覆不同的人，請在每段訊息前加上 [TO:該人的名稱]\n"
-            "例：[TO:頭皮慶]\n你的回覆...\n[TO:吳神月]\n你的回覆...\n"
-            "⚠️ [TO:] 僅限用於確定有在找你說話的人（回覆過你的訊息、@你、或直接提到你的角色名），"
-            "不要對歷史記錄中每個出現的人都一一回覆。\n"
-            "【回覆專注原則】\n"
-            f"你正在回覆的是 {current_user_name}。專注於他/她的訊息即可。\n"
-            "如果歷史中其他人在對話但沒有明確找你（沒有@你、沒有回覆你、沒有提到你的角色名），"
-            "不需要回應他們，也不需要為他們加上 [TO:]。"
-            f"{img_block}"
-        ),
+        "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
     })
+    if now_divider:
+        phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
         "role": "user",
         "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
@@ -3862,8 +4143,12 @@ async def run_phase2_direct(
         await f.write(phase2_system)
         await f.write("\n\n=== CONTEXT ===\n")
         for m in all_context:
-            role_tag = phase2_char_name if m["role"] == "assistant" else "USER"
+            role_tag = "系統分隔" if m.get("role") == "system" else (
+                phase2_char_name if m["role"] == "assistant" else "USER"
+            )
             await f.write(f"\n[{role_tag}] {m['content']}")
+        if now_divider:
+            await f.write(f"\n[系統分隔] {now_divider}")
         await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
@@ -3896,17 +4181,8 @@ async def run_phase2_direct(
     return raw_content, phase2_char_name, current_user_name
 
 
-async def style_self_check(raw_content: str, channel_type: str, enable_ic_style: bool,
-                           pcfg: dict) -> str:
-    """IC 文風啟用時，呼叫 LLM 檢查並修正違規。回傳可能修正過的 raw_content。"""
-    if not (
-        ((enable_ic_style and channel_type != "out_of_character") or channel_type == "in_character")
-        and raw_content.strip()
-    ):
-        return raw_content
-
-    style_rules = "\n".join(f"- {p}" for p in pcfg.get("expression_prefs", []))
-    banned = "、".join(pcfg.get("banned_words", []))
+async def _style_check_text(text: str, style_rules: str, banned: str) -> str:
+    """對單一區段做文風自檢；失敗時原樣回傳。"""
     sr_prompt = f"""請審閱以下角色回覆，檢查是否違反文風規則。若有違反請修正，但務必保留原意、語氣和角色性格。
 
 【文風規則】
@@ -3916,7 +4192,7 @@ async def style_self_check(raw_content: str, channel_type: str, enable_ic_style:
 {banned}
 
 【角色回覆】
-{raw_content}
+{text}
 
 請直接輸出修正後的完整回覆（含 <planning> 區塊），不要加任何解釋。若無需修正則輸出原文。"""
     try:
@@ -3929,12 +4205,38 @@ async def style_self_check(raw_content: str, channel_type: str, enable_ic_style:
         )
         reviewed = sr_resp.choices[0].message.content or ""
         if reviewed.strip():
-            old_len = len(raw_content)
-            raw_content = reviewed
-            print(f"[文風自檢] 修正 {old_len} → {len(reviewed)} chars")
+            print(f"[文風自檢] 修正 {len(text)} → {len(reviewed)} chars")
+            return reviewed
     except Exception as e:
         print(f"[文風自檢] 失敗（保留原文）: {e}")
-    return raw_content
+    return text
+
+
+async def style_self_check(raw_content: str, channel_type: str, enable_ic_style: bool,
+                           pcfg: dict) -> str:
+    """IC 文風啟用時，呼叫 LLM 檢查並修正違規。回傳可能修正過的 raw_content。
+
+    [TO:] 分段回覆會「逐段」送檢再組回去，避免整篇送檢時標記被吃掉、
+    導致後面 dispatch 無法拆成多則訊息。
+    """
+    if not (
+        ((enable_ic_style and channel_type != "out_of_character") or channel_type == "in_character")
+        and raw_content.strip()
+    ):
+        return raw_content
+
+    style_rules = "\n".join(f"- {p}" for p in pcfg.get("expression_prefs", []))
+    banned = "、".join(pcfg.get("banned_words", []))
+
+    segments = split_to_segments(raw_content)
+    if sum(1 for name, _ in segments if name) >= 2:
+        out = []
+        for name, text in segments:
+            fixed = await _style_check_text(text, style_rules, banned)
+            out.append(f"[TO:{name}]\n{fixed}" if name else fixed)
+        return "\n\n".join(out)
+
+    return await _style_check_text(raw_content, style_rules, banned)
 
 
 _SKIP_PATTERNS = [
@@ -3945,8 +4247,13 @@ _SKIP_PATTERNS = [
 
 
 async def cleanup_response(raw_content: str, blocked_kw: list, phase2_char_name: str,
-                           clean_input: str, clean_input_reply: str) -> str | None:
-    """清理、skip 偵測、安全過濾。若 bot 決定不回覆則回傳 None。"""
+                           clean_input: str, clean_input_reply: str,
+                           blocked_exceptions: list | None = None) -> str | None:
+    """清理、skip 偵測、安全過濾。若 bot 決定不回覆則回傳 None。
+
+    blocked_exceptions 是「無害但會被子字串誤命中」的詞（如「一台獨立」含「台獨」），
+    比對前先從文字中移除，避免整段被誤殺。
+    """
     if not raw_content.strip():
         return None
 
@@ -3978,8 +4285,16 @@ async def cleanup_response(raw_content: str, blocked_kw: list, phase2_char_name:
         bot_reply = "……"
 
     reply_lower = bot_reply.lower()
+    # 先移除無害的誤判詞（例如「一台獨立」之於「台獨」），再做禁字比對
+    scan_text = reply_lower
+    # [TO:名稱] 是分段標記，名稱不是角色台詞；比對禁字前先剔除
+    scan_text = _TO_RE.sub("", scan_text)
+    for ex in (blocked_exceptions or []):
+        ex = (ex or "").lower()
+        if ex:
+            scan_text = scan_text.replace(ex, "")
     for kw in blocked_kw:
-        if kw in reply_lower:
+        if kw in scan_text:
             print(f"[安全] 攔截！回覆包含封鎖關鍵字: '{kw}'")
             print(f"[安全] 原始回覆: {bot_reply[:200]}")
             bot_reply = f"（{phase2_char_name}輕輕搖頭，沒有回應這個話題。）"
@@ -3988,41 +4303,211 @@ async def cleanup_response(raw_content: str, blocked_kw: list, phase2_char_name:
     return bot_reply
 
 
-async def dispatch_reply(message: discord.Message, bot_reply: str, tarot_drawn: dict | None):
-    """處理分段 [TO:] 回覆並發送（含 tarot 附件）。
+def _message_body(m: dict) -> str:
+    """取訊息內容（去掉開頭的 [名稱]: 前綴）。"""
+    content = m.get("content") or ""
+    mm = re.match(r"^\[[^\]]*\]\s*:?\s*", content)
+    if mm:
+        content = content[mm.end():]
+    return content.strip()
 
-    如果有多個 [TO:] 區段，全部合併為單一回覆（回覆到觸發訊息），
-    避免單獨回覆各人時 reply 鏈指錯人。
+
+def _context_msg_name(m: dict) -> str:
+    """從 context 條目取發言者名稱（優先用 name 欄位）。"""
+    name = (m.get("name") or "").strip()
+    if name:
+        return name
+    mm = re.match(r"^\[([^\]]+)\]", m.get("content") or "")
+    if not mm:
+        return ""
+    # 回覆鏈條目會帶「↩某某『…』」標記，名稱只取前面那段
+    return re.split(r"\s*↩", mm.group(1))[0].strip()
+
+
+def _reply_roster_text(all_context: list, current_user_name: str,
+                       limit: int = 6) -> str:
+    """列出最近發言的人與最後一句，讓模型寫 [TO:] 時有正確名稱可抄。"""
+    seen: dict[str, str] = {}
+    for m in reversed(all_context or []):
+        if m.get("role") != "user":
+            continue
+        name = _context_msg_name(m)
+        if not name or name in seen:
+            continue
+        snippet = _message_body(m)[:40].replace("\n", " ")
+        seen[name] = snippet or "（非文字訊息）"
+        if len(seen) >= limit:
+            break
+
+    if current_user_name:
+        ordered: dict[str, str] = {
+            current_user_name: seen.get(current_user_name, "（本則訊息）")
+        }
+        ordered.update(
+            {n: s for n, s in seen.items() if n != current_user_name}
+        )
+        seen = ordered
+
+    lines = ["【最近發言的人（寫 [TO:] 時請完整照抄名稱）】"]
+    if not seen:
+        lines.append("（歷史中沒有其他發言者）")
+        return "\n".join(lines)
+    for name, snippet in seen.items():
+        tag = "　← 本輪觸發者" if name == current_user_name else ""
+        lines.append(f"- {name}：{snippet}{tag}")
+    return "\n".join(lines)
+
+
+def _reply_format_instruction(channel_type: str, phase2_char_name: str,
+                              current_user_name: str, roster: str,
+                              img_block: str = "") -> tuple[str, str, str, str]:
+    """回傳 (格式指令全文, planning_instruction, fmt_body, priming_suffix)。
+
+    重點：預設只回覆觸發者；真的有多人明確找 bot 時，每段 [TO:名稱] 會
+    各自變成一則獨立 Discord 訊息，並回覆到那個人的訊息。
     """
-    if "[TO:" in bot_reply:
-        parts = re.split(r"\n?\[TO:(.+?)\]\n?", bot_reply)
-        if len(parts) > 1:
-            segments = []
-            for i in range(1, len(parts), 2):
-                name = parts[i].strip()
-                text = parts[i + 1].strip() if i + 1 < len(parts) else ""
-                if text:
-                    segments.append((name, text))
-
-            if len(segments) >= 2:
-                # 多人回覆 → 合併為一則，用分隔線區分
-                merged_lines = []
-                for seg_name, seg_text in segments:
-                    merged_lines.append(f"**回覆 {seg_name}**\n{seg_text}")
-                merged = "\n\n---\n\n".join(merged_lines)
-                tf = tarot_drawn.get("files", []) if tarot_drawn else []
-                await message.reply(merged, files=tf)
-            elif len(segments) == 1:
-                # 只有一人 → 直接回覆觸發訊息
-                seg_name, seg_text = segments[0]
-                tf = tarot_drawn.get("files", []) if tarot_drawn else []
-                await message.reply(seg_text, files=tf)
-        else:
-            tf = tarot_drawn.get("files", []) if tarot_drawn else []
-            await message.reply(bot_reply, files=tf)
+    if channel_type == "out_of_character":
+        planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
+        fmt_body = "2. 正文（自然對話）\n"
+        priming_suffix = "喔好，收到了，我現在會開始思考、開始回應："
     else:
-        tf = tarot_drawn.get("files", []) if tarot_drawn else []
-        await message.reply(bot_reply, files=tf)
+        planning_instruction = "1. <planning>當前情況分析</planning>"
+        fmt_body = f"2. {phase2_char_name}的台詞\n"
+        priming_suffix = f"開始回應： {phase2_char_name}的台詞"
+
+    text = (
+        f"【你正在回覆 {current_user_name} 的訊息】\n"
+        "【系統格式指令】\n你接下來回覆的順序必須是：\n"
+        f"{planning_instruction}\n{fmt_body}\n"
+        "【回覆對象規則】\n"
+        f"- 預設只回覆 {current_user_name}。只有一個人時，直接寫正文，不要加 [TO:]。\n"
+        "- 只有在歷史中「有人明確找你」（回覆你的訊息、@你、直接叫你的角色名）時，才另外分段回覆那個人。\n"
+        "- 分段時，每一段開頭獨立一行寫 [TO:名稱]，名稱必須完整照下面清單複製，不要只寫小名或角色名。\n"
+        "- 每一個 [TO:] 都會被拆成一則獨立的 Discord 訊息，並回覆到那個人的訊息；"
+        "所以不要在同一個區段裡回覆兩個人。\n"
+        "- <planning> 只寫一份放在最前面，不要為每個人重寫。\n"
+        f"\n{roster}\n"
+        "【範例】\n"
+        "只有一個人：（直接寫正文，不加 [TO:]）\n"
+        "有兩個人：\n"
+        "[TO:甲]\n給甲的正文\n"
+        "[TO:乙]\n給乙的正文\n"
+        f"{img_block}"
+    )
+    return text, planning_instruction, fmt_body, priming_suffix
+
+
+# [TO:名稱]（支援半形/全形冒號、全形括號、前後空白）
+_TO_RE = re.compile(r"[\[【]\s*[Tt][Oo]\s*[:：]\s*([^\]】\n]{1,40}?)\s*[\]】]")
+# 少數模型會寫成行首「TO：名稱」（沒有括號）
+_TO_BARE_RE = re.compile(r"(?m)^[ \t]*[Tt][Oo]\s*[:：]\s*([^\n]{1,40}?)[ \t]*$")
+
+
+def split_to_segments(bot_reply: str) -> list[tuple[str, str]]:
+    """把 [TO:名稱] 回覆切成 [(名稱, 內容)]；沒有 [TO:] 時回 [("", 原文)]。"""
+    text = bot_reply or ""
+    matches = list(_TO_RE.finditer(text))
+    if not matches:
+        matches = list(_TO_BARE_RE.finditer(text))
+    if not matches:
+        return [("", text.strip())]
+
+    segments: list[tuple[str, str]] = []
+    lead = text[:matches[0].start()].strip()
+    if lead:
+        segments.append(("", lead))
+    for i, mt in enumerate(matches):
+        name = (mt.group(1) or "").strip()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[mt.end():end].strip()
+        if body:
+            segments.append((name, body))
+    return segments or [("", text.strip())]
+
+
+def _norm_name(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"^@+", "", s)
+    s = re.sub(r"[（(【\[].*?[）)】\]]", "", s)      # 括號補充（如「頭皮慶（一般的學弟）」）
+    s = re.sub(r"[^\w\u4e00-\u9fff]", "", s)       # emoji／空白／標點
+    return s
+
+
+def _name_matches(a: str, b: str) -> bool:
+    na, nb = _norm_name(a), _norm_name(b)
+    if not na or not nb:
+        return False
+    return na == nb or na in nb or nb in na
+
+
+async def _resolve_reply_target(message: discord.Message, name: str,
+                                context: list | None, cache: dict):
+    """把 [TO:名稱] 解析成頻道中的那則訊息；找不到回 None。"""
+    if not name:
+        return None
+
+    best_id = 0
+    for m in context or []:
+        if m.get("role") != "user":
+            continue
+        mid = m.get("msg_id") or 0
+        if mid and _name_matches(name, _context_msg_name(m)):
+            best_id = max(best_id, int(mid))
+
+    if best_id:
+        if best_id not in cache:
+            try:
+                cache[best_id] = await message.channel.fetch_message(best_id)
+            except Exception as e:
+                print(f"[回覆] 取不到訊息 {best_id}: {e}")
+                cache[best_id] = None
+        return cache[best_id]
+
+    # context 沒撈到 → 掃最近頻道訊息（多段回覆才會走到這裡）
+    try:
+        async for m in message.channel.history(limit=30):
+            if m.author == bot.user:
+                continue
+            if _name_matches(name, m.author.display_name):
+                return m
+    except Exception as e:
+        print(f"[回覆] 掃描頻道訊息失敗: {e}")
+    return None
+
+
+async def dispatch_reply(message: discord.Message, bot_reply: str,
+                         tarot_drawn: dict | None, context: list | None = None):
+    """處理 [TO:] 分段並發送：每個人各自一則獨立回覆，回覆到那個人的訊息。
+
+    只有一段（或沒寫 [TO:]）→ 直接回覆觸發訊息。
+    解析不到對象時退回回覆觸發訊息，內容不會遺失。
+    """
+    segments = split_to_segments(bot_reply)
+    tf = tarot_drawn.get("files", []) if tarot_drawn else []
+    named = [(n, t) for n, t in segments if n]
+
+    if not named:
+        text = "\n\n".join(t for _, t in segments if t).strip() or bot_reply
+        await message.reply(text, files=tf)
+        return
+
+    cache: dict = {}
+    for idx, (name, text) in enumerate(segments):
+        files = tf if idx == 0 else []
+        target = await _resolve_reply_target(message, name, context, cache)
+        try:
+            if target is not None:
+                await target.reply(text, files=files)
+            else:
+                if name:
+                    print(f"[回覆] 找不到「{name}」的訊息，改回覆觸發訊息")
+                await message.reply(text, files=files)
+        except Exception as e:
+            print(f"[回覆] 回覆 {name or '觸發者'} 失敗: {type(e).__name__}: {e}")
+            try:
+                await message.channel.send(text, files=files)
+            except Exception as e2:
+                print(f"[回覆] 發送備援也失敗: {type(e2).__name__}: {e2}")
 
 
 @bot.event
@@ -4077,8 +4562,12 @@ async def on_message(message: discord.Message):
             char_name_await = await get_character_name() or "角色"
             chain_text = (
                 "\n".join(
-                    f"[{char_name_await if m['role'] == 'assistant' else '對方'}]: {m['content'][:200]}"
-                    for m in all_context[-12:]
+                    (
+                        m["content"]
+                        if m.get("role") == "system"
+                        else f"[{char_name_await if m['role'] == 'assistant' else '對方'}]: {m['content'][:200]}"
+                    )
+                    for m in all_context[-16:]
                 ) or "（無歷史對話）"
             )
 
@@ -4114,7 +4603,8 @@ async def on_message(message: discord.Message):
                     quests_text = q + "\n\n（請在劇情中自然地引導角色往任務目標前進。不要突兀地讓角色突然想到任務，而是透過環境或對話自然觸發。）"
 
             (phase1_json, recall_user_ids, lore_topics, lore_notes, recall_threads,
-             load_plot, enable_ic_style, phase1_supplement) = await run_phase1(
+             load_plot, enable_ic_style, phase1_supplement,
+             need_web_search, web_search_query) = await run_phase1(
                 recall_candidates, chain_text, thread_catalog, quests_text,
                 clean_input_reply, all_context, self_memories_full, user_memories_full, lore_full,
             )
@@ -4157,7 +4647,8 @@ async def on_message(message: discord.Message):
             # 對話「提到誰就召回誰」：補上 Phase 1 點名機制的漏洞
             # （獨立角色如羊君不在候選人也沒登記別名，只能靠這條撈回來）。
             mention_text = clean_input_reply + "\n" + "\n".join(
-                m["content"] for m in all_context[-3:] if m.get("content")
+                m["content"] for m in all_context[-3:]
+                if m.get("content") and m.get("role") != "system"
             )
             mentioned_mem = await recall_mentioned_persons_memories(
                 mention_text, combined_memories,
@@ -4176,10 +4667,32 @@ async def on_message(message: discord.Message):
 
             pcfg = await load_prompt_config()
             blocked_kw = [k.lower() for k in pcfg.get("blocked_keywords", [])]
+            blocked_exceptions = [
+                e.lower() for e in pcfg.get("blocked_keyword_exceptions", [])
+            ]
 
             web_context, web_pages, web_summary = await _build_web_context(
                 clean_input_reply, pcfg
             )
+
+            # Phase 1 決定要不要用 DeepSeek 原生搜尋（server-side web_search）。
+            # 若使用者已貼連結且已抓到內容，就不重複搜尋。
+            search_result = None
+            search_query = ""
+            dcfg = {**deepseek_search.DEFAULT_CFG, **(pcfg.get("deepseek_search") or {})}
+            if need_web_search and not web_pages and dcfg.get("enabled", True):
+                search_query = web_search_query or clean_input_reply
+                search_result = await deepseek_search.search(search_query, dcfg)
+                if search_result.get("ok"):
+                    web_context = (web_context or "") + deepseek_search.build_injection(
+                        search_result, search_query
+                    )
+                    print(
+                        f"[搜尋] DeepSeek 原生搜尋完成"
+                        f"（{len(search_result.get('sources') or [])} 來源）"
+                    )
+                else:
+                    print(f"[搜尋] 失敗: {search_result.get('error')}")
 
             raw_content, phase2_char_name, current_user_name = await build_and_call_phase2(
                 message, channel_type=channel_type, pcfg=pcfg,
@@ -4193,7 +4706,10 @@ async def on_message(message: discord.Message):
 
             raw_content = await style_self_check(raw_content, channel_type, enable_ic_style, pcfg)
 
-            bot_reply = await cleanup_response(raw_content, blocked_kw, phase2_char_name, clean_input, clean_input_reply)
+            bot_reply = await cleanup_response(
+                raw_content, blocked_kw, phase2_char_name,
+                clean_input, clean_input_reply, blocked_exceptions,
+            )
 
             excerpt = re.sub(r'[\\/:*?"<>|\r\n]', "", clean_input[:20]) or "unknown"
             session_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -4204,13 +4720,19 @@ async def on_message(message: discord.Message):
                 await message.reply("……")
                 return
 
-            await dispatch_reply(message, bot_reply, tarot_drawn)
+            await dispatch_reply(message, bot_reply, tarot_drawn, all_context)
 
             if web_pages:
                 asyncio.create_task(web_reader.log_web_analysis(
                     message.author.display_name,
                     getattr(message.channel, "name", ""),
                     web_pages, web_summary, bot_reply,
+                ))
+            if search_result and search_result.get("ok"):
+                asyncio.create_task(deepseek_search.log_search(
+                    message.author.display_name,
+                    getattr(message.channel, "name", ""),
+                    search_query, search_result, bot_reply,
                 ))
 
             self_memories_all = await get_self_memory(limit=200)
@@ -4726,8 +5248,17 @@ async def cmd_readimg(
                 continue
             role = "assistant" if msg.author == bot.user else "user"
             name = msg.author.display_name
-            all_context.append({"role": role, "content": f"[{name}]: {msg.content}"})
+            all_context.append({
+                "role": role,
+                "content": f"[{name}]: {msg.content}",
+                "ts": _msg_ts(msg),
+            })
     all_context.reverse()
+    tw = _time_awareness_for(pcfg, channel_type)
+    if tw and tw["day_dividers"]:
+        all_context = insert_day_dividers(
+            all_context, gap_hours=tw["same_day_gap_hours"]
+        )
 
     user_name = interaction.user.display_name
     # 只讀發起者自己的圖，所以出處必然是同一人。

@@ -31,7 +31,7 @@ PROMPT_LOG_DIR = os.path.join(SCRIPT_DIR, "prompt_logs")
 LAST_DUMP = os.path.join(PROMPT_LOG_DIR, "last_prompt_blocks.json")
 RAW_PROMPT = os.path.join(PROMPT_LOG_DIR, "last_prompt.txt")
 
-PLACEHOLDERS = ["today", "char_name", "banned_words"]
+PLACEHOLDERS = ["now", "today", "char_name", "banned_words"]
 
 app = FastAPI(title="Phase 2 Prompt Editor", version="1.0")
 
@@ -216,6 +216,15 @@ function renderTabs() {
   }
 }
 function esc(s){ return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+function dupTitle(t) {
+  t = t || "";
+  const m = t.match(/（複本(?: (\d+))?）$/);
+  if (m) {
+    const n = m[1] ? parseInt(m[1], 10) + 1 : 2;
+    return t.replace(/（複本(?: \d+)?）$/, `（複本 ${n}）`);
+  }
+  return t + "（複本）";
+}
 function render() {
   const m = document.getElementById("main"); m.innerHTML = "";
   if (CUR === "view") renderView(m);
@@ -251,7 +260,7 @@ function renderEditor(m, channel) {
   const blocks = DATA.blocks.tabs[channel] || (DATA.blocks.tabs[channel] = []);
   const bar = document.createElement("div"); bar.className="toolbar";
   bar.innerHTML = `<button class="mini" id="addb">+ 新增條目</button>
-    <span class="muted">動態條目內容唯讀；標題只是給你（模型看不到）。</span>`;
+    <span class="muted">動態條目唯讀；靜態條目可按「複製」做版本（複本預設停用）。標題模型看不到。</span>`;
   m.appendChild(bar);
   bar.querySelector("#addb").onclick = () => {
     const id = "_custom_" + Date.now();
@@ -275,6 +284,7 @@ function renderEditor(m, channel) {
         <input type="text" value="${esc(b.title)}" data-title>
         <span class="badge ${b.kind}">${b.kind}</span>
         <span class="muted">#${i}</span>
+        ${isStatic?'<button class="mini" data-dup title="複製成新版本（插在下面、預設停用）">複製</button>':''}
         ${b.id.startsWith("_custom_")?'<button class="mini" data-del>刪除</button>':''}
       </div>
       <div class="body">
@@ -291,6 +301,20 @@ function renderEditor(m, channel) {
     d.querySelectorAll("[data-flag]").forEach(cb => cb.onchange = () => {
       b.condition = [...d.querySelectorAll("[data-flag]:checked")].map(x=>x.dataset.flag);
     });
+    const dup = d.querySelector("[data-dup]");
+    if (dup) dup.onclick = () => {
+      const copy = {
+        id: "_custom_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+        title: dupTitle(b.title),
+        kind: "static",
+        enabled: false,
+        condition: [...(b.condition || [])],
+        content: b.content || "",
+      };
+      blocks.splice(i + 1, 0, copy);
+      render();
+      setStatus("已複製條目（預設停用，方便切換版本；記得儲存）");
+    };
     const del = d.querySelector("[data-del]");
     if (del) del.onclick = () => { blocks.splice(i,1); render(); };
     const ta = d.querySelector("[data-content]");

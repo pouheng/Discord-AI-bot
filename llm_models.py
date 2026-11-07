@@ -19,6 +19,27 @@ llm_models.py — 集中管理 LLM「來源」（endpoint + API key）與各「�
 import json
 import os
 
+
+def _sanitize_no_proxy():
+    """移除 NO_PROXY 裡 httpx 無法解析的括號 IPv6（如 [::1]）。
+
+    Windows 的 NO_PROXY 常含 `[::1]`，httpx 會把它當 URL 解析而在建立 client
+    時直接拋 InvalidURL（port ':1]'），導致所有 LLM 呼叫失敗。
+    """
+    for key in ("NO_PROXY", "no_proxy"):
+        val = os.environ.get(key)
+        if not val:
+            continue
+        kept = [
+            p.strip()
+            for p in val.split(",")
+            if p.strip() and not (p.strip().startswith("[") and p.strip().endswith("]"))
+        ]
+        os.environ[key] = ",".join(kept)
+
+
+_sanitize_no_proxy()
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_FILE = os.path.join(SCRIPT_DIR, "models.json")
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
@@ -93,6 +114,50 @@ def save_model(slot: str, model_id: str):
     """寫入單一場景的模型 ID（保留 source 與其他 key）。"""
     raw = _read_raw()
     raw[slot] = (model_id or "").strip() or DEFAULT_MODELS.get(slot, "")
+    _write_raw(raw)
+
+
+def get_fallbacks(model: str) -> list[str]:
+    """models.json 的 fallback_models[model]：同一模型的其他線路（如 global → sg → cn）。"""
+    raw = _read_raw()
+    fb = raw.get("fallback_models")
+    if not isinstance(fb, dict):
+        return []
+    v = fb.get(model)
+    if not isinstance(v, list):
+        return []
+    return [str(x).strip() for x in v if isinstance(x, str) and x.strip()]
+
+
+def model_chain(slot: str, model: str | None = None) -> list[str]:
+    """回傳依序嘗試的線路 [主模型, *後備]，去重保序。"""
+    primary = (model or get_model(slot)).strip() or get_model(slot)
+    chain = [primary]
+    for m in get_fallbacks(primary):
+        if m not in chain:
+            chain.append(m)
+    return chain
+
+
+def save_fallbacks(model: str, models: list[str]):
+    """寫入某模型的三線路後備（models.json 的 fallback_models[model]）。"""
+    model = (model or "").strip()
+    if not model:
+        return
+    cleaned: list[str] = []
+    for m in models or []:
+        m = (m or "").strip()
+        if m and m != model and m not in cleaned:
+            cleaned.append(m)
+    raw = _read_raw()
+    fb = raw.get("fallback_models")
+    if not isinstance(fb, dict):
+        fb = {}
+    if cleaned:
+        fb[model] = cleaned
+    else:
+        fb.pop(model, None)
+    raw["fallback_models"] = fb
     _write_raw(raw)
 
 

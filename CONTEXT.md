@@ -39,6 +39,11 @@ _Await_: Roleplay channel, character channel
 
 _Await_: NPC management, background tasks
 
+**多人回覆（Multi-reply / TO 分段）**：
+模型在一則回覆裡要分別回答多人時，用 `[TO:名稱]` 分段；`dispatch_reply` 會把每一段拆成一則**獨立的 Discord 訊息**，並各自 `reply` 到那個人的訊息（名稱用正規化比對，支援「頭皮慶」對「頭皮慶（一般的學弟）」、emoji 與 @ 前綴）。找不到對象時退回回覆觸發訊息，內容不遺失。名稱清單由 `_reply_roster_text` 依最近發言者動態注入，避免模型寫錯名字。沒有 `[TO:]` 或全部解析不到時，維持單則回覆。
+
+_Await_: multi reply, split reply, 分段回覆
+
 **Priming Trick（回覆起始引導）**：
 在 prompt 末尾注入起始短語（OOC: 「喔好，收到了...」、IC: 「開始回應：」），利用 deepseek-flash 的 recency bias 引導模型產生正確格式的回覆。
 
@@ -49,10 +54,20 @@ _Await_: Response引导, format引导
 
 _Await_: Vision analysis, image description
 
+**Web Search（DeepSeek 原生搜尋）**：
+Phase 1 判斷需要「資料庫以外的即時／外部資訊」時，改用 DeepSeek 官方 `/v1/responses` + `deepseek-v4-pro` 的 server-side `web_search` 工具（`deepseek_search.py`），取得答案與來源後注入 Phase 2。與 `web_reader`（只讀使用者貼的連結）互補。設定在 `config.json` 的 `deepseek_search`；搜尋按次計費（自 2026-11-01 起）。
+
+_Await_: native search, web search tool
+
 **Web Reader（網頁讀取）**：
 自動偵測使用者訊息（含被回覆訊息）中的 http(s) 連結，透過 `web_reader.py` 抓取網頁（httpx + bs4；擋私有/本機位址）→ 交由 LLM 摘要 → 以「用戶分享的網頁內容」區塊注入 Phase 2，讓角色「看得到」連結內容。紀錄寫入 `web_logs/`。由 `config.json` 的 `web_reader` 控制。
 
 _Await_: URL reader, link reader
+
+**時間感知（Time awareness / 日期分隔）**：
+在 OOC 頻道的歷史對話中插入 `role="system"` 的分隔訊息，讓模型能分辨「昨天的訊息」與「今天的訊息」。三種分隔：`【歷史起點】`（第一則的日期＋相對天數）、`【日期分隔】`（跨日時插入，含「距上一則 X 天 X 小時」）、`【時間分隔】`（同一天但間隔超過 `same_day_gap_hours`）、以及目前訊息前的 `【現在】`。設定在 `config.json` 的 `time_awareness`（`enabled` / `day_dividers` / `now_divider` / `ooc_only` / `same_day_gap_hours`）。
+
+_Await_: day divider, 日期分隔, 跨日感知
 
 **記憶模組（Memory module）**：
 擁有 `memories` 資料表的模組（`memory.py`）：含建表/欄位遷移與所有 SQL 存取。介面是記憶的 save / get / search / recall；實作吸收去重、語意合併、字首相似、`__BOT__` 自記憶疊加與重複分組。角色自身記憶以 `user_id='__BOT__'` 存在同一張表。對外只依賴 db（連線）與 profiles（人物別名解析）。

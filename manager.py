@@ -18,6 +18,9 @@ _wd_installed = False
 _model_combos = {}
 _model_vars = {}
 _source_vars = {}
+_route_vars = {}
+_route_combos = {}
+_route_sync_var = None
 
 
 def get_pid() -> int | None:
@@ -440,8 +443,16 @@ def _on_model_selected(slot):
         log(f"儲存模型設定失敗: {e}")
 
 
+def _combo_values_cur(cur, ids):
+    """下拉選項＝清單；目前值不在清單內也帶出，避免被清空。"""
+    vals = list(ids or [])
+    if cur and cur not in vals:
+        vals = [cur] + vals
+    return vals
+
+
 def _fetch_and_apply_models():
-    """背景執行：向來源拉取模型清單，更新所有下拉選項。"""
+    """背景執行：向來源拉取模型清單，更新所有下拉選項（含三線路）。"""
     try:
         ids = llm_models.fetch_models()
     except Exception as e:
@@ -451,6 +462,9 @@ def _fetch_and_apply_models():
     def _apply():
         for slot, combo in _model_combos.items():
             combo["values"] = _combo_values(slot, ids)
+        for i, combo in _route_combos.items():
+            cur = _route_vars[i].get().strip()
+            combo["values"] = _combo_values_cur(cur, ids)
         log(f"已拉取 {len(ids)} 個模型: {', '.join(ids)}")
 
     try:
@@ -465,7 +479,7 @@ class BotManagerGUI:
         self.root = tk.Tk()
         root = self.root
         self.root.title("Bot Manager")
-        self.root.geometry("620x680")
+        self.root.geometry("660x840")
         self.root.resizable(False, False)
 
         nb = ttk.Notebook(self.root)
@@ -481,6 +495,7 @@ class BotManagerGUI:
         # 設定分頁：來源 + 模型選擇 + Watchdog
         self._build_source_section(settings_tab)
         self._build_model_section(settings_tab)
+        self._build_fallback_section(settings_tab)
         ttk.Label(settings_tab, text="Watchdog（定時自動重啟）",
                   font=("Segoe UI", 11, "bold")).pack(anchor=tk.W, pady=(12, 2))
 
@@ -734,6 +749,60 @@ class BotManagerGUI:
         combo.bind("<FocusOut>", lambda e, s=slot: _on_model_selected(s))
         _model_combos[slot] = combo
         _model_vars[slot] = var
+
+    def _build_fallback_section(self, parent):
+        global _route_sync_var
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        header = ttk.Frame(parent)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="三線路退回（同模型不同路由）",
+                  font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT)
+        ttk.Button(header, text="儲存三線路", width=11,
+                   command=self._save_routes).pack(side=tk.RIGHT)
+        ttk.Label(
+            parent,
+            text="主線路失敗（5xx／限流／逾時／401）時，依序切到線路 2、3；留空＝不使用。存檔下一則生效。",
+            font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, pady=(2, 4))
+
+        primary = llm_models.get_model("default")
+        fbs = llm_models.get_fallbacks(primary)
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X)
+        labels = ["線路 1（主）", "線路 2", "線路 3"]
+        defaults = [primary,
+                    fbs[0] if len(fbs) > 0 else "",
+                    fbs[1] if len(fbs) > 1 else ""]
+        for idx in range(3):
+            ttk.Label(frame, text=labels[idx], font=("Segoe UI", 9)).grid(
+                row=idx, column=0, sticky=tk.W, pady=2, padx=(0, 8))
+            var = tk.StringVar(value=defaults[idx])
+            combo = ttk.Combobox(frame, textvariable=var, width=38,
+                                 values=_combo_values_cur(defaults[idx], []))
+            combo.grid(row=idx, column=1, sticky=tk.W, pady=2)
+            _route_vars[idx + 1] = var
+            _route_combos[idx + 1] = combo
+        _route_sync_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="主線路同步套用到所有場景",
+                        variable=_route_sync_var).grid(
+            row=3, column=1, sticky=tk.W, pady=(4, 0))
+
+    def _save_routes(self):
+        try:
+            r1 = (_route_vars[1].get() or "").strip() or llm_models.get_model("default")
+            r2 = (_route_vars[2].get() or "").strip()
+            r3 = (_route_vars[3].get() or "").strip()
+            if _route_sync_var is not None and _route_sync_var.get():
+                for slot, _label in llm_models.SLOTS:
+                    llm_models.save_model(slot, r1)
+            else:
+                llm_models.save_model("default", r1)
+            llm_models.save_fallbacks(r1, [r2, r3])
+            log(f"三線路已存：{r1} → {r2 or '—'} → {r3 or '—'}"
+                + ("（已套用所有場景）"
+                   if _route_sync_var is not None and _route_sync_var.get() else ""))
+        except Exception as e:
+            log(f"儲存三線路失敗: {e}")
 
     def _thread_action(self, action: str):
         """Run action in thread with instant button feedback."""
