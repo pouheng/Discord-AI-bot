@@ -22,6 +22,7 @@ __pycache__/
 architecture.html
 bot_errors.jsonl
 say_log.jsonl
+say_logs/
 error_logs/
 image_logs/
 skip_logs/

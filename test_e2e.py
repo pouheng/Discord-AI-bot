@@ -121,18 +121,29 @@ async def run_tests():
         else:
             print(f"  FAIL: {name}")
 
+    def sent(msg):
+        """有送出去就算數（可能用 reply，也可能是普通訊息）。"""
+        return msg.reply.called or msg.channel.send.called
+
+    def sent_text(msg):
+        if msg.reply.called:
+            return msg.reply.call_args[0][0]
+        if msg.channel.send.called:
+            return msg.channel.send.call_args[0][0]
+        return ""
+
     # ── Test 1: Non-trigger ──
     msg1 = _make_message("hello world")
     print("\n[Test 1] Non-trigger (no mention)")
     await main.on_message(msg1)
-    check("No reply", not msg1.reply.called)
+    check("No reply", not sent(msg1))
 
     # ── Test 2: @mention ──
     msg2 = _make_message("你好啊澪")
     _fake_bot_user.mentioned_in = lambda m: True
     print("\n[Test 2] @mention trigger")
     await main.on_message(msg2)
-    check("Reply sent", msg2.reply.called)
+    check("Reply sent", sent(msg2))
 
     # ── Test 3: Reply-to-bot ──
     ref = _make_ref()
@@ -140,7 +151,7 @@ async def run_tests():
     _fake_bot_user.mentioned_in = lambda m: False
     print("\n[Test 3] Reply-to-bot trigger")
     await main.on_message(msg3)
-    check("Reply sent", msg3.reply.called)
+    check("Reply sent", sent(msg3))
 
     # ── Test 4: Server whitelist ──
     msg4 = _make_message("test", guild_id=999)
@@ -154,7 +165,7 @@ async def run_tests():
     _fake_bot_user.mentioned_in = lambda m: True
     print("\n[Test 4] Server whitelist block")
     await main.on_message(msg4)
-    check("No reply (blocked)", not msg4.reply.called)
+    check("No reply (blocked)", not sent(msg4))
 
     _default_mocks()
 
@@ -163,7 +174,7 @@ async def run_tests():
     _fake_bot_user.mentioned_in = lambda m: True
     print("\n[Test 5] Empty content")
     await main.on_message(msg5)
-    check("Reply sent (fallback to hi)", msg5.reply.called)
+    check("Reply sent (fallback to hi)", sent(msg5))
 
     # ── Test 6: Blocked keyword ──
     main.load_prompt_config = mock.AsyncMock(return_value={
@@ -181,9 +192,9 @@ async def run_tests():
     _fake_bot_user.mentioned_in = lambda m: True
     print("\n[Test 6] Blocked keyword safety filter")
     await main.on_message(msg6)
-    check("Reply sent", msg6.reply.called)
-    if msg6.reply.called:
-        reply_text = msg6.reply.call_args[0][0]
+    check("Reply sent", sent(msg6))
+    if sent(msg6):
+        reply_text = sent_text(msg6)
         check("Safe fallback (no bananas)", "bananas" not in reply_text.lower())
 
     _default_mocks()

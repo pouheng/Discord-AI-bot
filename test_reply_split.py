@@ -115,6 +115,10 @@ class FakeMsg:
 class FakeChannel:
     def __init__(self, msgs):
         self._by_id = {m.id: m for m in msgs}
+        self.sent = []
+
+    async def send(self, text, files=None):
+        self.sent.append((text, files))
 
     async def fetch_message(self, mid):
         if mid in self._by_id:
@@ -128,12 +132,12 @@ class FakeChannel:
         return _gen()
 
 
-def run_dispatch(reply_text, context, existing=()):
+def run_dispatch(reply_text, context, existing=(), reply_mode="always"):
     a = FakeMsg("甲", 101)
     b = FakeMsg("乙", 102)
     channel = FakeChannel([a, b, *existing])
     trigger = FakeMsg("丙", 999, channel=channel)
-    asyncio.run(main.dispatch_reply(trigger, reply_text, None, context))
+    asyncio.run(main.dispatch_reply(trigger, reply_text, None, context, reply_mode))
     return trigger, a, b
 
 
@@ -160,7 +164,68 @@ trigger, a, b = run_dispatch("[TO:甲]\n給甲", ctx2)
 check("單一 [TO:] 也會回覆到對方", a.replies and a.replies[0][0] == "給甲",
       str(a.replies))
 
-print("[6] fetch 失敗時不丟內容")
+print("[6] 要不要使用「回覆」功能（模型自己選）")
+check("auto 沒標記 → 不引用", main.wants_reply("哈囉", "auto") is False)
+check("auto + [REPLY] → 引用", main.wants_reply("[REPLY]\n哈囉", "auto") is True)
+check("auto + [回覆] → 引用", main.wants_reply("【回覆】\n哈囉", "auto") is True)
+check("auto + [NO_REPLY] 優先", main.wants_reply("[REPLY]\n[no_reply]\n哈囉", "auto") is False)
+check("always 強制引用", main.wants_reply("哈囉", "always") is True)
+check("never 強制不引用", main.wants_reply("[REPLY]\n哈囉", "never") is False)
+check("[REPLY] 不會被當正文送出",
+      main.strip_reply_markers("[REPLY]\n哈囉") == "哈囉",
+      repr(main.strip_reply_markers("[REPLY]\n哈囉")))
+check("【不引用】也會被移除",
+      main.strip_reply_markers("【不引用】\n哈囉") == "哈囉")
+
+trigger, a, b = run_dispatch("哈囉", ctx2, reply_mode="auto")
+check("auto 無標記 → 送普通訊息",
+      trigger.channel.sent and trigger.channel.sent[0][0] == "哈囉",
+      str(trigger.channel.sent))
+check("auto 無標記 → 沒有引用觸發訊息", not trigger.replies, str(trigger.replies))
+
+trigger, a, b = run_dispatch("[REPLY]\n哈囉", ctx2, reply_mode="auto")
+check("auto 有標記 → 引用觸發訊息",
+      trigger.replies and trigger.replies[0][0] == "哈囉",
+      str(trigger.replies))
+check("標記已從正文移除", not trigger.channel.sent, str(trigger.channel.sent))
+
+trigger, a, b = run_dispatch("[TO:甲]\n[REPLY]\n給甲", ctx2, reply_mode="never")
+check("[TO:] 一律回覆對方（不受 never 影響）",
+      a.replies and a.replies[0][0] == "給甲", str(a.replies))
+
+print("[7] 模型結構出錯時的修補")
+check("全形字母 TO",
+      main.split_to_segments("[ＴＯ：甲]\n嗨") == [("甲", "嗨")],
+      str(main.split_to_segments("[ＴＯ：甲]\n嗨")))
+check("空 [TO:] 不留在正文",
+      main.strip_reply_markers("[TO:]\n嗨") == "嗨",
+      repr(main.strip_reply_markers("[TO:]\n嗨")))
+check("空【TO：】不留在正文",
+      main.strip_reply_markers("【TO：】嗨") == "嗨")
+trail = main.split_to_segments("給甲的內容\n[TO:甲]")
+check("TO 寫在正文後面 → 改掛到甲", trail == [("甲", "給甲的內容")], str(trail))
+check("[REPLY：說明] 也認得", main.wants_reply("[REPLY：上面那則]\n嗨", "auto") is True)
+check("[REPLY：說明] 會被移除",
+      main.strip_reply_markers("[REPLY：上面那則]\n嗨") == "嗨")
+check("【普通訊息】＝不引用",
+      main.wants_reply("【普通訊息】\n嗨", "auto") is False)
+check("只有標記 → 沒有正文", main.strip_reply_markers("[REPLY]") == "")
+
+trigger, a, b = run_dispatch("[TO:甲、乙]\n你們好", ctx2, reply_mode="always")
+check("多人標籤 → 回覆第一個找得到的",
+      a.replies and a.replies[0][0] == "你們好", str(a.replies))
+check("多人標籤不會重複回乙", not b.replies, str(b.replies))
+
+trigger, a, b = run_dispatch("[REPLY]\n[NO_REPLY]", ctx2, reply_mode="auto")
+check("全是標記 → 不送空訊息",
+      not trigger.replies and not trigger.channel.sent,
+      f"{trigger.replies} / {trigger.channel.sent}")
+
+trigger, a, b = run_dispatch("給甲的內容\n[TO:甲]", ctx2, reply_mode="always")
+check("TO 在後面 → 仍回覆到甲",
+      a.replies and a.replies[0][0] == "給甲的內容", str(a.replies))
+
+print("[8] fetch 失敗時不丟內容")
 class BrokenChannel(FakeChannel):
     async def fetch_message(self, mid):
         raise RuntimeError("boom")
@@ -176,7 +241,7 @@ asyncio.run(main.dispatch_reply(
 check("取訊息失敗 → 退回回覆觸發訊息", trigger2.replies and trigger2.replies[0][0] == "給甲",
       str(trigger2.replies))
 
-print("[7] 文風自檢不破壞分段")
+print("[9] 文風自檢不破壞分段")
 _orig_call_llm = main.call_llm
 
 

@@ -54,8 +54,11 @@ def parse_mem_tag(text: str) -> dict | None:
 
 
 def strip_planning(text: str) -> str:
-    """移除 <planning>...</planning> 區塊。"""
-    return re.sub(r"<planning>.*?</planning>", "", text, flags=re.DOTALL).strip()
+    """移除 <planning>...</planning> 區塊；未閉合時從 <planning> 起全部切掉。"""
+    text = re.sub(r"<planning>.*?</planning>", "", text, flags=re.DOTALL)
+    if "<planning>" in text:
+        text = text.split("<planning>", 1)[0]
+    return text.strip()
 
 
 def strip_mem_learn_tags(text: str) -> str:

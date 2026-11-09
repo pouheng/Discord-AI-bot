@@ -4197,14 +4197,20 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
 
     img_block = ""
     if image_description:
-        img_block = f"\n\n【用戶分享的圖片分析結果】\n{image_description}"
+        img_block = (
+            "\n\n【用戶本輪傳來的圖片（你已經看到，內容如下）】\n"
+            f"{image_description}\n"
+            "（這是剛剛收到的圖片，不是舊圖。若對話和圖片有關，"
+            "回覆時要引用圖片裡的具體內容；不要說看不到或無法讀取。）"
+        )
 
     roster = _reply_roster_text(all_context, current_user_name)
     format_text, planning_instruction, fmt_body, priming_suffix = (
         _reply_format_instruction(
-            channel_type, phase2_char_name, current_user_name, roster, img_block,
+            channel_type, phase2_char_name, current_user_name, roster,
         )
     )
+    phase2_messages.append({"role": "user", "content": format_text})
     if web_context:
         phase2_messages.append(_divider_msg(
             "【本輪網路資料 — 回覆前必須先參考】\n"
@@ -4213,7 +4219,8 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
             "只有資料裡真的沒有答案時才反問。\n"
             f"{web_context.strip()}"
         ))
-    phase2_messages.append({"role": "user", "content": format_text})
+    if image_description:
+        phase2_messages.append(_divider_msg(img_block.strip()))
     if now_divider:
         phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
@@ -4236,11 +4243,16 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
             await f.write(f"\n[系統分隔] {now_divider}")
         if web_context:
             await f.write(f"\n[本輪網路資料] {web_context.strip()}")
+        if image_description:
+            await f.write(f"\n[圖片分析] {image_description.strip()}")
         await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
         await f.write(f"\n\n=== PRIMING ===\n{priming_suffix}")
     print(f"[DEBUG] Phase 2 完整提示詞已寫入 {PROMPT_LOG_DIR}\\last_prompt.txt")
+    if image_description:
+        extra_segments.append({"id": "_ext_image", "title": "圖片分析",
+                               "kind": "dynamic", "rendered": img_block})
     await _write_prompt_blocks_dump(
         channel_type, enable_ic_style, extra_segments, all_context,
         current_user_name, clean_input_reply, planning_instruction, fmt_body,
@@ -4308,15 +4320,22 @@ async def run_phase2_direct(
 
     img_block = ""
     if image_description:
-        img_block = f"\n\n【用戶分享的圖片分析結果】\n{image_description}"
+        img_block = (
+            "\n\n【用戶本輪傳來的圖片（你已經看到，內容如下）】\n"
+            f"{image_description}\n"
+            "（這是剛剛收到的圖片，不是舊圖。若對話和圖片有關，"
+            "回覆時要引用圖片裡的具體內容；不要說看不到或無法讀取。）"
+        )
 
     roster = _reply_roster_text(all_context, current_user_name)
     format_text, planning_instruction, fmt_body, priming_suffix = (
         _reply_format_instruction(
-            channel_type, phase2_char_name, current_user_name, roster, img_block,
+            channel_type, phase2_char_name, current_user_name, roster,
         )
     )
     phase2_messages.append({"role": "user", "content": format_text})
+    if image_description:
+        phase2_messages.append(_divider_msg(img_block.strip()))
     if now_divider:
         phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
@@ -4575,25 +4594,46 @@ def _reply_format_instruction(channel_type: str, phase2_char_name: str,
         "所以不要在同一個區段裡回覆兩個人。\n"
         "- <planning> 只寫一份放在最前面，不要為每個人重寫。\n"
         f"\n{roster}\n"
+        "【要不要使用「回覆」功能（引用訊息）】\n"
+        "- 由你自己決定，不要每次都用。\n"
+        "- 只是接著最新訊息往下聊 → 不要引用，直接送普通訊息。\n"
+        "- 要回的是比較舊、已經被洗上去的訊息，或想明確標示在回誰 → "
+        "在該段正文最前面單獨一行寫 [REPLY]。\n"
+        "- [TO:名稱] 的分段一定會回覆到那個人的訊息，不用再加 [REPLY]。\n"
         "【範例】\n"
         "只有一個人：（直接寫正文，不加 [TO:]）\n"
         "有兩個人：\n"
         "[TO:甲]\n給甲的正文\n"
         "[TO:乙]\n給乙的正文\n"
+        "需要引用舊訊息時：\n"
+        "[REPLY]\n這段是在回前面那則比較舊的訊息\n"
         f"{img_block}"
     )
     return text, planning_instruction, fmt_body, priming_suffix
 
 
-# [TO:名稱]（支援半形/全形冒號、全形括號、前後空白）
-_TO_RE = re.compile(r"[\[【]\s*[Tt][Oo]\s*[:：]\s*([^\]】\n]{1,40}?)\s*[\]】]")
+# [TO:名稱]（支援半形/全形冒號、全形括號、全形字母、前後空白）
+_TO_RE = re.compile(
+    r"[\[【]\s*[TtＴｔ][OoＯｏ]\s*[:：]\s*([^\]】\n]{1,40}?)\s*[\]】]"
+)
+# 模型偶爾漏寫名字：[TO:]／【TO：】→ 直接清掉，不要留在正文
+_TO_EMPTY_RE = re.compile(r"[\[【]\s*[TtＴｔ][OoＯｏ]\s*[:：]\s*[\]】]")
 # 少數模型會寫成行首「TO：名稱」（沒有括號）
-_TO_BARE_RE = re.compile(r"(?m)^[ \t]*[Tt][Oo]\s*[:：]\s*([^\n]{1,40}?)[ \t]*$")
+_TO_BARE_RE = re.compile(
+    r"(?m)^[ \t]*[TtＴｔ][OoＯｏ]\s*[:：]\s*([^\n]{1,40}?)[ \t]*$"
+)
 
 
 def split_to_segments(bot_reply: str) -> list[tuple[str, str]]:
-    """把 [TO:名稱] 回覆切成 [(名稱, 內容)]；沒有 [TO:] 時回 [("", 原文)]。"""
-    text = bot_reply or ""
+    """把 [TO:名稱] 回覆切成 [(名稱, 內容)]；沒有 [TO:] 時回 [("", 原文)]。
+
+    容錯：
+    - 全形字母／冒號／括號、大小寫、前後空白
+    - 連續兩個 [TO:] 造成的中間空段直接丟掉
+    - 模型把 [TO:名稱] 寫在正文「後面」（段落是空的）時，
+      改把前面那段正文掛到這個名字，而不是丟失
+    """
+    text = (bot_reply or "").replace("\r\n", "\n")
     matches = list(_TO_RE.finditer(text))
     if not matches:
         matches = list(_TO_BARE_RE.finditer(text))
@@ -4608,6 +4648,12 @@ def split_to_segments(bot_reply: str) -> list[tuple[str, str]]:
         name = (mt.group(1) or "").strip()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         body = text[mt.end():end].strip()
+        if not body and i == len(matches) - 1 and segments and segments[-1][0] == "":
+            # 例：「正文\n[TO:甲]」→ 把「正文」改掛到甲
+            _prev_name, prev_body = segments.pop()
+            print(f"[回覆] [TO:{name}] 寫在正文後面，修正為回覆 {name}")
+            segments.append((name, prev_body))
+            continue
         if body:
             segments.append((name, body))
     return segments or [("", text.strip())]
@@ -4628,12 +4674,59 @@ def _name_matches(a: str, b: str) -> bool:
     return na == nb or na in nb or nb in na
 
 
-async def _resolve_reply_target(message: discord.Message, name: str,
-                                context: list | None, cache: dict):
-    """把 [TO:名稱] 解析成頻道中的那則訊息；找不到回 None。"""
-    if not name:
-        return None
+# [REPLY] / [NO_REPLY]：模型自己決定這則要不要使用 Discord 的「回覆」功能
+_REPLY_ON_RE = re.compile(
+    r"[\[【]\s*(?:"
+    r"[RrＲｒ][EeＥｅ][PpＰｐ][LlＬｌ][YyＹｙ]"
+    r"|回覆(?:訊息)?|引用(?:訊息)?|使用回覆"
+    r")\s*(?:[:：]\s*[^\]】\n]{0,40})?\s*[\]】]"
+)
+_REPLY_OFF_RE = re.compile(
+    r"[\[【]\s*(?:"
+    r"[NnＮｎ][OoＯｏ][_ ]?[RrＲｒ][EeＥｅ][PpＰｐ][LlＬｌ][YyＹｙ]"
+    r"|不\s*(?:回覆|回复|引用|用回覆)|普通訊息"
+    r")\s*(?:[:：]\s*[^\]】\n]{0,40})?\s*[\]】]"
+)
 
+
+def strip_reply_markers(text: str) -> str:
+    """移除 [REPLY]／[NO_REPLY] 與空的 [TO:]（不能讓它們被當成正文送出）。"""
+    out = _REPLY_OFF_RE.sub("", text or "")
+    out = _REPLY_ON_RE.sub("", out)
+    out = _TO_EMPTY_RE.sub("", out)
+    return out.strip()
+
+
+def wants_reply(bot_reply: str, mode: str = "auto") -> bool:
+    """這則回覆要不要引用（reply）觸發訊息。
+
+    mode: auto = 由模型決定（有 [REPLY] 才引用）；always / never = 強制。
+    """
+    mode = (mode or "auto").strip().lower()
+    if mode in ("always", "on", "true", "1"):
+        return True
+    if mode in ("never", "off", "false", "0"):
+        return False
+    if _REPLY_OFF_RE.search(bot_reply or ""):
+        return False
+    return bool(_REPLY_ON_RE.search(bot_reply or ""))
+
+
+async def _send_plain(message: discord.Message, text: str, files=None):
+    """不引用訊息，直接送出一則普通訊息。"""
+    channel = getattr(message, "channel", None)
+    if channel is not None and hasattr(channel, "send"):
+        try:
+            await channel.send(text, files=files or [])
+            return
+        except Exception as e:
+            print(f"[回覆] 普通訊息發送失敗，改用回覆: {type(e).__name__}: {e}")
+    await message.reply(text, files=files or [])
+
+
+async def _resolve_one_target(message: discord.Message, name: str,
+                              context: list | None, cache: dict):
+    """單一名稱的解析（context 優先，其次掃最近頻道訊息）。"""
     best_id = 0
     for m in context or []:
         if m.get("role") != "user":
@@ -4663,24 +4756,71 @@ async def _resolve_reply_target(message: discord.Message, name: str,
     return None
 
 
+async def _resolve_reply_target(message: discord.Message, name: str,
+                                context: list | None, cache: dict):
+    """把 [TO:名稱] 解析成頻道中的那則訊息；找不到回 None。
+
+    模型有時會把多個人塞進同一個標籤（[TO:甲、乙]）：拆開後取第一個
+    找得到的對象，找不到再往下試。
+    """
+    if not name:
+        return None
+    names = [n.strip() for n in re.split(r"[、,，/／&＆+＋]\s*", name) if n.strip()]
+    for candidate in names or [name]:
+        target = await _resolve_one_target(message, candidate, context, cache)
+        if target is not None:
+            if candidate != name:
+                print(f"[回覆] 多人標籤「{name}」→ 先回覆 {candidate}")
+            return target
+    return None
+
+
 async def dispatch_reply(message: discord.Message, bot_reply: str,
-                         tarot_drawn: dict | None, context: list | None = None):
+                         tarot_drawn: dict | None, context: list | None = None,
+                         reply_mode: str | None = None):
     """處理 [TO:] 分段並發送：每個人各自一則獨立回覆，回覆到那個人的訊息。
 
-    只有一段（或沒寫 [TO:]）→ 直接回覆觸發訊息。
+    只有一段（或沒寫 [TO:]）→ 依 reply_mode／[REPLY] 標記決定要不要引用觸發訊息：
+    - auto（預設）：模型寫了 [REPLY] 才引用，否則送普通訊息
+    - always / never：強制引用或不引用
     解析不到對象時退回回覆觸發訊息，內容不會遺失。
     """
-    segments = split_to_segments(bot_reply)
+    if reply_mode is None:
+        try:
+            pcfg = await load_prompt_config()
+            reply_mode = pcfg.get("reply_mode", "auto")
+        except Exception:
+            reply_mode = "auto"
+    use_reply = wants_reply(bot_reply, reply_mode)
+
+    segments = [
+        (name, strip_reply_markers(text))
+        for name, text in split_to_segments(bot_reply)
+    ]
+    segments = [(name, text) for name, text in segments if text]
     tf = tarot_drawn.get("files", []) if tarot_drawn else []
     named = [(n, t) for n, t in segments if n]
 
+    if not segments:
+        # 整段都是標記／空內容：不要送出空訊息（Discord 會 400）。
+        print("[回覆] 清理後沒有正文，略過發送")
+        return
+
     if not named:
-        text = "\n\n".join(t for _, t in segments if t).strip() or bot_reply
-        await message.reply(text, files=tf)
+        text = "\n\n".join(t for _, t in segments if t).strip()
+        if not text:
+            print("[回覆] 清理後沒有正文，略過發送")
+            return
+        if use_reply:
+            await message.reply(text, files=tf)
+        else:
+            await _send_plain(message, text, tf)
         return
 
     cache: dict = {}
     for idx, (name, text) in enumerate(segments):
+        if not text:
+            continue
         files = tf if idx == 0 else []
         target = await _resolve_reply_target(message, name, context, cache)
         try:

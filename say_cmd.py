@@ -1,9 +1,36 @@
 """/say 指令模組 — 讓角色主動加入對話（完整三階段流程）"""
 
+import asyncio
 import discord, json, re, os, datetime
 from llm_models import chat_create
 
-SAY_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "say_log.jsonl")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SAY_LOG_FILE = os.path.join(SCRIPT_DIR, "say_log.jsonl")
+SAY_DEBUG_DIR = os.path.join(SCRIPT_DIR, "say_logs")
+
+
+def _log_say_debug(stage: str, **fields):
+    """/say 的逐步診斷紀錄（每階段都寫，成功或失敗都看得到原因）。"""
+    try:
+        os.makedirs(SAY_DEBUG_DIR, exist_ok=True)
+        path = os.path.join(
+            SAY_DEBUG_DIR, f"{datetime.datetime.now():%Y-%m-%d}.jsonl"
+        )
+        record = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                  "stage": stage}
+        record.update(fields)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _clean_planning(text: str) -> str:
+    """移除 <planning> 區塊；未閉合時從 <planning> 起全部切掉，避免漏字。"""
+    text = re.sub(r"<planning>.*?</planning>", "", text, flags=re.DOTALL)
+    if "<planning>" in text:
+        text = text.split("<planning>", 1)[0]
+    return text.strip()
 
 
 def _log_say_usage(interaction: discord.Interaction, reply: str):
@@ -100,6 +127,7 @@ def register_say(bot):
 
 輸出 JSON：{{"suitable": true/false, "reason": "原因", "lore_topics": []}}"""
 
+        short_mode = False
         try:
             resp = await chat_create(
                 "say",
@@ -113,12 +141,17 @@ def register_say(bot):
             )
             raw = resp.choices[0].message.content or '{"suitable":false}'
             phase1 = json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip())
-            if not phase1.get("suitable", False):
-                await interaction.followup.send(
-                    f"（{char_name}覺得現在不是發言的好時機）", ephemeral=True
-                )
-                return
-        except Exception:
+            # 氣氛不適合長篇加入時不再完全沉默：改成「只補一句」短台詞。
+            short_mode = not phase1.get("suitable", False)
+            _log_say_debug(
+                "phase1",
+                suitable=phase1.get("suitable"),
+                reason=str(phase1.get("reason", ""))[:200],
+                short_mode=short_mode,
+                channel=str(getattr(channel, "name", "")),
+            )
+        except Exception as e:
+            _log_say_debug("phase1_error", error=f"{type(e).__name__}: {e}"[:300])
             await interaction.followup.send(
                 f"（{char_name}猶豫了一下...）", ephemeral=True
             )
@@ -180,30 +213,76 @@ def register_say(bot):
 
 不輸出 <planning> = 錯誤"""
 
-        try:
+        if short_mode:
+            say_user_prompt = (
+                f"【目前對話】\n{context_text}\n\n"
+                "現在氣氛不適合長篇加入。請只補一句很短的台詞（30 字內），"
+                "附和、吐槽或簡短回應即可，不要展開新話題、不要問問題。"
+            )
+        else:
+            say_user_prompt = (
+                f"【目前對話】\n{context_text}\n\n"
+                f"請以{char_name}的身分自然地加入對話。"
+            )
+
+        async def _generate(prompt_text: str, max_tokens: int) -> tuple[str, str, str]:
             resp = await chat_create(
                 "say",
                 messages=[
                     {"role": "system", "content": phase2_system},
-                    {
-                        "role": "user",
-                        "content": f"【目前對話】\n{context_text}\n\n請以{char_name}的身分自然地加入對話。",
-                    },
+                    {"role": "user", "content": prompt_text},
                 ],
                 temperature=0.8,
-                max_tokens=400,
+                max_tokens=max_tokens,
             )
-            raw_content = resp.choices[0].message.content or ""
-            reply = re.sub(
-                r"<planning>.*?</planning>", "", raw_content, flags=re.DOTALL
-            ).strip()
-            reply = re.sub(r"\s*\[MEM:\{.*?\}\]", "", reply, flags=re.DOTALL).strip()
-            reply = re.sub(r"\s*\[LEARN:\{.*?\}\]", "", reply, flags=re.DOTALL).strip()
-            reply = re.sub(r"</?(\w+)[^>]*>", "", reply, flags=re.DOTALL).strip()
+            raw = resp.choices[0].message.content or ""
+            text = _clean_planning(raw)
+            text = re.sub(r"\s*\[MEM:\{.*?\}\]", "", text, flags=re.DOTALL).strip()
+            text = re.sub(r"\s*\[LEARN:\{.*?\}\]", "", text, flags=re.DOTALL).strip()
+            text = re.sub(r"</?(\w+)[^>]*>", "", text, flags=re.DOTALL).strip()
+            finish = getattr(resp.choices[0], "finish_reason", "")
+            return raw, text, finish
+
+        try:
+            raw_content, reply, finish_reason = await _generate(
+                say_user_prompt, 400 if short_mode else 600
+            )
+            # 只輸出 planning、或整段被截斷時，重試一次「直接給台詞」。
             if not reply:
-                reply = f"（{char_name}看了看周圍，沒說什麼）"
+                _log_say_debug(
+                    "phase2_empty",
+                    short_mode=short_mode,
+                    finish=finish_reason,
+                    raw_len=len(raw_content),
+                    raw=str(raw_content)[:300],
+                )
+                retry_prompt = (
+                    f"【目前對話】\n{context_text}\n\n"
+                    "直接輸出澪要說的一句台詞（30 字內），"
+                    "不要 <planning>、不要說明、不要引號。"
+                )
+                raw_content, reply, finish_reason = await _generate(retry_prompt, 300)
+            if short_mode and reply:
+                # 保險：只留第一句，避免「補一句」變成整段演講
+                first = re.split(r"(?<=[。！？!?…])\s*", reply, maxsplit=1)[0].strip()
+                reply = first or reply
+            _log_say_debug(
+                "phase2",
+                short_mode=short_mode,
+                finish=finish_reason,
+                raw_len=len(raw_content),
+                reply_len=len(reply),
+                reply=reply[:200],
+            )
+            if not reply:
+                _log_say_debug("give_up", reason="模型兩次都沒給台詞")
+                await interaction.followup.send(
+                    f"（{char_name}想了想，還是沒開口）", ephemeral=True
+                )
+                return
             await interaction.delete_original_response()
             await channel.send(reply)
+            _log_say_debug("sent", reply=reply[:200], channel=str(getattr(channel, "name", "")))
             _log_say_usage(interaction, reply)
             user_content = last_user_msg.content if last_user_msg else "say指令"
             excerpt = re.sub(r'[\\/:*?"<>|\r\n]', "", user_content[:20]) or "say"
@@ -224,6 +303,10 @@ def register_say(bot):
             import traceback
             print(f"[/say] 失敗: {e}")
             print(traceback.format_exc())
+            _log_say_debug(
+                "exception", error=f"{type(e).__name__}: {e}"[:400],
+                trace=traceback.format_exc()[:1200],
+            )
             try:
                 from main import _log_error
                 await _log_error("say_failure", str(e), traceback=traceback.format_exc()[:2500])

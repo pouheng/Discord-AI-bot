@@ -496,6 +496,7 @@ class BotManagerGUI:
         self._build_source_section(settings_tab)
         self._build_model_section(settings_tab)
         self._build_fallback_section(settings_tab)
+        self._build_reply_section(settings_tab)
         ttk.Label(settings_tab, text="Watchdog（定時自動重啟）",
                   font=("Segoe UI", 11, "bold")).pack(anchor=tk.W, pady=(12, 2))
 
@@ -803,6 +804,50 @@ class BotManagerGUI:
                    if _route_sync_var is not None and _route_sync_var.get() else ""))
         except Exception as e:
             log(f"儲存三線路失敗: {e}")
+
+    def _build_reply_section(self, parent):
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        ttk.Label(parent, text="回覆功能（引用訊息）",
+                  font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+        ttk.Label(
+            parent,
+            text="自動＝角色自己決定要不要引用（預設不引用，需要時寫 [REPLY]）；改完需 /reload_config 或重啟。",
+            font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, pady=(2, 4))
+
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X)
+        self.reply_mode_var = tk.StringVar(value=self._load_reply_mode())
+        for text, value in (
+            ("自動（角色決定）", "auto"),
+            ("一律引用", "always"),
+            ("不引用", "never"),
+        ):
+            ttk.Radiobutton(
+                row, text=text, value=value,
+                variable=self.reply_mode_var,
+                command=self._save_reply_mode,
+            ).pack(side=tk.LEFT, padx=(0, 12))
+
+    @staticmethod
+    def _load_reply_mode() -> str:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("reply_mode", "auto") or "auto"
+        except Exception:
+            return "auto"
+
+    def _save_reply_mode(self):
+        mode = self.reply_mode_var.get()
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg["reply_mode"] = mode
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            log(f"回覆模式設為「{mode}」")
+        except Exception as e:
+            log(f"儲存回覆模式失敗: {e}")
 
     def _thread_action(self, action: str):
         """Run action in thread with instant button feedback."""
