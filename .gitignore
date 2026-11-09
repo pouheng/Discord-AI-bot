@@ -14,6 +14,7 @@ maintenance_logs/
 prompt_logs/
 conversation_logs/
 bot.pid
+bot.lock
 db_check_result.txt
 __pycache__/
 *.pyc

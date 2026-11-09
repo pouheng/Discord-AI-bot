@@ -5543,6 +5543,44 @@ import collide_cmds
 collide_write_cmds.register_commands(bot)
 collide_cmds.register_commands(bot)
 
+def _acquire_single_instance():
+    """確保同時只有一個 bot 實例；第二個實例直接結束。
+
+    沒有這道鎖時，manager／watchdog／restart 各自用 bot.pid 判斷存活，
+    追不到「pid 檔以外的舊實例」，兩個 bot 同時在線就會對同一則訊息
+    各回一次（雙重回覆）。Windows 的檔案鎖會隨行程結束自動釋放。
+    """
+    lock_path = os.path.join(SCRIPT_DIR, "bot.lock")
+    fh = open(lock_path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write("0")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[啟動] 偵測到另一個 bot 實例正在執行，這個實例結束（避免雙重回覆）。")
+        try:
+            fh.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+_SINGLE_INSTANCE_LOCK = None
+
 if __name__ == "__main__":
-    # 啟動機器人
+    # 啟動機器人（同一時間只允許一個實例）
+    _SINGLE_INSTANCE_LOCK = _acquire_single_instance()
     bot.run(DISCORD_TOKEN)
