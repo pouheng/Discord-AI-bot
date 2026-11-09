@@ -63,6 +63,8 @@ check("第三個分隔＝今天", "今天" in dividers[2]["content"], dividers[2
 check("分隔標明以上/以下", "以上" in dividers[1]["content"] and "以下" in dividers[1]["content"])
 check("原始訊息全數保留", len([m for m in out if m["role"] != "system"]) == 4)
 check("跨日分隔帶間隔", "距上一則" in dividers[1]["content"], dividers[1]["content"])
+check("分隔帶第一則時間", "10:00" in dividers[0]["content"], dividers[0]["content"])
+check("新的一天帶時間", "09:00" in dividers[1]["content"], dividers[1]["content"])
 
 print("[4] 同日長間隔")
 ctx2 = [
@@ -75,6 +77,7 @@ sys_msgs = [m for m in out2 if m.get("role") == "system"]
 check("起點 + 時間分隔共 2 條", len(sys_msgs) == 2, str(len(sys_msgs)))
 check("時間分隔文字", "【時間分隔】" in sys_msgs[1]["content"], sys_msgs[1]["content"])
 check("時間分隔含 10 小時", "10 小時" in sys_msgs[1]["content"], sys_msgs[1]["content"])
+check("時間分隔帶時間", "11:00" in sys_msgs[1]["content"], sys_msgs[1]["content"])
 
 out3 = main.insert_day_dividers(ctx2, now=datetime.datetime(2026, 11, 3, 12, 0),
                                 gap_hours=12)

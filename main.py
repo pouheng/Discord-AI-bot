@@ -11,6 +11,7 @@ import re
 import aiosqlite
 import sqlite3
 import os
+import time
 import aiofiles
 import autopilot
 import tarot
@@ -366,8 +367,9 @@ def _divider_msg(text: str) -> dict:
 
 
 def _day_divider_text(day: datetime.date, today: datetime.date, gap,
-                      *, first: bool = False) -> str:
-    info = [_day_label(day), _relative_day_label(day, today)]
+                      *, first: bool = False, at_time: str = "") -> str:
+    day_part = f"{_day_label(day)} {at_time}".strip() if at_time else _day_label(day)
+    info = [day_part, _relative_day_label(day, today)]
     if gap is not None:
         g = _format_gap(gap)
         if g:
@@ -388,11 +390,13 @@ def _day_divider_text(day: datetime.date, today: datetime.date, gap,
     )
 
 
-def _gap_divider_text(day: datetime.date, today: datetime.date, gap) -> str:
+def _gap_divider_text(day: datetime.date, today: datetime.date, gap,
+                      at_time: str = "") -> str:
     g = _format_gap(gap)
+    day_part = f"{_day_label(day)} {at_time}".strip() if at_time else _day_label(day)
     return (
         "── ── ── ── ──\n"
-        f"【時間分隔】以下對話開始於 {_day_label(day)}"
+        f"【時間分隔】以下對話開始於 {day_part}"
         f"｜{_relative_day_label(day, today)}"
         + (f"｜距上一則 {g}" if g else "")
         + "。\n"
@@ -423,11 +427,14 @@ def insert_day_dividers(context: list, now: datetime.datetime | None = None,
         day = dt.date()
         gap = (dt - prev_dt) if prev_dt is not None else None
         if prev_day is None:
-            out.append(_divider_msg(_day_divider_text(day, today, gap, first=True)))
+            out.append(_divider_msg(_day_divider_text(
+                day, today, gap, first=True, at_time=dt.strftime("%H:%M"))))
         elif day != prev_day:
-            out.append(_divider_msg(_day_divider_text(day, today, gap)))
+            out.append(_divider_msg(_day_divider_text(
+                day, today, gap, at_time=dt.strftime("%H:%M"))))
         elif gap_secs and gap is not None and gap.total_seconds() >= gap_secs:
-            out.append(_divider_msg(_gap_divider_text(day, today, gap)))
+            out.append(_divider_msg(_gap_divider_text(
+                day, today, gap, at_time=dt.strftime("%H:%M"))))
         out.append(m)
         prev_dt = dt
         prev_day = day
@@ -2734,8 +2741,13 @@ def format_supplement(supplement, include_notes: bool = True) -> str:
             note = entry.get("note", "")
             if not content:
                 continue
+            # 記憶必須帶日期，否則模型會把舊事件當成「剛剛」。沒帶日期就明確標示。
+            date = str(
+                entry.get("source_date") or entry.get("date") or ""
+            ).strip()
+            date_tag = f"（{date}）" if date else "（日期不明，屬過去）"
             prefix = f"- [{cat}] {topic}" if cat else f"- {topic}"
-            lines.append(f"{prefix}：{content}")
+            lines.append(f"{prefix}{date_tag}：{content}")
             if include_notes and note:
                 lines.append(f"  ※{note}")
         return "\n".join(lines)
@@ -2902,8 +2914,12 @@ async def run_phase1(
   - 對角色記憶的備註也用自由註釋，在內容中指名角色
 - supplement：JSON 陣列，每個元素是一個物件，**至少 6 條（建議 6-8 條）**，從資料庫中選出與對話最相關的條目。
   每個物件格式：
-  {"category": "分類標籤", "topic": "主題名稱", "content": "條目完整內容", "note": "運用備註（可選）"}
+  {"category": "分類標籤", "topic": "主題名稱", "content": "條目完整內容", "source_date": "YYYY-MM-DD 或空字串", "note": "運用備註（可選）"}
   分類標籤必須與資料庫原文一致，例如：世界觀、角色能力、角色背景、事件、人物、場景與人物、劇情摘要、勢力、數值體系。
+  ⚠️ source_date 是**必填**欄位：若該條目在資料庫中帶有 `[YYYY-MM-DD ...]` 時間戳，
+  必須原樣抄出日期（只抄 YYYY-MM-DD）；世界觀／設定類沒有時間戳的條目填 `""`。
+  抄 content 時**不要刪掉原文裡的時間語境**（例如「本次」「剛」「昨天」），
+  但這些詞是「當時」的視角，不是現在；source_date 就是判斷新舊的依據。
   note 為可選欄位，說明為什麼相關、Phase 2 該如何運用。
   ⚠️ note 是「推測與建議」，不是事實。嚴禁在 note 裡複述或改寫對話內容、
   嚴禁聲稱「某人（在本輪）說了什麼」——尤其不可把相鄰不同人的發言併給同一人。
@@ -2914,7 +2930,7 @@ async def run_phase1(
    若同一 topic 有多條相關條目，優先選取時間最新或內容最完整的，同 topic 最多選 2 條。
 
 正確範例：
-{"recall":[{"id":"1083341557677183036"}],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_topics":[],"need_web_search":false,"web_search_query":"","lore_notes":[{"note":"自由註釋"}],"supplement":[{"category":"世界觀","topic":"魔法","content":"這世界的人都會覺醒1種個人魔法...","note":"與當前對話直接相關"},{"category":"角色能力","topic":"機械義手","content":"澪的右手為機械義手..."}]}"""
+{"recall":[{"id":"1083341557677183036"}],"recall_threads":[],"load_plot":false,"enable_ic_style":false,"lore_topics":[],"need_web_search":false,"web_search_query":"","lore_notes":[{"note":"自由註釋"}],"supplement":[{"category":"世界觀","topic":"魔法","content":"這世界的人都會覺醒1種個人魔法...","source_date":"","note":"與當前對話直接相關"},{"category":"人物","topic":"頭皮慶","content":"頭皮慶曾以『咕咕嘎嘎』亂入...","source_date":"2026-10-25","note":"本輪他在場"}]}"""
 
     # ──────────────────────────────────────────────
     # 動態資料區（底部）：完整資料庫內容
@@ -3464,6 +3480,127 @@ _processing_messages = set()
 #  on_message 拆解後的輔助函數
 # ============================================================
 
+def _describe_empty_message(message) -> str:
+    """訊息沒有文字時，用附件／貼圖／嵌入的實際內容描述。
+
+    以前一律填 "hi"，模型會以為使用者真的在打招呼（例如只貼圖也被回
+    「hi hi～」）。改成描述實際內容，Phase 1/Phase 2 才知道發生什麼事。
+    """
+    atts = getattr(message, "attachments", None)
+    if isinstance(atts, (list, tuple)) and atts:
+        parts = []
+        for a in atts[:3]:
+            ctype = (getattr(a, "content_type", "") or "").lower()
+            if ctype.startswith("image"):
+                kind = "圖片"
+            elif ctype.startswith("video"):
+                kind = "影片"
+            elif ctype.startswith("audio"):
+                kind = "音訊"
+            else:
+                kind = "檔案"
+            name = getattr(a, "filename", "") or ""
+            parts.append(f"{kind}「{name}」" if name else kind)
+        return f"（傳送了 {'、'.join(parts)}）"
+
+    stickers = getattr(message, "stickers", None)
+    if isinstance(stickers, (list, tuple)) and stickers:
+        return "（傳送了貼圖）"
+
+    embeds = getattr(message, "embeds", None)
+    if isinstance(embeds, (list, tuple)) and embeds:
+        title = getattr(embeds[0], "title", "") or ""
+        return f"（分享了一個連結{f'：{title}' if title else ''}）"
+
+    return "（傳送了非文字內容）"
+
+
+async def _auto_read_images(message, pcfg: dict) -> tuple[str, list[dict]]:
+    """自動讀觸發訊息（或被回覆訊息）附的圖片。回傳 (注入文字, 紀錄)。
+
+    只在 image_reader.auto_read 開啟時運作；張數與大小有上限，
+    失敗不影響回覆（只是沒有圖片描述）。讀到的描述會放進
+    Phase 2 的 image_description，角色就「看得到」圖片。
+    """
+    cfg = pcfg.get("image_reader") or {}
+    if not cfg.get("auto_read", True):
+        return "", []
+    try:
+        max_images = max(1, int(cfg.get("auto_max_images", 1) or 1))
+        max_bytes = int(cfg.get("auto_max_bytes", 8_000_000) or 0)
+    except (TypeError, ValueError):
+        max_images, max_bytes = 1, 8_000_000
+
+    sources = [message]
+    ref = getattr(message, "reference", None)
+    replied = getattr(ref, "resolved", None) if ref else None
+    if replied is not None:
+        sources.append(replied)
+
+    imgs = []
+    for src in sources:
+        atts = getattr(src, "attachments", None)
+        if not isinstance(atts, (list, tuple)):
+            continue
+        for a in atts:
+            ctype = (getattr(a, "content_type", "") or "").lower()
+            if not ctype.startswith("image"):
+                continue
+            size = getattr(a, "size", 0) or 0
+            if max_bytes and size and size > max_bytes:
+                print(f"[讀圖] 跳過過大附件 {getattr(a, 'filename', '')} ({size} bytes)")
+                continue
+            imgs.append(a)
+            if len(imgs) >= max_images:
+                break
+        if len(imgs) >= max_images:
+            break
+
+    if not imgs:
+        return "", []
+
+    ollama_cfg = pcfg.get("ollama", {})
+    blocks: list[str] = []
+    logs: list[dict] = []
+    for a in imgs:
+        filename = getattr(a, "filename", "") or "image"
+        try:
+            data = await a.read()
+        except Exception as e:
+            print(f"[讀圖] 下載失敗 {filename}: {type(e).__name__}: {e}")
+            continue
+
+        cached = image_reader.get_cached_description(data)
+        if cached:
+            print(f"[讀圖] 使用快取: {filename}")
+            desc, elapsed = cached, 0.0
+        else:
+            try:
+                result = await image_reader.read_image(
+                    data, filename, ollama_cfg, image_cfg=cfg
+                )
+            except Exception as e:
+                print(f"[讀圖] 失敗 {filename}: {type(e).__name__}: {e}")
+                continue
+            if not result.get("success"):
+                print(f"[讀圖] 失敗 {filename}: {result.get('error')}")
+                continue
+            desc = result["description"]
+            elapsed = result.get("elapsed", 0.0)
+            image_reader.set_cached_description(data, desc)
+
+        blocks.append(f"【{filename}】\n{desc}")
+        logs.append({"filename": filename, "description": desc, "elapsed": elapsed})
+        print(f"[讀圖] 完成 {filename}（{elapsed:.1f}s）")
+
+    if not blocks:
+        return "", logs
+    text = "\n\n".join(blocks)
+    if len(blocks) > 1:
+        text = f"（共 {len(blocks)} 張圖片）\n\n{text}"
+    return text, logs
+
+
 def detect_trigger(message: discord.Message) -> tuple[bool, bool, bool]:
     """判斷訊息是否在「找」bot（@ / role mention / reply-to-bot）。"""
     is_mention = bot.user.mentioned_in(message)
@@ -3928,15 +4065,61 @@ async def _summarize_web_pages(pages: list[dict], max_text_chars: int = 6000) ->
     return (resp.choices[0].message.content or "").strip() if resp.choices else ""
 
 
-async def _build_web_context(text: str, pcfg: dict) -> tuple[str, list[dict], str]:
-    """偵測 text 中的連結、抓取並摘要。回傳 (注入區塊, 成功頁面, 摘要)。"""
+_WEB_PAGE_CACHE: dict = {}
+
+
+def _web_cache_get(url: str, ttl: int) -> dict | None:
+    hit = _WEB_PAGE_CACHE.get(url)
+    if not hit:
+        return None
+    ts, page = hit
+    if ttl > 0 and (time.time() - ts) > ttl:
+        _WEB_PAGE_CACHE.pop(url, None)
+        return None
+    return page
+
+
+async def _build_web_context(text: str, pcfg: dict,
+                             context: list | None = None) -> tuple[str, list[dict], str]:
+    """偵測連結、抓取並摘要。回傳 (注入區塊, 成功頁面, 摘要)。
+
+    text 是當前訊息；context 是最新歷史。連結常是幾小時前貼的，
+    只掃當前訊息會永遠讀不到，因此一併掃最近 N 則（web_reader.history_messages）。
+    同一網址在 web_reader.cache_ttl_seconds 內不重抓。
+    """
     wcfg = {**web_reader.DEFAULT_CFG, **(pcfg.get("web_reader") or {})}
     if not wcfg.get("enabled", True):
         return "", [], []
-    urls = web_reader.extract_urls(text, limit=int(wcfg.get("max_links", 2)))
+
+    scan_parts = [text or ""]
+    try:
+        history_n = int(wcfg.get("history_messages", 6))
+    except (TypeError, ValueError):
+        history_n = 6
+    if context and history_n > 0:
+        recent = [m for m in context if m.get("role") != "system"][-history_n:]
+        scan_parts.extend(m.get("content") or "" for m in recent)
+    scan_text = "\n".join(p for p in scan_parts if p)
+
+    urls = web_reader.extract_urls(scan_text, limit=int(wcfg.get("max_links", 2)))
     if not urls:
         return "", [], ""
-    results = await asyncio.gather(*[web_reader.fetch_page(u, wcfg) for u in urls])
+
+    try:
+        ttl = int(wcfg.get("cache_ttl_seconds", 1800))
+    except (TypeError, ValueError):
+        ttl = 1800
+
+    async def _fetch(url: str) -> dict:
+        cached = _web_cache_get(url, ttl)
+        if cached is not None:
+            return cached
+        page = await web_reader.fetch_page(url, wcfg)
+        if page.get("ok"):
+            _WEB_PAGE_CACHE[url] = (time.time(), page)
+        return page
+
+    results = await asyncio.gather(*[_fetch(u) for u in urls])
     pages = [p for p in results if p.get("ok")]
     if not pages:
         for p in results:
@@ -3995,7 +4178,8 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
                                "kind": "dynamic", "rendered": _seg})
 
     if web_context:
-        phase2_system += web_context
+        # 不放進 system 尾端（會被 ooc_tail 的 few-shot 蓋過），改在
+        # 當前訊息前以獨立區塊注入，見下方 phase2_messages。
         extra_segments.append({"id": "_ext_web", "title": "網頁內容",
                                "kind": "dynamic", "rendered": web_context})
 
@@ -4021,6 +4205,14 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
             channel_type, phase2_char_name, current_user_name, roster, img_block,
         )
     )
+    if web_context:
+        phase2_messages.append(_divider_msg(
+            "【本輪網路資料 — 回覆前必須先參考】\n"
+            "以下是你剛剛查到的內容。若使用者在問這個連結或主題，"
+            "必須直接用這些內容回答，不要說「我沒點開」或反問；"
+            "只有資料裡真的沒有答案時才反問。\n"
+            f"{web_context.strip()}"
+        ))
     phase2_messages.append({"role": "user", "content": format_text})
     if now_divider:
         phase2_messages.append(_divider_msg(now_divider))
@@ -4042,6 +4234,8 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
             await f.write(f"\n[{role_tag}] {m['content']}")
         if now_divider:
             await f.write(f"\n[系統分隔] {now_divider}")
+        if web_context:
+            await f.write(f"\n[本輪網路資料] {web_context.strip()}")
         await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
@@ -4123,12 +4317,6 @@ async def run_phase2_direct(
         )
     )
     phase2_messages.append({"role": "user", "content": format_text})
-    if now_divider:
-        phase2_messages.append(_divider_msg(now_divider))
-    phase2_messages.append({
-        "role": "user",
-        "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
-    })
     if now_divider:
         phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
@@ -4537,7 +4725,7 @@ async def on_message(message: discord.Message):
         try:
             clean_input = re.sub(r"<@&?\d+>", "", message.content).strip()
             if not clean_input:
-                clean_input = "hi"
+                clean_input = _describe_empty_message(message)
 
             reply_context = ""
             if message.reference and message.reference.resolved:
@@ -4666,13 +4854,15 @@ async def on_message(message: discord.Message):
             await log_recalled_data(resolved_ids, recall_candidates, combined_memories, lore_text)
 
             pcfg = await load_prompt_config()
+            # 自動讀觸發訊息（或被回覆訊息）附的圖片；與搜尋／網頁並行
+            image_task = asyncio.create_task(_auto_read_images(message, pcfg))
             blocked_kw = [k.lower() for k in pcfg.get("blocked_keywords", [])]
             blocked_exceptions = [
                 e.lower() for e in pcfg.get("blocked_keyword_exceptions", [])
             ]
 
             web_context, web_pages, web_summary = await _build_web_context(
-                clean_input_reply, pcfg
+                clean_input_reply, pcfg, all_context
             )
 
             # Phase 1 決定要不要用 DeepSeek 原生搜尋（server-side web_search）。
@@ -4694,6 +4884,8 @@ async def on_message(message: discord.Message):
                 else:
                     print(f"[搜尋] 失敗: {search_result.get('error')}")
 
+            image_description, image_logs = await image_task
+
             raw_content, phase2_char_name, current_user_name = await build_and_call_phase2(
                 message, channel_type=channel_type, pcfg=pcfg,
                 enable_ic_style=enable_ic_style, channel_context=channel_context,
@@ -4702,6 +4894,7 @@ async def on_message(message: discord.Message):
                 quests_text=quests_text, all_context=all_context,
                 clean_input_reply=clean_input_reply, tarot_drawn=tarot_drawn,
                 lore_speculation=lore_speculation, web_context=web_context,
+                image_description=image_description,
             )
 
             raw_content = await style_self_check(raw_content, channel_type, enable_ic_style, pcfg)
@@ -4733,6 +4926,15 @@ async def on_message(message: discord.Message):
                     message.author.display_name,
                     getattr(message.channel, "name", ""),
                     search_query, search_result, bot_reply,
+                ))
+            for _img in image_logs:
+                asyncio.create_task(image_reader.log_image_analysis(
+                    message.author.display_name,
+                    getattr(message.channel, "name", ""),
+                    _img["filename"],
+                    {"description": _img["description"], "thinking": "",
+                     "elapsed": _img["elapsed"]},
+                    bot_reply,
                 ))
 
             self_memories_all = await get_self_memory(limit=200)

@@ -50,9 +50,9 @@ _Await_: multi reply, split reply, 分段回覆
 _Await_: Response引导, format引导
 
 **Image Reader（圖片分析）**：
-分析用戶分享的圖片並產生結構化描述（[類型]/[描述]/[表情]/[姿勢]/[環境]/[情緒]），注入 prompt 的 context 區塊，讓 AI 角色「看到」圖片。使用 `/readimg` slash command 觸發。讀圖 provider 可切換：`config.json` 的 `image_reader.provider` = `ollama`（本地 Gemma4、不上傳，預設）或 `deepseek`（雲端 vision、較快但圖片會上傳）。
+分析用戶分享的圖片並產生結構化描述（[類型]/[描述]/[表情]/[姿勢]/[環境]/[情緒]），注入 prompt 的 context 區塊，讓 AI 角色「看到」圖片。`/readimg` slash command 可手動觸發；另外 `image_reader.auto_read` 開啟時，觸發訊息（或被回覆訊息）附的圖片會自動讀取並注入 Phase 2（`auto_max_images`／`auto_max_bytes` 控管）。讀圖 provider 可切換：`config.json` 的 `image_reader.provider` = `ollama`（本地 Gemma4、不上傳，預設）或 `deepseek`（雲端 vision、較快但圖片會上傳）。
 
-_Await_: Vision analysis, image description
+_Await_: Vision analysis, image description, auto image read
 
 **Web Search（DeepSeek 原生搜尋）**：
 Phase 1 判斷需要「資料庫以外的即時／外部資訊」時，改用 DeepSeek 官方 `/v1/responses` + `deepseek-v4-pro` 的 server-side `web_search` 工具（`deepseek_search.py`），取得答案與來源後注入 Phase 2。與 `web_reader`（只讀使用者貼的連結）互補。設定在 `config.json` 的 `deepseek_search`；搜尋按次計費（自 2026-11-01 起）。

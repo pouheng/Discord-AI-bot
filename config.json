@@ -126,7 +126,10 @@
     "deepseek_model": "",
     "deepseek_max_tokens": 800,
     "max_side": 1024,
-    "timeout": 120
+    "timeout": 120,
+    "auto_read": true,
+    "auto_max_images": 1,
+    "auto_max_bytes": 8000000
   },
   "web_reader": {
     "enabled": true,
@@ -134,7 +137,9 @@
     "max_bytes": 500000,
     "max_links": 2,
     "max_text_chars": 6000,
-    "block_private": true
+    "block_private": true,
+    "history_messages": 6,
+    "cache_ttl_seconds": 1800
   },
   "deepseek_search": {
     "enabled": true,
