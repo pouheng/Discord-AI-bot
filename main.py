@@ -5252,6 +5252,14 @@ async def on_message(message: discord.Message):
                                 max_steps=int(dcfg.get("read_steps", 3)),
                             )
                             drive_context = (result.get("summary") or "").strip()
+                            if not drive_context and _read_docs:
+                                # 研究員沒吐出摘要（步數用盡）→ 至少把讀到的原文交給 Phase 2
+                                print("[Drive] 研究員沒有摘要，改用已讀到的原文")
+                                drive_context = "\n\n".join(_read_docs)[:2500]
+                            print(
+                                f"[Drive] 唯讀完成 steps={result.get('steps')} "
+                                f"摘要={len(drive_context)} 字"
+                            )
                         if drive_writes:
                             print(
                                 "[Drive] 寫入結果："
@@ -5973,7 +5981,59 @@ def _acquire_single_instance():
 
 _SINGLE_INSTANCE_LOCK = None
 
+CONSOLE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_console.log")
+
+
+class _TeeStream:
+    """同時寫到 stdout 與檔案；pythonw／CREATE_NO_WINDOW 的情況 stdout 可能是 None。"""
+
+    def __init__(self, stream, fp):
+        self.stream = stream
+        self.fp = fp
+        self._at_line_start = True
+
+    def write(self, data):
+        if not data:
+            return
+        try:
+            if self.stream is not None:
+                self.stream.write(data)
+                self.stream.flush()
+        except Exception:
+            pass
+        try:
+            out = []
+            for part in data.splitlines(True):
+                if self._at_line_start:
+                    out.append(datetime.datetime.now().strftime("[%H:%M:%S] "))
+                out.append(part)
+                self._at_line_start = part.endswith("\n")
+            self.fp.write("".join(out))
+            self.fp.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.fp.flush()
+        except Exception:
+            pass
+
+
+def _install_console_log():
+    """把 print／traceback 也寫進 bot_console.log，沒視窗時才看得到錯誤。"""
+    try:
+        if os.path.exists(CONSOLE_LOG) and os.path.getsize(CONSOLE_LOG) > 8 * 1024 * 1024:
+            os.replace(CONSOLE_LOG, CONSOLE_LOG + ".1")
+        fp = open(CONSOLE_LOG, "a", encoding="utf-8")
+    except Exception:
+        return
+    sys.stdout = _TeeStream(sys.stdout, fp)
+    sys.stderr = _TeeStream(sys.stderr, fp)
+
+
 if __name__ == "__main__":
+    _install_console_log()
     # 啟動機器人（同一時間只允許一個實例）
     _SINGLE_INSTANCE_LOCK = _acquire_single_instance()
     bot.run(DISCORD_TOKEN)

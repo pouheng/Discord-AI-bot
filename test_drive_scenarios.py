@@ -525,6 +525,21 @@ check("沒有殘留路徑與 mode", "角色草稿/測試.md" not in text and "cr
 check("沒有程式碼圍籬", "```" not in text, text[:80])
 check("開頭就是標題", text.lstrip().startswith("# 標題"), text[:40])
 
+# ── 場景 16：研究員步數用盡 → 還是要生出摘要 ───────────────
+
+print("[16] 唯讀研究員讀到步數用盡 → 追問一次摘要")
+seen = script_model([
+    model_reply(tool_calls=[tool_call("drive_read", {"path": "世界觀.md"}, cid="r1")]),
+    model_reply(tool_calls=[tool_call("drive_read", {"path": "國家設定.md"}, cid="r2")]),
+    model_reply(""),  # 最後一輪被 tool_choice=none，卻回空字串
+    model_reply("世界觀是三國對立，魔法來自靈魂。"),
+])
+res = asyncio.run(D.run_read_agent("世界觀在講什麼？", max_steps=3))
+check("有補出摘要", res.get("summary") == "世界觀是三國對立，魔法來自靈魂。",
+      str(res)[:160])
+check("有多問一次（共 4 次呼叫）", len(seen) == 4, str(len(seen)))
+check("追問時沒帶工具", seen[-1].get("tools") is None, str(seen[-1].keys()))
+
 restore(saved)
 
 print(f"\n{SUCCESS} passed, {FAIL} failed")

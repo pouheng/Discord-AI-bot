@@ -1519,15 +1519,19 @@ async def run_read_agent(
 
     cfg = get_config()
     steps = max(1, int(max_steps or cfg.get("read_steps", 2)))
+    docs_preloaded = "【已讀到的檔案內容】" in (extra_context or "")
     msgs = [
         {"role": "system", "content": _RESEARCHER_SYSTEM},
         {
             "role": "user",
             "content": (extra_context + "\n\n" if extra_context else "")
-            + f"【需求】\n{question}",
+            + f"【需求】\n{question}"
+            + ("\n\n（系統已先把相關檔案讀好，內容在上面；若已經足夠請直接給結論，"
+               "不要為了確認而再呼叫工具。）" if docs_preloaded else ""),
         },
     ]
     used: list[dict] = []
+    nudged = False
     for step in range(steps):
         kwargs = {
             "messages": msgs,
@@ -1540,6 +1544,10 @@ async def run_read_agent(
         resp = await chat_create(slot, **kwargs)
         msg = resp.choices[0].message
         tcs = getattr(msg, "tool_calls", None) or []
+        if _DEBUG:
+            print(f"[Drive] read step={step} tools={len(tcs)} "
+                  f"finish={getattr(resp.choices[0], 'finish_reason', '?')} "
+                  f"content={(msg.content or '')[:40]!r}")
         if not tcs:
             text = (msg.content or "").strip()
             dsml = extract_dsml_calls(text)
@@ -1567,6 +1575,8 @@ async def run_read_agent(
                     "tool_calls": used,
                     "steps": step + 1,
                 }
+            if not text:
+                break  # 空回覆（被截斷或模型沒吐字）→ 交給下面追問摘要
             return {
                 "ok": True,
                 "summary": strip_dsml(text),
@@ -1592,7 +1602,33 @@ async def run_read_agent(
                 "tool_call_id": tc.id,
                 "content": _tool_result_text(result)[:4000],
             })
-    return {"ok": True, "summary": "", "tool_calls": used, "steps": steps}
+
+        # 讀了兩次還沒收斂 → 明確要求開始寫結論（避免把步數全用在讀取）
+        read_calls = sum(
+            1 for u in used
+            if _TOOL_ALIASES.get(u["tool"], (u["tool"], None))[0]
+            in ("drive_read", "drive_list", "drive_search", "drive_grep")
+        )
+        if read_calls >= 2 and not nudged and step < steps - 1:
+            nudged = True
+            msgs.append({
+                "role": "user",
+                "content": "資料已經足夠，請立刻用 1200 字以內給出結論，不要再讀取。",
+            })
+
+    # 步數用完仍沒有結論 → 再要一次摘要（只給結論，不給工具）
+    try:
+        msgs.append({
+            "role": "user",
+            "content": "請根據以上工具結果，整理出與需求相關的重點（1200 字以內），"
+                       "並註明引用到的檔名。不要再呼叫工具。",
+        })
+        final = await chat_create(slot, messages=msgs, temperature=0.2, max_tokens=1200)
+        text = strip_dsml(final.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[Drive] 研究員總結失敗：{type(e).__name__}: {e}")
+        text = ""
+    return {"ok": True, "summary": text, "tool_calls": used, "steps": steps}
 
 
 # ── CLI ───────────────────────────────────────────────────
