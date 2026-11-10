@@ -41,6 +41,18 @@ async def run():
     check("8.8.8.8 可連", await web_reader._host_is_safe("8.8.8.8") is True)
     check("_ip_is_blocked 10.x", web_reader._ip_is_blocked("10.0.0.5") is True)
     check("_ip_is_blocked 8.8.8.8", web_reader._ip_is_blocked("8.8.8.8") is False)
+    # Clash／mihomo fake-IP（198.18.0.0/15）要放行，否則所有連結都讀不到
+    check("_ip_is_blocked 198.18.x 放行", web_reader._ip_is_blocked("198.18.0.7") is False)
+    check("_ip_is_blocked 198.19.x 放行", web_reader._ip_is_blocked("198.19.5.5") is False)
+    check("_ip_is_blocked 192.168.x 仍擋", web_reader._ip_is_blocked("192.168.1.1") is True)
+
+    # YouTube 連結走 oEmbed 取標題（不抓 JS 頁面）
+    yt = web_reader._youtube_id("https://www.youtube.com/watch?v=Kpxa2FABKsI")
+    check("解析 YouTube 影片 ID", yt == "Kpxa2FABKsI", yt)
+    check("解析 youtu.be 短連結",
+          web_reader._youtube_id("https://youtu.be/Kpxa2FABKsI") == "Kpxa2FABKsI")
+    check("非 YouTube 不會誤判",
+          web_reader._youtube_id("https://example.com/watch?v=abc") == "")
 
     # ── fetch_page：私有位址應被擋（不連網）──
     r = await web_reader.fetch_page("http://127.0.0.1:9/x")

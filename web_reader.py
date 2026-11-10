@@ -47,10 +47,17 @@ def extract_urls(text: str, limit: int = 2) -> list[str]:
     return out
 
 
+_FAKE_IP_NETS = (ipaddress.ip_network("198.18.0.0/15"),)
+
+
 def _ip_is_blocked(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
+        return False
+    # Clash／mihomo 的 fake-IP 模式會把網域解析到 198.18.0.0/15，
+    # 這是本機代理自己的位址，不是內網服務；不放行會讓所有連結都讀不到。
+    if any(addr in net for net in _FAKE_IP_NETS):
         return False
     return (
         addr.is_private
@@ -63,7 +70,11 @@ def _ip_is_blocked(ip: str) -> bool:
 
 
 async def _host_is_safe(host: str) -> bool:
-    """解析 host 並確認解析出的 IP 不是私有/本機位址（防 SSRF）。"""
+    """解析 host 並確認不是「只能連到內網」（防 SSRF）。
+
+    注意：本機可能有 DNS64／代理把 AAAA 解析成 2001::1 之類的位址，
+    只要還有一個公開位址可用就放行，交由 httpx 自己選。
+    """
     if not host:
         return False
     loop = asyncio.get_event_loop()
@@ -71,11 +82,10 @@ async def _host_is_safe(host: str) -> bool:
         infos = await asyncio.wait_for(loop.getaddrinfo(host, None), timeout=3)
     except (asyncio.TimeoutError, OSError):
         return True  # 解析失敗交給 httpx 決定（連不上自然失敗）
-    for info in infos:
-        ip = info[4][0]
-        if _ip_is_blocked(ip):
-            return False
-    return True
+    ips = [info[4][0] for info in infos if info[4]]
+    if not ips:
+        return True
+    return not all(_ip_is_blocked(ip) for ip in ips)
 
 
 def _parse_html(raw: bytes, url: str) -> tuple[str, str]:
@@ -103,6 +113,58 @@ def _parse_html(raw: bytes, url: str) -> tuple[str, str]:
         return "", text
 
 
+_YT_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|embed/|live/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{6,})"
+)
+
+
+def _youtube_id(url: str) -> str:
+    m = _YT_ID_RE.search(url or "")
+    return m.group(1) if m else ""
+
+
+async def _fetch_youtube(video_id: str, cfg: dict, url: str) -> dict:
+    """YouTube 頁面是 JS 渲染，抓不到正文；改用 oEmbed 取標題與頻道。"""
+    import httpx
+
+    oembed = (
+        "https://www.youtube.com/oembed?url="
+        f"https://www.youtube.com/watch?v={video_id}&format=json"
+    )
+    meta = {}
+    try:
+        async with httpx.AsyncClient(timeout=cfg["timeout"], headers={
+            "User-Agent": cfg["user_agent"], "Accept": "application/json",
+        }) as client:
+            r = await client.get(oembed)
+        if r.status_code == 200:
+            meta = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception:
+        meta = {}
+
+    title = (meta.get("title") or "").strip()
+    author = (meta.get("author_name") or "").strip()
+    if not title:
+        return {"ok": False, "url": url, "title": "", "text": "",
+                "error": "YouTube 影片資訊取得失敗", "elapsed": 0.0}
+
+    lines = [
+        f"YouTube 影片標題：{title}",
+        f"頻道：{author}" if author else "",
+        "（以下為影片資訊，無法取得影片內容本身）",
+    ]
+    return {
+        "ok": True,
+        "url": url,
+        "title": f"{title} - YouTube",
+        "text": "\n".join([ln for ln in lines if ln]),
+        "error": "",
+        "elapsed": 0.0,
+        "kind": "video_meta",
+    }
+
+
 async def fetch_page(url: str, cfg: dict | None = None) -> dict:
     """抓取單一網址，回傳 {ok, url, title, text, error, elapsed}。"""
     cfg = {**DEFAULT_CFG, **(cfg or {})}
@@ -111,6 +173,12 @@ async def fetch_page(url: str, cfg: dict | None = None) -> dict:
     def _err(msg: str) -> dict:
         return {"ok": False, "url": url, "title": "", "text": "",
                 "error": msg, "elapsed": time.time() - start}
+
+    yt_id = _youtube_id(url)
+    if yt_id:
+        res = await _fetch_youtube(yt_id, cfg, url)
+        res["elapsed"] = time.time() - start
+        return res
 
     try:
         import httpx
