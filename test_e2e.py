@@ -435,6 +435,33 @@ async def run_tests():
           == "角色草稿/技師.md",
           str(drive_mod.run_agent_loop.call_args.kwargs)[:200])
 
+    # ── Test 18：指定來源檔案 → 先讀進來再交給 Agent 擴展 ────
+    print("\n[Test 18] 「根據資料夾內容擴展」→ 來源檔案先讀進參考資料")
+    _orig_read_file = drive_mod.read_file
+    drive_mod.read_file = mock.AsyncMock(return_value={
+        "ok": True, "text": "個人魔法分為超能系、自然系、療癒系三大類。",
+        "total_chars": 22,
+    })
+    main.run_phase1 = mock.AsyncMock(return_value=(
+        [], [], [], [], [], False, False, "", True, "治癒魔法練習機",
+        [{"path": "名詞解釋.md", "mode": "auto"}], True,
+        "根據名詞解釋寫一台練習治癒魔法的機器到 角色草稿/治癒練習機.md",
+    ))
+    drive_mod.run_agent_loop = mock.AsyncMock(return_value={
+        "text": "已建立 治癒練習機.md",
+        "tool_calls": [{"tool": "drive_write", "args": {}, "ok": True}],
+        "writes": [{"ok": True, "action": "created", "name": "治癒練習機.md"}],
+        "steps": 2,
+    })
+    msg18 = _make_message("根據資料夾裡的名詞解釋，寫一台練習治癒魔法的機器")
+    await main.on_message(msg18)
+    blob = str(drive_mod.run_agent_loop.call_args[0][0])
+    check("來源檔案被讀取", drive_mod.read_file.await_count >= 1,
+          str(drive_mod.read_file.await_count))
+    check("參考資料含檔案名", "《名詞解釋.md》" in blob, blob[:300])
+    check("參考資料含檔案內容", "療癒系" in blob, blob[:300])
+    drive_mod.read_file = _orig_read_file
+
     # 還原
     main.build_and_call_phase2 = _orig_phase2
     drive_mod.run_read_agent = _orig_read_agent

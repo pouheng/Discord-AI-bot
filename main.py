@@ -2912,6 +2912,9 @@ async def run_phase1(
   drive_intent 要寫清楚目標檔名與內容重點（例：「上網找蒸氣龐克世界觀參考，
   整理成角色草稿 角色草稿/蒸氣技師.md」）。系統會先查網路，再把資料交給寫入 Agent。
 - 只是「上網查資料」而不用存檔 → drive_write 保持 false。
+- 若使用者要求「根據資料夾裡某份文件／設定，再擴展、延伸、改寫成新東西」：
+  把那份檔案放進 drive_read（mode 用 auto 即可），drive_write 同時設 true。
+  系統會先把檔案內容讀進來，再交給寫入 Agent 沿用同一套用語擴展。
 
 【輸出格式】
 純 JSON（不加 ```）。
@@ -5120,6 +5123,31 @@ async def on_message(message: discord.Message):
                                 ref_parts.append("【世界觀資料】\n" + lore_text.strip()[:2000])
                             if combined_memories:
                                 ref_parts.append("【角色記憶】\n" + combined_memories.strip()[:1500])
+                            # 「根據資料夾裡的內容再擴展」：Phase 1 點名的檔案先讀進來，
+                            # 讓 Agent 有原始設定可用，不必自己猜要讀哪一份。
+                            _src_docs = []
+                            for _d in (drive_read or [])[:2]:
+                                _path = (_d.get("path") or "").strip()
+                                if not _path:
+                                    continue
+                                try:
+                                    _r = await drive_agent.read_file(
+                                        _path, mode="auto", limit=3000
+                                    )
+                                except Exception:
+                                    continue
+                                if _r.get("ok") and (_r.get("text") or "").strip():
+                                    _src_docs.append(
+                                        f"《{_path}》\n{_r['text'].strip()[:3000]}"
+                                    )
+                            if _src_docs:
+                                ref_parts.append(
+                                    "【資料夾資料（使用者要求以這些為基礎擴展）】\n"
+                                    + "\n\n".join(_src_docs)
+                                )
+                                print(
+                                    f"[Drive] 先讀入參考檔案：{[d.get('path') for d in drive_read[:2]]}"
+                                )
                             reference_block = "\n\n".join(ref_parts)
                             # 目標檔名（模型堅持不呼叫工具時，程式可代寫）
                             _target_hits = re.findall(
@@ -5136,8 +5164,10 @@ async def on_message(message: discord.Message):
                                         "寫入內容用繁體中文、保持使用者原本的格式與語氣。"
                                         "路徑一律相對於資料夾根目錄（例如 世界觀.md），"
                                         "不要加資料夾名稱。"
-                                        "寫入前優先使用【參考資料】裡的世界觀與網路內容，"
+                                        "寫入前優先使用【參考資料】裡的世界觀、資料夾資料與網路內容，"
                                         "不要憑空編造設定；資料不足才用工具讀資料夾。"
+                                        "若【資料夾資料】已有既有設定（名詞、制度、數值、魔法分類），"
+                                        "必須沿用同一套用語再擴展，不要另創一套相近但不同的名稱。"
                                         "資料夾清單已經給你，除非使用者指定要參考某個檔案，"
                                         "最多讀 1-2 個檔案就開始寫入，不要逐一讀完。"
                                         "完成後用一句話說明你做了什麼（不要寫成角色台詞）。"
