@@ -85,7 +85,8 @@ class FakeFiles:
             fid = f"NEW{len(self.store):020d}"
             raw = _media_bytes(media_body)
             self.store[fid] = {
-                "meta": {"name": body["name"], "mimeType": "text/markdown",
+                "meta": {"name": body["name"],
+                         "mimeType": body.get("mimeType", "text/markdown"),
                          "parents": body.get("parents", [ROOT]), "size": len(raw)},
                 "data": raw,
             }
@@ -356,6 +357,16 @@ check("file 參數當成 path", r.get("ok") and r.get("text") == "改寫", str(r
 
 entry, _p, _n = D._resolve(D.get_service(), "澪創作/筆記.md")
 check("路徑自帶資料夾名稱也能解析", entry is not None and entry["id"] == F1, str(entry))
+
+print("[11] 子資料夾自動建立（草稿/技師.md）")
+r = asyncio.run(D.write_file("草稿/技師.md", "# 技師草稿\n內容", "create"))
+check("自動建立資料夾並寫入", r.get("ok") and r.get("action") == "created", str(r))
+check("資料夾真的被建立",
+      any(v["meta"]["name"] == "草稿" and v["meta"]["mimeType"] == D.FOLDER_MIME
+          for v in store.values()),
+      str([v["meta"]["name"] for v in store.values()]))
+r = asyncio.run(D.read_file("草稿/技師.md"))
+check("讀得回新檔", r.get("ok") and "技師草稿" in r.get("text", ""), str(r)[:100])
 
 restore(saved)
 D._cfg_cache["data"] = saved_cfg

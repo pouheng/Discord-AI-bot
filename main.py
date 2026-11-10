@@ -2908,6 +2908,10 @@ async def run_phase1(
   並在 drive_intent 用一句話寫要做什麼（盡量含目標檔名，沒有就自己想一個合理的）。
 - 不確定檔案在哪 → drive_read 留空、drive_write 設 false，系統不會去動雲端。
 - 沒有雲端需求時：drive_read=[]、drive_write=false、drive_intent=""。
+- 連鎖任務（例如「上網找參考，再寫成角色草稿」）：need_web_search 與 drive_write 同時設 true，
+  drive_intent 要寫清楚目標檔名與內容重點（例：「上網找蒸氣龐克世界觀參考，
+  整理成角色草稿 角色草稿/蒸氣技師.md」）。系統會先查網路，再把資料交給寫入 Agent。
+- 只是「上網查資料」而不用存檔 → drive_write 保持 false。
 
 【輸出格式】
 純 JSON（不加 ```）。
@@ -5105,6 +5109,22 @@ async def on_message(message: discord.Message):
                                 _tree = drive_agent.folder_tree_text()
                             except Exception:
                                 _tree = ""
+                            # 鏈式任務：把本輪已經查到的網路資料＋世界觀＋記憶一起交給 Agent，
+                            # 它才不用自己上網，也不會憑空編造設定。
+                            ref_parts = []
+                            if web_context:
+                                ref_parts.append("【網路資料】\n" + web_context.strip()[:3000])
+                            if lore_text:
+                                ref_parts.append("【世界觀資料】\n" + lore_text.strip()[:2000])
+                            if combined_memories:
+                                ref_parts.append("【角色記憶】\n" + combined_memories.strip()[:1500])
+                            reference_block = "\n\n".join(ref_parts)
+                            # 目標檔名（模型堅持不呼叫工具時，程式可代寫）
+                            _target_hits = re.findall(
+                                r"[^\s，。、；：「」\"'（）()【】]+\.(?:md|txt|json|csv)",
+                                drive_intent or clean_input_reply,
+                            )
+                            fallback_path = _target_hits[-1] if _target_hits else ""
                             result = await drive_agent.run_agent_loop(
                                 [
                                     {"role": "system", "content": (
@@ -5113,15 +5133,23 @@ async def on_message(message: discord.Message):
                                         "要修改既有檔案前先讀它；新檔案用 mode=create。"
                                         "寫入內容用繁體中文、保持使用者原本的格式與語氣。"
                                         "路徑一律相對於資料夾根目錄（例如 世界觀.md），"
-                                        "不要加資料夾名稱。完成後用一句話說明你做了什麼（不要寫成角色台詞）。"
+                                        "不要加資料夾名稱。"
+                                        "寫入前優先使用【參考資料】裡的世界觀與網路內容，"
+                                        "不要憑空編造設定；資料不足才用工具讀資料夾。"
+                                        "資料夾清單已經給你，除非使用者指定要參考某個檔案，"
+                                        "最多讀 1-2 個檔案就開始寫入，不要逐一讀完。"
+                                        "完成後用一句話說明你做了什麼（不要寫成角色台詞）。"
                                         + (f"\n\n【目前資料夾內容】\n{_tree}" if _tree else "")
                                     )},
                                     {"role": "user", "content": (
                                         f"【需求】\n{drive_intent or clean_input_reply}\n\n"
-                                        f"【最近對話】\n{recent_drive_ctx}"
+                                        + (f"【參考資料】\n{reference_block}\n\n" if reference_block else "")
+                                        + f"【最近對話】\n{recent_drive_ctx}"
                                     )},
                                 ],
-                                max_steps=int(dcfg.get("max_steps", 4)),
+                                max_steps=int(dcfg.get("max_steps", 6)),
+                                require_write=True,
+                                fallback_path=fallback_path,
                             )
                             drive_writes = result.get("writes") or []
                             drive_context = (result.get("text") or "").strip()
@@ -5142,6 +5170,8 @@ async def on_message(message: discord.Message):
                                 extra_context=(
                                     f"【Phase 1 認為可能要讀的檔案】\n{hints}\n\n"
                                     + (f"【目前資料夾內容】\n{_tree}\n\n" if _tree else "")
+                                    + (f"【本輪網路資料】\n{web_context.strip()[:2000]}\n\n"
+                                       if web_context else "")
                                     + f"【最近對話】\n{recent_drive_ctx}"
                                 ),
                                 max_steps=int(dcfg.get("read_steps", 3)),
@@ -5194,6 +5224,12 @@ async def on_message(message: discord.Message):
                     notice = drive_agent.format_write_notice(drive_writes)
                     if notice:
                         await message.channel.send(notice)
+                except Exception as _ne:
+                    print(f"[Drive] 提示發送失敗: {type(_ne).__name__}: {_ne}")
+            elif drive_write:
+                # 有寫入意圖卻什麼都沒存 → 誠實告知，不要讓使用者以為存好了
+                try:
+                    await message.channel.send("-# ⚠️ 這次沒能寫進雲端資料夾，內容還沒有存檔。")
                 except Exception as _ne:
                     print(f"[Drive] 提示發送失敗: {type(_ne).__name__}: {_ne}")
 

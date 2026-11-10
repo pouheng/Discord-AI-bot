@@ -383,6 +383,58 @@ async def run_tests():
           str(captured.get("drive_context")))
     check("正常回覆", sent(msg15))
 
+    print("\n[Test 16] 連鎖：上網找參考 → 寫入角色草稿")
+    _default_mocks()
+    drive_mod.is_enabled = lambda: True
+    main.run_phase1 = mock.AsyncMock(return_value=(
+        [], [], [], [], [], False, False, "", True, "蒸氣龐克 角色設定",
+        [], True, "上網找蒸氣龐克世界觀參考，整理成角色草稿 角色草稿/技師.md",
+    ))
+    main._build_web_context = mock.AsyncMock(return_value=(
+        "【網路】蒸氣龐克常見元素：齒輪、蒸氣、黃銅、維多利亞風格。",
+        [{"url": "https://example.com/steampunk", "title": "Steampunk"}],
+        "蒸氣龐克摘要",
+    ))
+    drive_mod.run_agent_loop = mock.AsyncMock(return_value={
+        "text": "已建立 角色草稿/技師.md",
+        "tool_calls": [{"tool": "drive_write", "args": {}, "ok": True}],
+        "writes": [{"ok": True, "action": "created", "name": "技師.md"}],
+        "steps": 3,
+    })
+    msg16 = _make_message("上網找一些蒸氣龐克的參考，幫我寫一份角色草稿")
+    _fake_bot_user.mentioned_in = lambda m: True
+    main.build_and_call_phase2 = mock.AsyncMock(
+        return_value=("<planning>x</planning>\nMio 的回覆", "Mio", "TestUser")
+    )
+    await main.on_message(msg16)
+    agent_input = drive_mod.run_agent_loop.call_args[0][0]
+    blob = str(agent_input)
+    check("Agent 被呼叫", drive_mod.run_agent_loop.called)
+    check("Agent 收到網路參考", "蒸氣龐克" in blob and "齒輪" in blob, blob[:200])
+    check("Agent 收到需求與檔名",
+          "角色草稿/技師.md" in blob, blob[:200])
+    check("有寫入提示", any(
+        "📁" in str(c[0][0]) for c in msg16.channel.send.call_args_list if c[0]
+    ), str(msg16.channel.send.call_args_list)[:150])
+
+    # ── Test 17：有寫入意圖但 Agent 沒寫 → 要誠實告知 ────────
+    print("\n[Test 17] 寫入意圖落空 → 顯示 ⚠️ 沒存檔")
+    drive_mod.run_agent_loop = mock.AsyncMock(return_value={
+        "text": "我讀完資料了。",
+        "tool_calls": [{"tool": "drive_read", "args": {}, "ok": True}],
+        "writes": [],
+        "steps": 6,
+    })
+    msg17 = _make_message("幫我寫一份角色草稿到 角色草稿/技師.md")
+    await main.on_message(msg17)
+    warns = [str(c[0][0]) for c in msg17.channel.send.call_args_list if c[0]]
+    check("有 ⚠️ 沒存檔提示", any("⚠️" in w for w in warns), str(warns)[:200])
+    check("沒有誤報成功", not any("📁" in w for w in warns), str(warns)[:200])
+    check("有把目標檔名交給 Agent 當備援",
+          drive_mod.run_agent_loop.call_args.kwargs.get("fallback_path")
+          == "角色草稿/技師.md",
+          str(drive_mod.run_agent_loop.call_args.kwargs)[:200])
+
     # 還原
     main.build_and_call_phase2 = _orig_phase2
     drive_mod.run_read_agent = _orig_read_agent

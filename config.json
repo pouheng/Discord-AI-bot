@@ -160,7 +160,7 @@
     "enabled": true,
     "folder_id": "18D6Nkv6P3rFUYE80U0xQWsoGUEnQBnxE",
     "folder_name": "澪創作",
-    "max_steps": 4,
+    "max_steps": 6,
     "max_read_bytes": 200000,
     "max_write_bytes": 200000,
     "max_image_bytes": 8388608,

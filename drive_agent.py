@@ -52,7 +52,7 @@ DEFAULTS = {
     "enabled": True,
     "folder_id": "",
     "folder_name": "",
-    "max_steps": 4,
+    "max_steps": 6,
     "read_steps": 3,
     "max_read_bytes": 200_000,
     "max_write_bytes": 200_000,
@@ -703,12 +703,62 @@ def _current_text(service, entry: dict) -> str:
         return ""
 
 
+def _last_name(path: str) -> str:
+    parts = [p for p in (path or "").replace("\\", "/").split("/") if p and p != "."]
+    return parts[-1] if parts else ""
+
+
+def _ensure_parent_folders(service, path: str) -> tuple[str, str]:
+    """建立（必要時）目標路徑的父資料夾，回傳 (parent_id, 檔名)。
+
+    只作用在白名單根目錄底下；已存在的資料夾直接沿用。
+    """
+    cfg = get_config()
+    root = cfg["folder_id"]
+    folder_name = (cfg.get("folder_name") or "").strip()
+    parts = [p for p in (path or "").replace("\\", "/").split("/") if p and p != "."]
+    if any(p == ".." for p in parts) or len(parts) < 2:
+        raise DriveAgentError("路徑不合法")
+    while parts and folder_name and parts[0] == folder_name:
+        parts.pop(0)
+    if len(parts) < 2:
+        raise DriveAgentError("路徑不合法")
+
+    parent = root
+    for part in parts[:-1]:
+        matches = [
+            c for c in _list_children(service, parent)
+            if c["name"] == part and c["is_folder"]
+        ]
+        if matches:
+            parent = matches[0]["id"]
+            continue
+        created = (
+            service.files()
+            .create(
+                body={"name": part, "mimeType": FOLDER_MIME, "parents": [parent]},
+                fields="id,name",
+            )
+            .execute()
+        )
+        parent = created["id"]
+        _audit("mkdir", path=part, parent=parent)
+    return parent, parts[-1]
+
+
 def _write_sync(path: str, content: str, mode: str) -> dict:
     from googleapiclient.http import MediaIoBaseUpload
 
     cfg = get_config()
     service = get_service()
-    entry, parent_id, name = _resolve(service, path)
+    try:
+        entry, parent_id, name = _resolve(service, path)
+    except DriveAgentError as e:
+        if "找不到資料夾" in str(e) and "/" in (path or "").replace("\\", "/").strip("/"):
+            entry, name = None, _last_name(path)
+            parent_id = ""
+        else:
+            raise
     _validate_write(cfg, name, content, mode)
 
     if entry and entry["is_folder"]:
@@ -719,6 +769,10 @@ def _write_sync(path: str, content: str, mode: str) -> dict:
         raise DriveAgentError(f"檔案已存在：{name}")
     if mode in ("overwrite", "append") and not entry:
         raise DriveAgentError(f"找不到檔案：{name}（要新建請用 mode=create）")
+    if entry is None and "/" in (path or "").replace("\\", "/").strip("/"):
+        # 目標在子資料夾裡而資料夾不存在 → 自動建立（只會建在白名單根目錄下）
+        parent_id, name = _ensure_parent_folders(service, path)
+        _validate_write(cfg, name, content, mode)
 
     old_text = _current_text(service, entry) if entry else ""
     new_text = (old_text + content) if mode == "append" else content
@@ -765,7 +819,13 @@ async def write_file(path: str, content: str, mode: str = "overwrite") -> dict:
 
     def _prepare():
         service = get_service()
-        entry, _parent, name = _resolve(service, path)
+        try:
+            entry, _parent, name = _resolve(service, path)
+        except DriveAgentError as e:
+            if "找不到資料夾" in str(e):
+                entry, name = None, _last_name(path)
+            else:
+                raise
         _validate_write(cfg, name, content, mode)
         old = _current_text(service, entry) if entry else ""
         return name, old, (old + content) if mode == "append" else content
@@ -999,22 +1059,39 @@ def _tool_result_text(result: dict) -> str:
     return json.dumps(result, ensure_ascii=False)[:1500]
 
 
+_DEBUG = os.environ.get("MIO_DRIVE_DEBUG") == "1"
+
+
+def _is_write_call(name: str) -> bool:
+    return _TOOL_ALIASES.get((name or "").strip(), (name, None))[0] == "drive_write"
+
+
+def _has_write(writes: list[dict]) -> bool:
+    return any(
+        w.get("ok") and w.get("action") in ("created", "updated") for w in writes
+    )
+
+
 async def run_agent_loop(
     messages: list[dict],
     *,
     max_steps: int | None = None,
     temperature: float = 0.5,
-    max_tokens: int = 900,
+    max_tokens: int = 2000,
     slot: str = "default",
+    require_write: bool = False,
+    fallback_path: str = "",
 ) -> dict:
     """讓模型自己決定要不要用 Drive 工具（tool calling）。
 
+    require_write=True 時，若跑完還沒寫入，會再用「強制 drive_write」逼一次，
+    避免模型只讀資料、最後什麼都沒存。
     回傳 {"text": 最終回覆, "tool_calls": [...], "writes": [...], "steps": n}
     """
     from llm_models import chat_create
 
     cfg = get_config()
-    steps = int(max_steps or cfg.get("max_steps", 4))
+    steps = int(max_steps or cfg.get("max_steps", 6))
     used: list[dict] = []
     writes: list[dict] = []
     msgs = list(messages)
@@ -1031,6 +1108,19 @@ async def run_agent_loop(
         resp = await chat_create(slot, **kwargs)
         msg = resp.choices[0].message
         tcs = getattr(msg, "tool_calls", None) or []
+        if _DEBUG:
+            print(f"[Drive] step={step} tools={len(tcs)} "
+                  f"finish={getattr(resp.choices[0], 'finish_reason', '?')} "
+                  f"content={(msg.content or '')[:40]!r}")
+        if (not tcs and not (msg.content or "").strip()
+                and getattr(resp.choices[0], "finish_reason", "") == "length"):
+            # 思考／長內容把 token 額度吃光 → 放大額度重試一次
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["max_tokens"] = max(max_tokens, 3000)
+            print("[Drive] 回應被長度截斷 → 提高額度重試")
+            resp = await chat_create(slot, **retry_kwargs)
+            msg = resp.choices[0].message
+            tcs = getattr(msg, "tool_calls", None) or []
         if not tcs:
             text = (msg.content or "").strip()
             dsml = extract_dsml_calls(text)
@@ -1038,12 +1128,14 @@ async def run_agent_loop(
                 for name, args in dsml:
                     result = await call_tool(name, args)
                     used.append({"tool": name, "args": args, "ok": bool(result.get("ok"))})
-                    if result.get("ok") and result.get("action") in ("created", "updated"):
+                    if _is_write_call(name):
                         writes.append(result)
                     msgs.append({
                         "role": "user",
                         "content": f"工具結果（{name}）：\n{_tool_result_text(result)[:4000]}",
                     })
+                if require_write and not _has_write(writes):
+                    break  # 交給下面的強制寫入
                 msgs.append({
                     "role": "user",
                     "content": "以上是工具結果。請用一句話總結你做了什麼，不要再呼叫工具。",
@@ -1057,6 +1149,11 @@ async def run_agent_loop(
                     "writes": writes,
                     "steps": step + 1,
                 }
+            if require_write and not _has_write(writes):
+                if text:
+                    # 空字串的 assistant 訊息會被 API 拒絕（400）→ 只有有內容才加
+                    msgs.append({"role": "assistant", "content": text})
+                break  # 只回文字、沒有寫入 → 交給強制寫入
             return {"text": strip_dsml(text), "tool_calls": used,
                     "writes": writes, "steps": step + 1}
 
@@ -1074,13 +1171,111 @@ async def run_agent_loop(
             args = _parse_args(tc.function.arguments)
             result = await call_tool(name, args)
             used.append({"tool": name, "args": args, "ok": bool(result.get("ok"))})
-            if result.get("ok") and result.get("action") in ("created", "updated"):
+            if _is_write_call(name):
                 writes.append(result)
             msgs.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": _tool_result_text(result)[:4000],
             })
+
+        # 已經讀很多次還沒寫 → 明確催它開始寫（require_write 時才啟用）
+        if require_write and not _has_write(writes):
+            read_calls = sum(
+                1 for u in used
+                if _TOOL_ALIASES.get(u["tool"], (u["tool"], None))[0]
+                in ("drive_read", "drive_list", "drive_search")
+            )
+            nudged = any(
+                "資料已經足夠" in (m.get("content") or "")
+                for m in msgs if m.get("role") == "user"
+            )
+            if read_calls >= 3 and not nudged:
+                msgs.append({
+                    "role": "user",
+                    "content": "資料已經足夠，請不要再讀取，直接呼叫 drive_write 把內容寫入。",
+                })
+                print("[Drive] 已讀 3 次，提醒模型開始寫入")
+
+    # 迴圈用完還沒寫入 → 用「強制 drive_write」再逼一次（只讀不寫的常見失敗）
+    if require_write and not _has_write(writes):
+        msgs.append({
+            "role": "user",
+            "content": (
+                "你還沒有寫入任何檔案。請立刻呼叫 drive_write 完成使用者的需求"
+                "（新檔用 mode=create、改舊檔用 mode=overwrite），"
+                "不要再讀檔案，也不要只回文字說明。"
+                + (f"\n目標檔案：{fallback_path}" if fallback_path else "")
+            ),
+        })
+        forced = None
+        write_tools = [t for t in TOOL_DEFS if t["function"]["name"] == "drive_write"]
+        try:
+            # DeepSeek 會忽略「指定函式名」的 tool_choice，只認 required／auto／none。
+            # 因此這一輪只提供 drive_write，等於強迫它非得寫檔不可。
+            forced = await chat_create(
+                slot, messages=msgs, tools=write_tools,
+                temperature=temperature, max_tokens=max(max_tokens, 3000),
+                tool_choice="required",
+            )
+        except Exception as e:
+            print(f"[Drive] 指定工具強制寫入失敗：{e}")
+            forced = None
+        if forced is None:
+            try:
+                forced = await chat_create(
+                    slot, messages=msgs, tools=write_tools,
+                    temperature=temperature, max_tokens=max(max_tokens, 3000),
+                )
+            except Exception as e:
+                print(f"[Drive] 強制寫入重試失敗：{e}")
+                forced = None
+        forced_text = ""
+        if forced is not None:
+            fmsg = forced.choices[0].message
+            for tc in (getattr(fmsg, "tool_calls", None) or []):
+                name = tc.function.name
+                if _TOOL_ALIASES.get(name, (name, None))[0] != "drive_write":
+                    continue
+                args = _parse_args(tc.function.arguments)
+                result = await call_tool(name, args)
+                used.append({"tool": name, "args": args, "ok": bool(result.get("ok"))})
+                if _is_write_call(name):
+                    writes.append(result)
+            forced_text = strip_dsml(fmsg.content or "").strip()
+            if _has_write(writes):
+                return {"text": forced_text, "tool_calls": used, "writes": writes,
+                        "steps": steps + 1}
+
+    # 最後保險：模型堅持不呼叫工具 → 由程式指定路徑，模型只負責生內容
+    if require_write and not _has_write(writes) and fallback_path:
+        try:
+            gen = await chat_create(
+                slot,
+                messages=msgs + [{
+                    "role": "user",
+                    "content": (
+                        f"請直接輸出要寫入「{fallback_path}」的完整檔案內容（純 Markdown／純文字），"
+                        "不要任何解釋、不要程式碼圍籬、不要標題以外的廢話。"
+                    ),
+                }],
+                temperature=temperature,
+                max_tokens=max(max_tokens, 1600),
+            )
+            content = strip_dsml(gen.choices[0].message.content or "").strip()
+            if content:
+                res = await write_file(fallback_path, content, "create")
+                if not res.get("ok") and "已存在" in (res.get("error") or ""):
+                    res = await write_file(fallback_path, content, "overwrite")
+                used.append({
+                    "tool": "drive_write",
+                    "args": {"path": fallback_path, "mode": res.get("action") or "create"},
+                    "ok": bool(res.get("ok")),
+                })
+                writes.append(res)
+                print(f"[Drive] 改用程式代寫：{fallback_path} → {res.get('action') or res.get('error')}")
+        except Exception as e:
+            print(f"[Drive] 程式代寫失敗：{type(e).__name__}: {e}")
 
     return {"text": "", "tool_calls": used, "writes": writes, "steps": steps}
 

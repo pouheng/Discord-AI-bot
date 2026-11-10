@@ -177,12 +177,16 @@ def model_reply(content="", tool_calls=None):
 
 
 def script_model(responses):
-    """把 llm_models.chat_create 換成照腳本回應的假函式，並記錄每次 messages。"""
+    """把 llm_models.chat_create 換成照腳本回應的假函式，並記錄每次呼叫。"""
     seen = []
     queue = list(responses)
 
     async def fake(slot, **kwargs):
-        seen.append(kwargs.get("messages") or [])
+        seen.append({
+            "messages": kwargs.get("messages") or [],
+            "tool_choice": kwargs.get("tool_choice"),
+            "tools": kwargs.get("tools"),
+        })
         if queue:
             return queue.pop(0)
         return model_reply("（腳本結束）")
@@ -191,8 +195,9 @@ def script_model(responses):
     return seen
 
 
-def tool_results(messages):
-    return [m["content"] for m in messages if m.get("role") == "tool"]
+def tool_results(entry):
+    msgs = entry["messages"] if isinstance(entry, dict) else entry
+    return [m["content"] for m in msgs if m.get("role") == "tool"]
 
 
 # ── 場景 1：只讀需要的段落 ────────────────────────────────
@@ -384,6 +389,115 @@ blob = "\n".join(tool_results(seen[-1]))
 check("第一段有告訴模型還有後續", "offset=" in blob, blob[:200])
 check("兩段內容不同", blob.count("這是一段") > 1, "兩段都有內容")
 check("最後有結論", "設定內容" in result["summary"], result["summary"])
+
+# ── 場景 11：只讀不寫 → 強制再寫一次 ──────────────────────
+
+print("[11] 模型只讀不寫 → require_write 會強制再寫一次")
+D.review_write = approve_all
+seen = script_model([
+    model_reply(tool_calls=[tool_call("drive_read", {"path": "世界觀.md"})]),
+    model_reply("我看完了，內容大概是三國對立。"),  # 只回文字，沒有寫入
+    model_reply(tool_calls=[tool_call("drive_write", {
+        "path": "強制寫入.md", "content": "# 強制寫入\n內容", "mode": "create",
+    })]),
+])
+result = asyncio.run(D.run_agent_loop(
+    [
+        {"role": "system", "content": "寫檔案"},
+        {"role": "user", "content": "整理成 強制寫入.md"},
+    ],
+    require_write=True,
+))
+check("最後真的有寫入", len(result["writes"]) == 1
+      and result["writes"][0].get("action") == "created", str(result["writes"]))
+check("強制那輪只給 drive_write 並用 required",
+      seen[-1]["tool_choice"] == "required"
+      and [t["function"]["name"] for t in (seen[-1]["tools"] or [])] == ["drive_write"],
+      f"{seen[-1]['tool_choice']} / {[t['function']['name'] for t in (seen[-1]['tools'] or [])]}")
+check("檔案真的存在",
+      any(v["meta"]["name"] == "強制寫入.md" for v in store.values()),
+      str([v["meta"]["name"] for v in store.values()]))
+
+# ── 場景 12：Agent 寫入被審核否決 → 提示要顯示失敗 ─────────
+
+print("[12] Agent 寫入被審核否決 → 回報失敗而不是靜默")
+
+
+async def reject_this(*a, **kw):
+    return False, "內容含可疑字串"
+
+
+D.review_write = reject_this
+seen = script_model([
+    model_reply(tool_calls=[tool_call("drive_write", {
+        "path": "被擋.md", "content": "可疑內容", "mode": "create",
+    })]),
+    model_reply("我想寫入但被擋下了。"),
+])
+result = asyncio.run(D.run_agent_loop(
+    [
+        {"role": "system", "content": "寫檔案"},
+        {"role": "user", "content": "寫入 被擋.md"},
+    ],
+    require_write=False,
+))
+check("有記錄失敗的寫入", len(result["writes"]) == 1
+      and result["writes"][0].get("ok") is False, str(result["writes"]))
+notice = D.format_write_notice(result["writes"])
+check("提示顯示 ⚠️ 與原因", "⚠️" in notice and "可疑" in notice, notice)
+check("檔案沒有被建立",
+      not any(v["meta"]["name"] == "被擋.md" for v in store.values()),
+      str([v["meta"]["name"] for v in store.values()]))
+
+# ── 場景 13：讀了三次就被催「開始寫」────────────────────
+
+print("[13] 連續讀 3 次 → 系統提醒模型開始寫入")
+D.review_write = approve_all
+seen = script_model([
+    model_reply(tool_calls=[tool_call("drive_read", {"path": "世界觀.md"}, cid="c1")]),
+    model_reply(tool_calls=[tool_call("drive_read", {"path": "國家設定.md"}, cid="c2")]),
+    model_reply(tool_calls=[tool_call("drive_read", {"path": "國家設定_整理.md"}, cid="c3")]),
+    model_reply("我讀完了。"),
+    model_reply(tool_calls=[tool_call("drive_write", {
+        "path": "草稿.md", "content": "# 草稿", "mode": "create",
+    })]),
+])
+result = asyncio.run(D.run_agent_loop(
+    [
+        {"role": "system", "content": "寫檔案"},
+        {"role": "user", "content": "整理成 草稿.md"},
+    ],
+    require_write=True,
+))
+blob = str(seen[-1]["messages"])
+check("有插入「資料已經足夠」提醒", "資料已經足夠" in blob, blob[-400:])
+check("最終仍完成寫入", len(result["writes"]) == 1
+      and result["writes"][0].get("ok"), str(result["writes"]))
+
+# ── 場景 14：模型死都不寫 → 程式代寫 fallback_path ─────────
+
+print("[14] 模型堅持不呼叫工具 → 程式指定路徑代寫")
+D.review_write = approve_all
+seen = script_model([
+    model_reply("好的，我先看看。"),
+    model_reply("我覺得直接說明就好。"),
+    model_reply("# 自動草稿\n蒸氣龐克角色：黃銅護目鏡、皮質大衣。"),
+])
+result = asyncio.run(D.run_agent_loop(
+    [
+        {"role": "system", "content": "寫檔案"},
+        {"role": "user", "content": "寫一份角色草稿到 自動草稿.md"},
+    ],
+    require_write=True,
+    fallback_path="自動草稿.md",
+))
+check("程式代寫成功", len(result["writes"]) == 1
+      and result["writes"][0].get("ok"), str(result["writes"]))
+check("檔案真的存在",
+      any(v["meta"]["name"] == "自動草稿.md" for v in store.values()),
+      str([v["meta"]["name"] for v in store.values()]))
+back = asyncio.run(D.read_file("自動草稿.md"))
+check("內容是模型產生的", "黃銅護目鏡" in back.get("text", ""), back.get("text", "")[:80])
 
 restore(saved)
 
