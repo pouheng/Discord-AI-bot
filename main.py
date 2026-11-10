@@ -4023,7 +4023,8 @@ def phase2_slot(channel_type: str, enable_ic_style: bool) -> str:
 
 
 async def _call_phase2_with_retry(
-    phase2_messages: list, *, label: str = "Phase 2", slot: str = "plot"
+    phase2_messages: list, *, label: str = "Phase 2", slot: str = "plot",
+    priming: str = "",
 ) -> str:
     """呼叫 Phase 2 生成回覆；空內容時放大預算重試（最多 3 次）。
 
@@ -4049,6 +4050,7 @@ async def _call_phase2_with_retry(
             await asyncio.sleep(0.5)
             continue
         content = (resp.choices[0].message.content or "").strip()
+        content = _strip_priming(content, priming).strip()
         last = content
         if content:
             return content
@@ -4089,6 +4091,7 @@ async def _call_phase2_with_retry(
                     label="phase2_minimal", slot=slot,
                 )
                 content = (resp.choices[0].message.content or "").strip()
+                content = _strip_priming(content, priming).strip()
             except Exception as e:
                 print(f"[Phase 2] 精簡 prompt 兜底 API 錯誤 effort={effort}: {e}")
                 await _log_error(
@@ -4337,8 +4340,10 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
     raw_content = await _call_phase2_with_retry(
         phase2_messages, label="Phase 2",
         slot=phase2_slot(channel_type, enable_ic_style),
+        priming=priming_suffix,
     )
     raw_content = autopilot.strip_japanese_original(raw_content)
+    raw_content = _strip_priming(raw_content, priming_suffix)
     print(f"[LOG] [Phase 2] 回傳長度={len(raw_content)}")
     if not raw_content.strip():
         await _log_error(
@@ -4445,9 +4450,11 @@ async def run_phase2_direct(
     phase2_resp = await _call_phase2_with_retry(
         phase2_messages, label="Phase 2 direct",
         slot=phase2_slot(channel_type, enable_ic_style),
+        priming=priming_suffix,
     )
     raw_content = phase2_resp or ""
     raw_content = autopilot.strip_japanese_original(raw_content)
+    raw_content = _strip_priming(raw_content, priming_suffix)
     print(f"[LOG] [Phase 2 direct] 回傳長度={len(raw_content)}")
     if not raw_content.strip():
         await _log_error(
@@ -4638,6 +4645,49 @@ def _reply_roster_text(all_context: list, current_user_name: str,
         tag = "　← 本輪觸發者" if name == current_user_name else ""
         lines.append(f"- {name}：{snippet}{tag}")
     return "\n".join(lines)
+
+
+def _strip_priming(text: str, priming: str = "") -> str:
+    """去掉模型把「開場提示句」複述出來的內容。
+
+    Phase 2 會在使用者訊息後面接一句 priming（例如「喔好，收到了，我現在會開始
+    思考、開始回應：」）引導模型直接進入正文；模型偶爾會把這句話一起吐出來，
+    就變成回覆開頭多一行突兀的旁白。
+    """
+    if not text or not text.strip():
+        return text
+
+    head = ""
+    body = text
+    # 先保留 <planning> 區塊，再處理後面的正文
+    if body.lstrip().startswith("<planning>") or body.lstrip().startswith("<planning"):
+        idx = body.find("</planning>")
+        if idx != -1:
+            head = body[: idx + len("</planning>")]
+            body = body[idx + len("</planning>"):]
+
+    lines = body.lstrip("\n").splitlines()
+    if not lines:
+        return text
+
+    p = (priming or "").strip()
+    first = lines[0].strip()
+    drop = False
+    if p and (first == p or first == p.rstrip("：::") or first.startswith(p)):
+        drop = True
+    elif (
+        len(first) <= 40
+        and first.endswith(("：", ":"))
+        and any(k in first for k in ("開始思考", "開始回應", "我現在會開始"))
+    ):
+        drop = True
+
+    if not drop:
+        return text
+    rest = "\n".join(lines[1:]).lstrip("\n")
+    if head:
+        return (head + "\n" + rest).strip("\n")
+    return rest
 
 
 def _reply_format_instruction(channel_type: str, phase2_char_name: str,

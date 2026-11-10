@@ -262,5 +262,31 @@ check("逐段送檢後仍能切出兩人",
       main.split_to_segments(out) == [("甲", "給甲"), ("乙", "給乙")], out)
 main.call_llm = _orig_call_llm
 
+# ── 開場提示句（priming）複述清理 ──────────────────────
+print("\n[priming] 模型把開場提示句一起吐出來")
+PRIME = "喔好，收到了，我現在會開始思考、開始回應："
+
+check("純 priming 開頭 → 去掉",
+      main._strip_priming(PRIME + "\n\n嗯嗯原來是放假", PRIME) == "嗯嗯原來是放假",
+      main._strip_priming(PRIME + "\n\n嗯嗯原來是放假", PRIME))
+check("中間有空白行也去掉",
+      main._strip_priming(PRIME + "\n\n\n今天早點睡", PRIME) == "今天早點睡")
+check("只有 priming → 空字串",
+      main._strip_priming(PRIME, PRIME).strip() == "",
+      repr(main._strip_priming(PRIME, PRIME)))
+check("planning 區塊要保留",
+      main._strip_priming("<planning>x</planning>\n" + PRIME + "\n正文", PRIME)
+      == "<planning>x</planning>\n正文",
+      repr(main._strip_priming("<planning>x</planning>\n" + PRIME + "\n正文", PRIME)))
+check("正常回覆不動",
+      main._strip_priming("她開始思考下一步。", PRIME) == "她開始思考下一步。")
+check("冒號換成全形也認得",
+      main._strip_priming("喔好，收到了，我現在會開始思考、開始回應:\n正文", PRIME)
+      == "正文",
+      repr(main._strip_priming("喔好，收到了，我現在會開始思考、開始回應:\n正文", PRIME)))
+check("沒有 priming 參數時仍能靠特徵判斷",
+      main._strip_priming(PRIME.replace("：", ":") + "\n正文", "").strip() == "正文",
+      repr(main._strip_priming(PRIME.replace("：", ":") + "\n正文", "")))
+
 print(f"\n{SUCCESS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
