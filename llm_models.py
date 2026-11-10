@@ -42,6 +42,9 @@ _sanitize_no_proxy()
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_FILE = os.path.join(SCRIPT_DIR, "models.json")
+
+# 全域備援的鍵：主線路由各場景決定，備援不分場景共用
+GLOBAL_FALLBACK_KEY = "*"
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
@@ -118,19 +121,50 @@ def save_model(slot: str, model_id: str):
 
 
 def get_fallbacks(model: str) -> list[str]:
-    """models.json 的 fallback_models[model]：同一模型的其他線路（如 global → sg → cn）。"""
+    """回傳模型的後備線路（依序嘗試）。
+
+    以「全域備援」`fallback_models["*"]` 為主：主線路由各場景自己選，
+    備援則不分場景共用，避免某個場景換了模型就突然沒有第 2、3 線。
+    沒有全域設定時，才回退到舊格式 `fallback_models[<模型ID>]`。
+    """
     raw = _read_raw()
     fb = raw.get("fallback_models")
     if not isinstance(fb, dict):
         return []
-    v = fb.get(model)
+    v = fb.get(GLOBAL_FALLBACK_KEY)
+    if not isinstance(v, list):
+        v = fb.get(model)
     if not isinstance(v, list):
         return []
     return [str(x).strip() for x in v if isinstance(x, str) and x.strip()]
 
 
+def save_global_fallbacks(models: list[str]):
+    """寫入全域備援線路（models.json 的 fallback_models["*"]）。"""
+    cleaned: list[str] = []
+    for m in models or []:
+        m = (m or "").strip()
+        if m and m not in cleaned:
+            cleaned.append(m)
+    raw = _read_raw()
+    fb = raw.get("fallback_models")
+    if not isinstance(fb, dict):
+        fb = {}
+    if cleaned:
+        fb[GLOBAL_FALLBACK_KEY] = cleaned
+    else:
+        fb.pop(GLOBAL_FALLBACK_KEY, None)
+    raw["fallback_models"] = fb
+    _write_raw(raw)
+
+
+def global_fallbacks() -> list[str]:
+    """目前的全域備援清單。"""
+    return get_fallbacks("")
+
+
 def model_chain(slot: str, model: str | None = None) -> list[str]:
-    """回傳依序嘗試的線路 [主模型, *後備]，去重保序。"""
+    """回傳依序嘗試的線路 [主模型, *全域備援]，去重保序。"""
     primary = (model or get_model(slot)).strip() or get_model(slot)
     chain = [primary]
     for m in get_fallbacks(primary):
@@ -140,7 +174,7 @@ def model_chain(slot: str, model: str | None = None) -> list[str]:
 
 
 def save_fallbacks(model: str, models: list[str]):
-    """寫入某模型的三線路後備（models.json 的 fallback_models[model]）。"""
+    """（舊格式）寫入某模型專屬的後備線路；新設定請用 save_global_fallbacks。"""
     model = (model or "").strip()
     if not model:
         return

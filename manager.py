@@ -20,7 +20,6 @@ _model_vars = {}
 _source_vars = {}
 _route_vars = {}
 _route_combos = {}
-_route_sync_var = None
 
 
 def get_pid() -> int | None:
@@ -752,58 +751,58 @@ class BotManagerGUI:
         _model_vars[slot] = var
 
     def _build_fallback_section(self, parent):
-        global _route_sync_var
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
         header = ttk.Frame(parent)
         header.pack(fill=tk.X)
-        ttk.Label(header, text="三線路退回（同模型不同路由）",
+        ttk.Label(header, text="全域備援（不分場景）",
                   font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT)
-        ttk.Button(header, text="儲存三線路", width=11,
+        ttk.Button(header, text="儲存備援", width=11,
                    command=self._save_routes).pack(side=tk.RIGHT)
         ttk.Label(
             parent,
-            text="主線路失敗（5xx／限流／逾時／401）時，依序切到線路 2、3；留空＝不使用。存檔下一則生效。",
+            text="主線路＝上方各場景選的模型；失敗（5xx／限流／逾時／401）時，"
+                 "依序切到備援 1、2、3。留空＝不使用。存檔下一則生效。",
             font=("Segoe UI", 8),
         ).pack(anchor=tk.W, pady=(2, 4))
 
-        primary = llm_models.get_model("default")
-        fbs = llm_models.get_fallbacks(primary)
+        fbs = llm_models.global_fallbacks()
+        if not fbs:
+            # 還沒有全域設定 → 先用「日常/通用」目前模型的舊設定墊著
+            fbs = llm_models.get_fallbacks(llm_models.get_model("default"))
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.X)
-        labels = ["線路 1（主）", "線路 2", "線路 3"]
-        defaults = [primary,
-                    fbs[0] if len(fbs) > 0 else "",
-                    fbs[1] if len(fbs) > 1 else ""]
+        labels = ["備援 1", "備援 2", "備援 3"]
         for idx in range(3):
             ttk.Label(frame, text=labels[idx], font=("Segoe UI", 9)).grid(
                 row=idx, column=0, sticky=tk.W, pady=2, padx=(0, 8))
-            var = tk.StringVar(value=defaults[idx])
+            cur = fbs[idx] if len(fbs) > idx else ""
+            var = tk.StringVar(value=cur)
             combo = ttk.Combobox(frame, textvariable=var, width=38,
-                                 values=_combo_values_cur(defaults[idx], []))
+                                 values=_combo_values_cur(cur, []))
             combo.grid(row=idx, column=1, sticky=tk.W, pady=2)
             _route_vars[idx + 1] = var
             _route_combos[idx + 1] = combo
-        _route_sync_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame, text="主線路同步套用到所有場景",
-                        variable=_route_sync_var).grid(
-            row=3, column=1, sticky=tk.W, pady=(4, 0))
+
+        # 目前各場景的主線路（唯讀，方便對照「誰是誰的備援」）
+        cur_models = [
+            f"{label}={llm_models.get_model(slot)}"
+            for slot, label in llm_models.SLOTS
+            if llm_models.get_model(slot)
+        ]
+        ttk.Label(
+            frame,
+            text="目前主線路：" + "、".join(cur_models),
+            font=("Segoe UI", 8), foreground="#666666", wraplength=560,
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
 
     def _save_routes(self):
         try:
-            r1 = (_route_vars[1].get() or "").strip() or llm_models.get_model("default")
-            r2 = (_route_vars[2].get() or "").strip()
-            r3 = (_route_vars[3].get() or "").strip()
-            if _route_sync_var is not None and _route_sync_var.get():
-                for slot, _label in llm_models.SLOTS:
-                    llm_models.save_model(slot, r1)
-            else:
-                llm_models.save_model("default", r1)
-            llm_models.save_fallbacks(r1, [r2, r3])
-            log(f"三線路已存：{r1} → {r2 or '—'} → {r3 or '—'}"
-                + ("（已套用所有場景）"
-                   if _route_sync_var is not None and _route_sync_var.get() else ""))
+            backups = [(_route_vars[i].get() or "").strip() for i in (1, 2, 3)]
+            llm_models.save_global_fallbacks(backups)
+            shown = " → ".join(b or "—" for b in backups)
+            log(f"全域備援已存：{shown}（不影響各場景主線路）")
         except Exception as e:
-            log(f"儲存三線路失敗: {e}")
+            log(f"儲存備援失敗: {e}")
 
     def _build_reply_section(self, parent):
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
