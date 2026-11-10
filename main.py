@@ -4014,8 +4014,12 @@ async def _write_prompt_blocks_dump(channel_type, enable_ic_style, extra_segment
 
 
 def phase2_slot(channel_type: str, enable_ic_style: bool) -> str:
-    """IC，或 OOC 但被要求寫作（enable_ic_style）→ 劇情；其餘 OOC → 日常。"""
-    return "plot" if (channel_type == "in_character" or enable_ic_style) else "default"
+    """Phase 2（真正生成回覆）一律用「回覆」場景。
+
+    IC／OOC 只影響提示詞，不影響用哪個模型——不然在 OOC 頻道把
+    「回覆」設成 Pro 會完全沒作用（舊行為會退回「日常/通用」）。
+    """
+    return "plot"
 
 
 async def _call_phase2_with_retry(

@@ -728,6 +728,12 @@ class BotManagerGUI:
 
         grid = ttk.Frame(parent)
         grid.pack(fill=tk.X)
+        ttk.Label(
+            parent,
+            text="雜務＝Phase 1／Phase 3／網頁摘要；回覆＝Phase 2（IC 與 OOC 都算）；"
+                 "維護＝記憶整理。",
+            font=("Segoe UI", 8), foreground="#666666",
+        ).pack(anchor=tk.W, pady=(2, 0))
         for i, (slot, label) in enumerate(llm_models.SLOTS[:3]):
             self._make_model_row(grid, i, slot, label)
 

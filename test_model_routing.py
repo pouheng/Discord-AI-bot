@@ -75,6 +75,12 @@ try:
           str(raw3["fallback_models"]))
     check("清空後只剩主線路", L.model_chain("default") == ["m:pro"],
           str(L.model_chain("default")))
+    print("[6] Phase 2 一律走「回覆」場景")
+    import main as M
+    check("OOC 也是 plot", M.phase2_slot("out_of_character", False) == "plot")
+    check("IC 是 plot", M.phase2_slot("in_character", False) == "plot")
+    check("OOC 但 IC 風格也是 plot", M.phase2_slot("out_of_character", True) == "plot")
+
 finally:
     io.open(L.MODELS_FILE, "w", encoding="utf-8").write(saved)
 

@@ -51,8 +51,8 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 
 # 場景清單（順序即 Manager 顯示順序）；中文標籤給 UI 用。
 SLOTS = [
-    ("default", "日常/通用"),
-    ("plot", "回覆/劇情"),
+    ("default", "雜務（Phase1／Phase3）"),
+    ("plot", "回覆（IC／OOC）"),
     ("maintenance", "維護"),
     ("collide", "碰撞"),
     ("tarot", "塔羅"),
