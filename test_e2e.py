@@ -79,7 +79,7 @@ def _default_mocks():
     main.get_channel_summary = mock.AsyncMock(return_value="")
     main.get_lore_by_topics = mock.AsyncMock(return_value=[])
     main.run_phase1 = mock.AsyncMock(
-        return_value=([], [], [], [], [], False, False, "", False, "")
+        return_value=([], [], [], [], [], False, False, "", False, "", [], False, "")
     )
     main.load_prompt_config = mock.AsyncMock(return_value={
         "banned_words": [], "blocked_keywords": [],

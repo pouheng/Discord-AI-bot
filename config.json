@@ -155,5 +155,33 @@
   },
   "google_sheets": {
     "spreadsheet_id": "15ZRL5Hx6bIlkuNZ6xiTc56_GTBZrKRzizdm34tLaMjY"
+  },
+  "drive_agent": {
+    "enabled": true,
+    "folder_id": "18D6Nkv6P3rFUYE80U0xQWsoGUEnQBnxE",
+    "folder_name": "澪創作",
+    "max_steps": 4,
+    "max_read_bytes": 200000,
+    "max_write_bytes": 200000,
+    "max_image_bytes": 8388608,
+    "writable_extensions": [
+      ".md",
+      ".txt",
+      ".json",
+      ".csv"
+    ],
+    "readonly_extensions": [
+      ".pdf",
+      ".docx",
+      ".xlsx"
+    ],
+    "image_extensions": [
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".webp",
+      ".gif"
+    ],
+    "snapshot_dir": "drive_snapshots"
   }
 }

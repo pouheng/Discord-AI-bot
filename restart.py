@@ -21,18 +21,44 @@ PID_FILE = os.path.join(SCRIPT_DIR, "bot.pid")
 
 
 def stop_bot():
-    subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "Get-WmiObject Win32_Process -Filter \"Name='python.exe'\" | "
-            "Where-Object { $_.CommandLine -match 'main\\.py' } | "
-            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
-        ],
-        capture_output=True,
-        timeout=10,
-    )
+    # 先用 bot.pid 精準殺，再掃命名為 main.py 的 python 行程。
+    # 舊版用 Get-WmiObject，在 PowerShell 7 已被移除 → 常常「殺不到」，
+    # 舊 bot 就會一直佔著 bot.lock，新 bot 還以為有人在使用而自我結束。
+    pids = []
+    for pid_file in (PID_FILE, os.path.join(SCRIPT_DIR, "bot.lock")):
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r", encoding="utf-8") as f:
+                    pids.append(int((f.read() or "0").strip() or 0))
+            except (OSError, ValueError):
+                pass
+    try:
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'main\\.py' } | "
+                "ForEach-Object { $_.ProcessId }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+        pids.extend(int(x) for x in out.split() if x.strip().isdigit())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+
+    for pid in {p for p in pids if p and p != os.getpid()}:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    time.sleep(1)
     if os.path.exists(PID_FILE):
         try:
             os.remove(PID_FILE)

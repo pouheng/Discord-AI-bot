@@ -2898,6 +2898,17 @@ async def run_phase1(
 - 不確定 → false（不要為了多做事而開）。
 - 若 true，web_search_query 給一句「具體、可直接丟搜尋引擎」的查詢（不要放角色名、RP 用語或「澪」）。
 
+【雲端資料夾判斷 - drive_read / drive_write】
+- 下方【雲端資料夾】是你可讀寫的 Google Drive 資料夾，只列出檔名，不含內容。
+- 只有在需要「檔案裡實際的內容」時，才把檔案放進 drive_read。
+  閒聊、問候、情緒、單純討論設定 → 空陣列。
+- drive_read 每一項：{"path":"相對路徑","mode":"auto|section|grep|full","section":"標題或空字串","query":"關鍵字或空字串"}
+  大文件請優先用 mode=section（只讀某段）或 mode=grep（找關鍵字），不要動不動讀全文。
+- 若使用者要求「寫入／更新／存檔／整理成文件／改設定」，drive_write 設 true，
+  並在 drive_intent 用一句話寫要做什麼（盡量含目標檔名，沒有就自己想一個合理的）。
+- 不確定檔案在哪 → drive_read 留空、drive_write 設 false，系統不會去動雲端。
+- 沒有雲端需求時：drive_read=[]、drive_write=false、drive_intent=""。
+
 【輸出格式】
 純 JSON（不加 ```）。
 - recall：陣列，每個元素是 {"id": "使用者ID數字"}；也可填 NPC 正名（如 "甲"），系統會依身份對照表解析
@@ -2908,6 +2919,9 @@ async def run_phase1(
 - recall_date_range：物件 {"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}，無則 null
 - need_web_search：布林值（是否需要即時網路搜尋）
 - web_search_query：字串；need_web_search=true 時給具體查詢，否則空字串
+- drive_read：陣列，元素 {"path":"相對路徑","mode":"auto|section|grep|full","section":"","query":""}；不需要就 []
+- drive_write：布林值（是否要寫入／修改雲端檔案）
+- drive_intent：字串；drive_write=true 時寫「要做什麼」，否則空字串
 - lore_notes：陣列，每個元素可以是：
   - 關聯到某個 topic 的註釋：{"topic":"條目名稱","note":"註釋內容"}
   - 或自由註釋（無 topic）：{"note":"自由註釋內容"}
@@ -2940,6 +2954,19 @@ async def run_phase1(
     # （【可查詢的參與者】只有 Discord 使用者，NPC 不在其中）。
     _p1_alias = await format_person_alias_map()
     phase1_alias_block = (_p1_alias + "\n\n") if _p1_alias else ""
+    # 雲端資料夾檔案清單（只有檔名，快取 5 分鐘）：讓 Phase 1 自己判斷要不要讀
+    drive_block = ""
+    try:
+        import drive_agent
+        if drive_agent.is_enabled():
+            _tree = drive_agent.folder_tree_text()
+            if _tree:
+                drive_block = (
+                    f"【雲端資料夾「{drive_agent.get_config().get('folder_name', '')}】\n"
+                    f"{_tree}\n"
+                )
+    except Exception as _de:
+        print(f"[Drive] 讀取資料夾清單失敗: {type(_de).__name__}: {_de}")
     dynamic_data = f"""【目前日期】
 {datetime.datetime.now().strftime("%Y-%m-%d")}
 
@@ -2958,6 +2985,7 @@ async def run_phase1(
 
 {quests_text}
 
+{drive_block}
 【可查詢的參與者】
 {candidates_text}
 
@@ -3070,6 +3098,9 @@ async def run_phase1(
     web_search_query = ""
     supplement = ""
     phase1_json = {}
+    drive_read = []
+    drive_write = False
+    drive_intent = ""
     try:
         cleaned = extract_json(phase1_raw)
         phase1_json = json.loads(cleaned)
@@ -3102,6 +3133,15 @@ async def run_phase1(
         need_web_search = bool(phase1_json.get("need_web_search", False))
         web_search_query = str(phase1_json.get("web_search_query") or "").strip()
         supplement = phase1_json.get("supplement", "")
+        drive_read = phase1_json.get("drive_read") or []
+        if not isinstance(drive_read, list):
+            drive_read = []
+        drive_read = [
+            d for d in drive_read
+            if isinstance(d, dict) and str(d.get("path") or "").strip()
+        ]
+        drive_write = bool(phase1_json.get("drive_write", False))
+        drive_intent = str(phase1_json.get("drive_intent") or "").strip()
     except json.JSONDecodeError:
         print("[Phase 1] JSON 解析失敗，只召回觸發者。")
 
@@ -3116,6 +3156,9 @@ async def run_phase1(
         supplement,
         need_web_search,
         web_search_query,
+        drive_read,
+        drive_write,
+        drive_intent,
     )
 
 
@@ -4139,7 +4182,8 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
                                 quests_text: str, all_context: list, clean_input_reply: str,
                                 tarot_drawn: dict | None, image_description: str = "",
                                 lore_speculation: str = "",
-                                web_context: str = "") -> tuple[str, str, str]:
+                                web_context: str = "",
+                                drive_context: str = "") -> tuple[str, str, str]:
     """建構 Phase 2 prompt、呼叫 API、寫入 debug log。回傳 (raw_content, phase2_char_name, current_user_name)。"""
     self_memories = await get_self_memory(limit=15)
     server_rules_text = ""
@@ -4221,6 +4265,14 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
         ))
     if image_description:
         phase2_messages.append(_divider_msg(img_block.strip()))
+    if drive_context:
+        phase2_messages.append(_divider_msg(
+            "【雲端資料夾內容 — 程式剛剛實際讀到的】\n"
+            "以下是從使用者的 Google Drive 資料夾讀到的內容（已整理）。\n"
+            "若與當前話題有關，直接用裡面的具體內容回答；"
+            "不要說你沒看到或無法讀取。\n"
+            f"{drive_context.strip()}"
+        ))
     if now_divider:
         phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
@@ -4245,6 +4297,8 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
             await f.write(f"\n[本輪網路資料] {web_context.strip()}")
         if image_description:
             await f.write(f"\n[圖片分析] {image_description.strip()}")
+        if drive_context:
+            await f.write(f"\n[雲端資料夾] {drive_context.strip()}")
         await f.write(f"\n\n=== CURRENT MESSAGE ===\n[{current_user_name}]: {clean_input_reply}")
         await f.write(f"\n\n=== FORMAT OVERRIDE (injected user msg) ===\n")
         await f.write(f"【你正在回覆 {current_user_name}】\n{planning_instruction}\n{fmt_body}")
@@ -4253,6 +4307,9 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
     if image_description:
         extra_segments.append({"id": "_ext_image", "title": "圖片分析",
                                "kind": "dynamic", "rendered": img_block})
+    if drive_context:
+        extra_segments.append({"id": "_ext_drive", "title": "雲端資料夾內容",
+                               "kind": "dynamic", "rendered": drive_context})
     await _write_prompt_blocks_dump(
         channel_type, enable_ic_style, extra_segments, all_context,
         current_user_name, clean_input_reply, planning_instruction, fmt_body,
@@ -4932,7 +4989,8 @@ async def on_message(message: discord.Message):
 
             (phase1_json, recall_user_ids, lore_topics, lore_notes, recall_threads,
              load_plot, enable_ic_style, phase1_supplement,
-             need_web_search, web_search_query) = await run_phase1(
+             need_web_search, web_search_query,
+             drive_read, drive_write, drive_intent) = await run_phase1(
                 recall_candidates, chain_text, thread_catalog, quests_text,
                 clean_input_reply, all_context, self_memories_full, user_memories_full, lore_full,
             )
@@ -5026,6 +5084,80 @@ async def on_message(message: discord.Message):
 
             image_description, image_logs = await image_task
 
+            # ── Drive Agent：Phase 1 判斷需要才跑（唯讀→研究員；要改→完整 Agent）──
+            drive_context = ""
+            drive_writes: list = []
+            if drive_read or drive_write:
+                try:
+                    import drive_agent
+
+                    dcfg = drive_agent.get_config()
+                    if drive_agent.is_enabled():
+                        recent_drive_ctx = "\n".join(
+                            f"[{'澪' if m.get('role') == 'assistant' else (m.get('name') or '使用者')}]: "
+                            f"{(m.get('content') or '')[:300]}"
+                            for m in all_context[-6:]
+                            if m.get("role") != "system"
+                        )
+                        if drive_write:
+                            print(f"[Drive] 寫入意圖：{drive_intent or clean_input_reply[:60]}")
+                            try:
+                                _tree = drive_agent.folder_tree_text()
+                            except Exception:
+                                _tree = ""
+                            result = await drive_agent.run_agent_loop(
+                                [
+                                    {"role": "system", "content": (
+                                        "你負責操作使用者的 Google Drive 資料夾。"
+                                        "只做使用者要求的事，不要順便改其他檔案。"
+                                        "要修改既有檔案前先讀它；新檔案用 mode=create。"
+                                        "寫入內容用繁體中文、保持使用者原本的格式與語氣。"
+                                        "路徑一律相對於資料夾根目錄（例如 世界觀.md），"
+                                        "不要加資料夾名稱。完成後用一句話說明你做了什麼（不要寫成角色台詞）。"
+                                        + (f"\n\n【目前資料夾內容】\n{_tree}" if _tree else "")
+                                    )},
+                                    {"role": "user", "content": (
+                                        f"【需求】\n{drive_intent or clean_input_reply}\n\n"
+                                        f"【最近對話】\n{recent_drive_ctx}"
+                                    )},
+                                ],
+                                max_steps=int(dcfg.get("max_steps", 4)),
+                            )
+                            drive_writes = result.get("writes") or []
+                            drive_context = (result.get("text") or "").strip()
+                        else:
+                            hints = "\n".join(
+                                f"- {d.get('path', '')}"
+                                + (f"（{d.get('mode')}：{d.get('section') or d.get('query') or ''}）"
+                                   if d.get("mode") in ("section", "grep") else "")
+                                for d in drive_read[:5]
+                            )
+                            print(f"[Drive] 唯讀需求：{hints.replace(chr(10), ' / ')[:120]}")
+                            try:
+                                _tree = drive_agent.folder_tree_text()
+                            except Exception:
+                                _tree = ""
+                            result = await drive_agent.run_read_agent(
+                                drive_intent or clean_input_reply,
+                                extra_context=(
+                                    f"【Phase 1 認為可能要讀的檔案】\n{hints}\n\n"
+                                    + (f"【目前資料夾內容】\n{_tree}\n\n" if _tree else "")
+                                    + f"【最近對話】\n{recent_drive_ctx}"
+                                ),
+                                max_steps=int(dcfg.get("read_steps", 3)),
+                            )
+                            drive_context = (result.get("summary") or "").strip()
+                        if drive_writes:
+                            print(
+                                "[Drive] 寫入結果："
+                                + ", ".join(
+                                    f"{w.get('action', 'fail')}:{w.get('name', '')}"
+                                    for w in drive_writes
+                                )
+                            )
+                except Exception as _de:
+                    print(f"[Drive] Agent 失敗: {type(_de).__name__}: {_de}")
+
             raw_content, phase2_char_name, current_user_name = await build_and_call_phase2(
                 message, channel_type=channel_type, pcfg=pcfg,
                 enable_ic_style=enable_ic_style, channel_context=channel_context,
@@ -5034,7 +5166,7 @@ async def on_message(message: discord.Message):
                 quests_text=quests_text, all_context=all_context,
                 clean_input_reply=clean_input_reply, tarot_drawn=tarot_drawn,
                 lore_speculation=lore_speculation, web_context=web_context,
-                image_description=image_description,
+                image_description=image_description, drive_context=drive_context,
             )
 
             raw_content = await style_self_check(raw_content, channel_type, enable_ic_style, pcfg)
@@ -5054,6 +5186,16 @@ async def on_message(message: discord.Message):
                 return
 
             await dispatch_reply(message, bot_reply, tarot_drawn, all_context)
+
+            # 寫入提示：程式產生，單獨一則（不靠模型記得說）
+            if drive_writes:
+                try:
+                    import drive_agent
+                    notice = drive_agent.format_write_notice(drive_writes)
+                    if notice:
+                        await message.channel.send(notice)
+                except Exception as _ne:
+                    print(f"[Drive] 提示發送失敗: {type(_ne).__name__}: {_ne}")
 
             if web_pages:
                 asyncio.create_task(web_reader.log_web_analysis(

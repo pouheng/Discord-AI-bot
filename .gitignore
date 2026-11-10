@@ -34,6 +34,7 @@ start.bat
 # Google OAuth 與 Discord bot token
 token.json
 drive_token.json
+drive_agent_token.json
 credentials.json
 client_secret_*.json
 service_account*.json
@@ -65,3 +66,8 @@ backup/
 llm_call_debug.jsonl
 watchdog_state.json
 prompt_blocks_history/
+
+# Drive Agent 產物（快照／審計／圖片快取）
+drive_snapshots/
+drive_logs/
+drive_cache/
