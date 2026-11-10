@@ -289,7 +289,7 @@ check("預設不可寫 .exe", ".exe" not in D.DEFAULTS["writable_extensions"])
 check("預設審核開啟", D.DEFAULTS["review_writes"] is True)
 check("工具定義完整",
       {t["function"]["name"] for t in D.TOOL_DEFS}
-      == {"drive_list", "drive_read", "drive_write", "drive_search"},
+      == {"drive_list", "drive_read", "drive_write", "drive_search", "drive_grep"},
       str([t["function"]["name"] for t in D.TOOL_DEFS]))
 
 print("[8] 範圍讀取（大文件只讀需要的部分）")
@@ -367,6 +367,29 @@ check("資料夾真的被建立",
       str([v["meta"]["name"] for v in store.values()]))
 r = asyncio.run(D.read_file("草稿/技師.md"))
 check("讀得回新檔", r.get("ok") and "技師草稿" in r.get("text", ""), str(r)[:100])
+
+print("[12] 內容搜尋：只給關鍵字也能找到檔案")
+res = asyncio.run(D.search_content("國家"))
+check("搜到含關鍵字的檔案", res.get("ok") and res.get("count", 0) >= 1, str(res)[:200])
+check("回傳檔案路徑與片段",
+      bool(res.get("matches")) and "path" in res["matches"][0]
+      and "snippet" in res["matches"][0], str(res)[:200])
+res = asyncio.run(D.search_content("不存在的關鍵字xyz"))
+check("找不到時回空陣列", res.get("ok") and res.get("count") == 0, str(res)[:120])
+
+print("[13] drive_grep 工具與別名")
+check("TOOL_DEFS 有 drive_grep",
+      any(t["function"]["name"] == "drive_grep" for t in D.TOOL_DEFS))
+check("研究員工具也含 drive_grep",
+      any(t["function"]["name"] == "drive_grep" for t in D.READ_TOOL_DEFS))
+r = asyncio.run(D.call_tool("drive_search_content", {"query": "國家"}))
+check("別名 drive_search_content → drive_grep",
+      r.get("ok") and r.get("count", 0) >= 1, str(r)[:160])
+
+print("[14] resolve_hints：空路徑 + 關鍵字 → 補成真實檔案")
+hints = asyncio.run(D.resolve_hints([{"path": "", "mode": "grep", "query": "國家"}]))
+check("補出檔案路徑", len(hints) == 1 and hints[0].get("path"), str(hints))
+check("保留模式為 auto", hints and hints[0].get("mode") == "auto", str(hints))
 
 restore(saved)
 D._cfg_cache["data"] = saved_cfg

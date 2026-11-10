@@ -604,6 +604,117 @@ async def search_files(query: str, limit: int = 20) -> dict:
     return await asyncio.to_thread(_search_sync, query, limit)
 
 
+# ── 內容搜尋（不知道是哪個檔案時用）────────────────────────
+
+def _query_grams(q: str, width: int = 2) -> list[str]:
+    """把關鍵字切成 n-gram（中文沒有空白可切），給模糊比對用。"""
+    q = (q or "").strip().lower()
+    if len(q) < width * 2:
+        return []
+    return list(dict.fromkeys(q[i:i + width] for i in range(len(q) - width + 1)))
+
+
+def _grep_content_sync(query: str, limit: int = 5, max_files: int = 40,
+                       chunk: int = 6000) -> dict:
+    """在資料夾所有文字檔的「內文」搜關鍵字，回傳命中的檔案與片段。"""
+    cfg = get_config()
+    service = get_service()
+    q = (query or "").strip()
+    if len(q) < 2:
+        raise DriveAgentError("搜尋關鍵字太短")
+
+    exts = {e.lower() for e in (cfg.get("write_exts") or [".md", ".txt", ".json", ".csv"])}
+    candidates = [
+        e for e in _walk(service, cfg["folder_id"])
+        if not e["is_folder"]
+        and (os.path.splitext(e["name"])[1].lower() in exts or e.get("mime") == GDOC_MIME)
+    ]
+
+    needle = q.lower()
+    grams = _query_grams(needle)
+    hits: list[dict] = []
+    scanned = 0
+    for e in candidates[:max_files]:
+        try:
+            data = _read_sync(e["path"])
+        except Exception:
+            continue
+        scanned += 1
+        text = (data.get("text") or "")
+        low = text.lower()
+
+        count = low.count(needle) if needle else 0
+        idx = low.find(needle) if count else -1
+        fuzzy = False
+        found: list[str] = []
+        if idx < 0 and grams:
+            # 「高低階魔法」對不上文件裡的「高階和低階」→ 用 2-gram 覆蓋率
+            found = [g for g in grams if g in low]
+            if len(found) >= max(2, int(len(grams) * 0.5)):
+                fuzzy = True
+                count = len(found)
+                idx = low.find(found[0])
+        if idx < 0:
+            continue
+
+        # 檔名命中比內文命中更能代表「就是這份文件」
+        name_low = e["name"].lower()
+        name_bonus = 10 if needle and needle in name_low else 0
+        if not name_bonus and grams:
+            name_bonus = sum(2 for g in grams if g in name_low)
+
+        start = max(0, idx - 80)
+        snippet = text[start:idx + len(found[0] if fuzzy else q) + 120]
+        hits.append({
+            "path": e["path"],
+            "matches": count,
+            "score": count + name_bonus,
+            "fuzzy": fuzzy,
+            "snippet": snippet.replace("\n", " ").strip(),
+        })
+
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    hits = hits[:limit]
+    return {
+        "ok": True,
+        "query": q,
+        "scanned": scanned,
+        "count": len(hits),
+        "matches": hits,
+    }
+
+
+async def search_content(query: str, limit: int = 5) -> dict:
+    return await asyncio.to_thread(_grep_content_sync, query, limit)
+
+
+async def resolve_hints(hints: list[dict]) -> list[dict]:
+    """把 Phase 1 的讀取提示補成可用的檔案路徑。
+
+    path 空的代表「我不知道是哪個檔案」→ 用 query 做內文搜尋，挑命中最多的一份。
+    """
+    out: list[dict] = []
+    for h in (hints or [])[:5]:
+        if not isinstance(h, dict):
+            continue
+        path = (h.get("path") or "").strip()
+        if path:
+            out.append(h)
+            continue
+        q = (h.get("query") or h.get("section") or "").strip()
+        if not q:
+            continue
+        try:
+            res = await search_content(q, limit=1)
+        except Exception:
+            continue
+        matches = res.get("matches") or []
+        if matches:
+            print(f"[Drive] 「{q}」→ 找到 {matches[0]['path']}")
+            out.append({"path": matches[0]["path"], "mode": "auto"})
+    return out[:2]
+
+
 # ── 寫入審核 ──────────────────────────────────────────────
 
 _REVIEW_RULES = """你是檔案變更審核員。以下是一個 Discord 角色想寫入 Google Drive 資料夾的變更。
@@ -918,6 +1029,21 @@ TOOL_DEFS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "drive_grep",
+            "description": "在資料夾所有文字檔的內文搜尋關鍵字（不知道是哪個檔案時先用這個）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "要搜的關鍵字"},
+                    "limit": {"type": "integer", "description": "最多回傳幾個檔案"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -931,6 +1057,10 @@ _TOOL_ALIASES = {
     "drive_ls": ("drive_list", None),
     "drive_dir": ("drive_list", None),
     "drive_find": ("drive_search", None),
+    "drive_search_content": ("drive_grep", None),
+    "drive_grep_content": ("drive_grep", None),
+    "drive_search_text": ("drive_grep", None),
+    "drive_find_content": ("drive_grep", None),
     "drive_open": ("drive_read", None),
     "drive_cat": ("drive_read", None),
 }
@@ -976,6 +1106,11 @@ async def call_tool(name: str, args: dict) -> dict:
             )
         if name == "drive_search":
             return await search_files(str(args.get("query") or ""))
+        if name == "drive_grep":
+            return await search_content(
+                str(args.get("query") or ""),
+                limit=int(args["limit"]) if args.get("limit") else 5,
+            )
         return {"ok": False, "error": f"未知工具：{name}"}
     except DriveAgentError as e:
         return {"ok": False, "error": str(e)}
@@ -1359,7 +1494,7 @@ _RESEARCHER_SYSTEM = """你是資料研究員，只能「讀」不能寫。
 不要加資料夾名稱（不要寫成「澪創作/世界觀.md」）。
 
 讀取策略：
-1. 不確定檔案在哪 → 先 drive_list 或 drive_search 看檔名。
+1. 不確定檔案在哪 → 先用 **drive_grep 搜內文關鍵字**（最準），沒有結果再用 drive_list／drive_search 看檔名。
 2. 大文件不要一次讀完：先用 mode=section 讀指定標題，或 mode=grep 找關鍵字。
 3. 只有整份都相關、且不算大時，才用 mode=full。
 4. 拿到足夠資訊就停止，不要為了完整而把整份文件讀完。

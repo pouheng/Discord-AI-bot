@@ -2907,6 +2907,9 @@ async def run_phase1(
 - 若使用者要求「寫入／更新／存檔／整理成文件／改設定」，drive_write 設 true，
   並在 drive_intent 用一句話寫要做什麼（盡量含目標檔名，沒有就自己想一個合理的）。
 - 不確定檔案在哪 → drive_read 留空、drive_write 設 false，系統不會去動雲端。
+- 但若使用者明顯在說「你去讀那個文件／資料夾裡有寫」，只是沒說檔名：
+  給 drive_read 一項 {"path":"","mode":"grep","query":"<你猜的關鍵字>"}（例如「治癒魔法」），
+  系統會自動在資料夾內文搜尋，找到最相符的檔案再讀。不確定關鍵字就留空。
 - 沒有雲端需求時：drive_read=[]、drive_write=false、drive_intent=""。
 - 連鎖任務（例如「上網找參考，再寫成角色草稿」）：need_web_search 與 drive_write 同時設 true，
   drive_intent 要寫清楚目標檔名與內容重點（例：「上網找蒸氣龐克世界觀參考，
@@ -3145,7 +3148,9 @@ async def run_phase1(
             drive_read = []
         drive_read = [
             d for d in drive_read
-            if isinstance(d, dict) and str(d.get("path") or "").strip()
+            if isinstance(d, dict)
+            and (str(d.get("path") or "").strip()
+                 or str(d.get("query") or "").strip())
         ]
         drive_write = bool(phase1_json.get("drive_write", False))
         drive_intent = str(phase1_json.get("drive_intent") or "").strip()
@@ -5004,6 +5009,21 @@ async def on_message(message: discord.Message):
                 clean_input_reply, all_context, self_memories_full, user_memories_full, lore_full,
             )
 
+            # Phase 1 只給關鍵字、沒給檔名時（「你去讀那個文件」）→ 先在資料夾內文搜尋
+            _drive_hint_missed = False
+            if drive_read:
+                try:
+                    import drive_agent as _drive
+
+                    if _drive.is_enabled():
+                        _drive_raw = list(drive_read)
+                        drive_read = await _drive.resolve_hints(drive_read)
+                        if not drive_read and _drive_raw:
+                            _drive_hint_missed = True
+                            print("[Drive] 內文搜尋沒有命中任何檔案，改由研究員自行找")
+                except Exception as _re:
+                    print(f"[Drive] 解析讀取提示失敗: {type(_re).__name__}: {_re}")
+
             ic_context_text, channel_note = await pull_ooc_ic_content(
                 message, channel_type, load_plot, recall_threads, channel_note,
             )
@@ -5096,7 +5116,7 @@ async def on_message(message: discord.Message):
             # ── Drive Agent：Phase 1 判斷需要才跑（唯讀→研究員；要改→完整 Agent）──
             drive_context = ""
             drive_writes: list = []
-            if drive_read or drive_write:
+            if drive_read or drive_write or _drive_hint_missed:
                 try:
                     import drive_agent
 
@@ -5170,6 +5190,8 @@ async def on_message(message: discord.Message):
                                         "必須沿用同一套用語再擴展，不要另創一套相近但不同的名稱。"
                                         "資料夾清單已經給你，除非使用者指定要參考某個檔案，"
                                         "最多讀 1-2 個檔案就開始寫入，不要逐一讀完。"
+                                        "若使用者說「去讀那個文件」卻沒給明確檔名，"
+                                        "先用 drive_grep 以關鍵字搜內文，命中哪一份就讀哪一份。"
                                         "完成後用一句話說明你做了什麼（不要寫成角色台詞）。"
                                         + (f"\n\n【目前資料夾內容】\n{_tree}" if _tree else "")
                                     )},
@@ -5197,10 +5219,31 @@ async def on_message(message: discord.Message):
                                 _tree = drive_agent.folder_tree_text()
                             except Exception:
                                 _tree = ""
+                            # 已經定位到的檔案先讀進來，研究員就不必再花步數重讀
+                            _read_docs = []
+                            for _d in (drive_read or [])[:2]:
+                                _path = (_d.get("path") or "").strip()
+                                if not _path:
+                                    continue
+                                try:
+                                    _r = await drive_agent.read_file(
+                                        _path, mode="auto", limit=2500
+                                    )
+                                except Exception:
+                                    continue
+                                if _r.get("ok") and (_r.get("text") or "").strip():
+                                    _read_docs.append(
+                                        f"《{_path}》\n{_r['text'].strip()[:2500]}"
+                                    )
                             result = await drive_agent.run_read_agent(
                                 drive_intent or clean_input_reply,
                                 extra_context=(
-                                    f"【Phase 1 認為可能要讀的檔案】\n{hints}\n\n"
+                                    (f"【已讀到的檔案內容】\n" + "\n\n".join(_read_docs) + "\n\n"
+                                     if _read_docs else "")
+                                    + ("【注意】系統用關鍵字搜尋內文後沒有命中任何檔案，"
+                                       "請自行用 drive_grep／drive_list 找出最相關的文件再讀。\n\n"
+                                       if _drive_hint_missed else "")
+                                    + f"【Phase 1 認為可能要讀的檔案】\n{hints}\n\n"
                                     + (f"【目前資料夾內容】\n{_tree}\n\n" if _tree else "")
                                     + (f"【本輪網路資料】\n{web_context.strip()[:2000]}\n\n"
                                        if web_context else "")

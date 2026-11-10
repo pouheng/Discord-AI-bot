@@ -462,6 +462,40 @@ async def run_tests():
     check("參考資料含檔案內容", "療癒系" in blob, blob[:300])
     drive_mod.read_file = _orig_read_file
 
+    # ── Test 19：「去讀那個文件」沒給檔名 → 先用內文搜尋定位 ────
+    print("\n[Test 19] 沒給檔名 → 內文搜尋找到檔案再讀")
+    _orig_search_content = drive_mod.search_content
+    _orig_read_file = drive_mod.read_file
+    drive_mod.search_content = mock.AsyncMock(return_value={
+        "ok": True, "query": "治癒魔法", "count": 1,
+        "matches": [{"path": "治癒魔法與高低階魔法解釋", "matches": 3,
+                     "snippet": "低階治癒只能堵傷口"}],
+    })
+    drive_mod.read_file = mock.AsyncMock(return_value={
+        "ok": True, "text": "低階治癒只能堵傷口，高階可無詠唱修復斷肢。",
+        "total_chars": 24,
+    })
+    main.run_phase1 = mock.AsyncMock(return_value=(
+        [], [], [], [], [], False, False, "", False, "",
+        [{"path": "", "mode": "grep", "query": "治癒魔法"}], False, "",
+    ))
+    drive_mod.run_read_agent = mock.AsyncMock(return_value={
+        "summary": "文件說低階治癒只能堵傷口，高階可修復斷肢。",
+        "tool_calls": [], "steps": 1,
+    })
+    msg19 = _make_message("你去讀那個文件啊，上面應該有記載，讀完再跟我說")
+    await main.on_message(msg19)
+    check("有做內文搜尋", drive_mod.search_content.await_count >= 1,
+          str(drive_mod.search_content.await_count))
+    check("搜到後有去讀那個檔案",
+          any("治癒魔法與高低階魔法解釋" in str(c) for c in drive_mod.read_file.call_args_list),
+          str(drive_mod.read_file.call_args_list)[:200])
+    check("研究員拿到讀到的內容",
+          "堵傷口" in str(drive_mod.run_read_agent.call_args),
+          str(drive_mod.run_read_agent.call_args)[:300])
+    drive_mod.search_content = _orig_search_content
+    drive_mod.read_file = _orig_read_file
+
     # 還原
     main.build_and_call_phase2 = _orig_phase2
     drive_mod.run_read_agent = _orig_read_agent
