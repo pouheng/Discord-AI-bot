@@ -1072,6 +1072,29 @@ def _has_write(writes: list[dict]) -> bool:
     )
 
 
+def _clean_generated(text: str, path: str) -> str:
+    """清掉模型把「路徑／mode」也一起輸出、或包了程式碼圍籬的情況。"""
+    s = (text or "").strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+    junk = {
+        path.strip(), path.strip().lstrip("/"), "create", "overwrite", "append",
+        "mode=create", "mode: create", "mode：create", "已建立", "已寫入",
+    }
+    for _ in range(3):
+        lines = s.splitlines()
+        if lines and lines[0].strip() in junk:
+            s = "\n".join(lines[1:]).lstrip()
+        else:
+            break
+    return s
+
+
 async def run_agent_loop(
     messages: list[dict],
     *,
@@ -1260,9 +1283,25 @@ async def run_agent_loop(
                     ),
                 }],
                 temperature=temperature,
-                max_tokens=max(max_tokens, 1600),
+                max_tokens=max(max_tokens, 3600),
             )
-            content = strip_dsml(gen.choices[0].message.content or "").strip()
+            if getattr(gen.choices[0], "finish_reason", "") == "length":
+                print("[Drive] 代寫內容被截斷 → 提高額度重寫")
+                gen = await chat_create(
+                    slot,
+                    messages=msgs + [{
+                        "role": "user",
+                        "content": (
+                            f"請直接輸出要寫入「{fallback_path}」的完整檔案內容（純 Markdown／純文字），"
+                            "不要任何解釋、不要程式碼圍籬、不要標題以外的廢話。"
+                        ),
+                    }],
+                    temperature=temperature,
+                    max_tokens=6000,
+                )
+            content = _clean_generated(
+                strip_dsml(gen.choices[0].message.content or ""), fallback_path
+            )
             if content:
                 res = await write_file(fallback_path, content, "create")
                 if not res.get("ok") and "已存在" in (res.get("error") or ""):

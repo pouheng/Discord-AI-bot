@@ -499,6 +499,32 @@ check("檔案真的存在",
 back = asyncio.run(D.read_file("自動草稿.md"))
 check("內容是模型產生的", "黃銅護目鏡" in back.get("text", ""), back.get("text", "")[:80])
 
+# ── 場景 15：代寫內容夾帶「路徑／create」與程式碼圍籬 → 要清乾淨 ──
+
+print("[15] 代寫內容夾帶雜訊（路徑、create、```）→ 清洗後才寫入")
+D.review_write = approve_all
+seen = script_model([
+    model_reply("好的。"),
+    model_reply("我不想寫。"),
+    model_reply("```markdown\n角色草稿/測試.md\ncreate\n# 標題\n內容本體\n```"),
+])
+result = asyncio.run(D.run_agent_loop(
+    [
+        {"role": "system", "content": "寫檔案"},
+        {"role": "user", "content": "寫到 角色草稿/測試.md"},
+    ],
+    require_write=True,
+    fallback_path="角色草稿/測試.md",
+))
+check("代寫成功", len(result["writes"]) == 1 and result["writes"][0].get("ok"),
+      str(result["writes"]))
+back = asyncio.run(D.read_file("角色草稿/測試.md"))
+text = back.get("text", "")
+check("沒有殘留路徑與 mode", "角色草稿/測試.md" not in text and "create" not in text,
+      text[:80])
+check("沒有程式碼圍籬", "```" not in text, text[:80])
+check("開頭就是標題", text.lstrip().startswith("# 標題"), text[:40])
+
 restore(saved)
 
 print(f"\n{SUCCESS} passed, {FAIL} failed")
