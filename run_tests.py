@@ -33,16 +33,16 @@ SUITE = [
     "test_webreader.py",      # 網頁 reader
     "test_drive_agent.py",    # Drive 工具層
     "test_drive_scenarios.py",# Drive 使用場景
+    "test_prompts.py",        # 提示詞結構
+    "test_parity.py",         # block 版 vs legacy 版一致性
 ]
 
-# 需要資料庫／提示詞檔案的測試（目前 prompt_blocks 有已知問題）
-EXTRA = [
-    "test_prompts.py",
-    "test_parity.py",
-]
+# 保留給舊指令（--all）相容，目前無額外測試
+EXTRA: list[str] = []
 
 _PASSED_FAILED = re.compile(r"(\d+)\s+passed,\s*(\d+)\s+failed")
 _RESULTS = re.compile(r"Results:\s*(\d+)/(\d+)\s+passed")
+_PASS_TOTAL = re.compile(r"PASS\s+(\d+)/(\d+)")
 
 
 def parse_result(output: str):
@@ -51,6 +51,10 @@ def parse_result(output: str):
         passed, failed = m[-1]
         return int(passed), int(passed) + int(failed)
     m = _RESULTS.findall(output)
+    if m:
+        passed, total = m[-1]
+        return int(passed), int(total)
+    m = _PASS_TOTAL.findall(output)
     if m:
         passed, total = m[-1]
         return int(passed), int(total)
@@ -88,7 +92,7 @@ def run_one(name: str, fail_fast: bool):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("filter", nargs="?", default="", help="只跑名稱含此字串的測試")
-    parser.add_argument("--all", action="store_true", help="加上 prompt／parity")
+    parser.add_argument("--all", action="store_true", help="（相容用，已無額外測試）")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="失敗時印出完整輸出")
     args = parser.parse_args()

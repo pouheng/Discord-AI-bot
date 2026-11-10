@@ -193,10 +193,19 @@ async def test_phase2_ooc_prompt():
     yield check("OOC: 包含場景", "【場景】" in mock_prompt)
     yield check("OOC: 包含世界觀資料", "【世界觀資料】" in mock_prompt)
     yield check("OOC: 包含已知資訊", "【你對眼前人物的已知資訊】" in mock_prompt)
-    yield check("OOC: 包含輸出格式守則", "輸出格式守則（靜態指令）" in mock_prompt)
+    yield check("OOC: 包含時間來源優先順序", "時間來源優先順序" in mock_prompt)
+    yield check("OOC: 要求 <planning> 區塊", "<planning>" in mock_prompt)
 
     yield check("OOC: 包含避免重複結構", "避免重複結構" in mock_prompt)
-    yield check("OOC: 包含標籤強制規則", "標籤強制規則" in mock_prompt)
+
+    # 輸出格式與 [TO:] 規則由 main._reply_format_instruction 每輪注入，
+    # 不在 system prompt 裡；這裡改為檢查那份指令真的有產生。
+    fmt_text, _plan, _body, _prime = main._reply_format_instruction(
+        "out_of_character", "澪", "測試者", "【最近發言的人】", ""
+    )
+    yield check("OOC: 格式指令含 <planning>", "<planning>" in fmt_text, fmt_text[:120])
+    yield check("OOC: 格式指令含 [TO:] 說明", "[TO:" in fmt_text, fmt_text[:120])
+    yield check("OOC: 格式指令含 [REPLY] 說明", "[REPLY]" in fmt_text, fmt_text[:120])
     yield check(
         "OOC: 動態資料在靜態之後",
         mock_prompt.index("動態資料區") > mock_prompt.index("【身分】"),
