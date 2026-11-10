@@ -36,6 +36,7 @@ SUITE = [
     "test_prompts.py",        # 提示詞結構
     "test_parity.py",         # block 版 vs legacy 版一致性
     "test_model_routing.py",  # 全域備援（主線路由場景決定）
+    "test_priming.py",        # 開場提示句（單一來源）
 ]
 
 # 保留給舊指令（--all）相容，目前無額外測試

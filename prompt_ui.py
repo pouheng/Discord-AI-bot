@@ -31,13 +31,14 @@ PROMPT_LOG_DIR = os.path.join(SCRIPT_DIR, "prompt_logs")
 LAST_DUMP = os.path.join(PROMPT_LOG_DIR, "last_prompt_blocks.json")
 RAW_PROMPT = os.path.join(PROMPT_LOG_DIR, "last_prompt.txt")
 
-PLACEHOLDERS = ["now", "today", "char_name", "banned_words"]
+PLACEHOLDERS = ["now", "today", "char_name", "banned_words", "priming"]
 
 app = FastAPI(title="Phase 2 Prompt Editor", version="1.0")
 
 
 class SaveBody(BaseModel):
     tabs: dict[str, Any]
+    priming: dict[str, Any] | None = None
     note: str = ""
 
 
@@ -48,6 +49,7 @@ def get_data():
         "blocks": data,
         "flags": prompt_blocks.FLAG_LABELS,
         "placeholders": PLACEHOLDERS,
+        "priming_defaults": prompt_blocks.DEFAULT_PRIMING,
         "history": prompt_blocks.list_history(),
     }
 
@@ -80,13 +82,23 @@ def _dump_from_raw_prompt() -> dict:
     fmt = secs.get("FORMAT OVERRIDE (injected user msg)",
                    secs.get("FORMAT OVERRIDE", ""))
     priming = secs.get("PRIMING", "")
+    _sys = secs.get("SYSTEM", "")
+    _p = priming.strip()
+    if _p.startswith("開始回應") or "台詞" in _p:
+        _ctype = "in_character"
+    elif "（正文）" in _sys:
+        _ctype = "out_of_character"
+    elif _sys:
+        _ctype = "in_character"
+    else:
+        _ctype = "out_of_character"
     mtime = datetime.datetime.fromtimestamp(
         os.path.getmtime(RAW_PROMPT)
     ).strftime("%Y-%m-%d %H:%M:%S")
     return {
         "timestamp": mtime,
-        # IC 的 priming 以「開始回應」開頭；OOC 以「喔好，收到了」開頭
-        "channel_type": "in_character" if priming.strip().startswith("開始回應") else "out_of_character",
+        # IC 的 priming 含「台詞」；OOC 的系統尾巴含「（正文）」
+        "channel_type": _ctype,
         "channel": "",
         "enable_ic_style": False,
         "segments": [{
@@ -118,6 +130,10 @@ def get_last():
 def post_save(body: SaveBody):
     data = prompt_blocks.load_blocks()
     data["tabs"] = body.tabs
+    if body.priming is not None:
+        for ch in ("ooc", "ic"):
+            if isinstance(body.priming.get(ch), str):
+                prompt_blocks.set_priming(data, ch, body.priming[ch])
     ts = prompt_blocks.save_blocks(data, note=body.note)
     return {"ok": True, "ts": ts}
 
@@ -163,6 +179,8 @@ HTML_PAGE = r"""<!doctype html>
   .tabs button.active { background:#5865f2; border-color:#5865f2; color:#fff; }
   main { padding:14px; max-width:1100px; }
   .block { border:1px solid #3a3c42; border-radius:8px; margin:8px 0; background:#2b2d31; }
+  .block.priming { border-color:#5865f2; background:#26283a; }
+  .block.priming textarea { min-height:70px; }
   .block .head { display:flex; gap:8px; align-items:center; padding:6px 8px; border-bottom:1px solid #3a3c42; flex-wrap:wrap; }
   .block .head input[type=text] { flex:1; min-width:160px; background:#1e1f22; color:#eee; border:1px solid #444; border-radius:4px; padding:4px 6px; }
   .badge { font-size:11px; padding:1px 7px; border-radius:10px; }
@@ -243,10 +261,14 @@ function renderView(m) {
     m.appendChild(d);
   }
   const tail = document.createElement("div"); tail.className="seg";
+  const chKey = (LAST.channel_type === "in_character") ? "ic" : "ooc";
+  const curP = ((DATA.blocks.priming || {})[chKey]) || "";
+  const pNote = (!LAST.raw_fallback && curP && curP !== (LAST.priming || ""))
+    ? ` &nbsp;<span class="warn">（目前設定已改，下次生效）</span>` : "";
   tail.innerHTML = `<h3>CONTEXT（歷史對話）<span class="badge dynamic">message</span></h3><pre>${(LAST.context||[]).map(c=>`[${esc(c.role)}] ${esc(c.content)}`).join("\n")}</pre>
     <h3>CURRENT MESSAGE</h3><pre>${esc(LAST.current_message)}</pre>
     <h3>FORMAT OVERRIDE</h3><pre>${esc(LAST.format_override)}</pre>
-    <h3>PRIMING</h3><pre>${esc(LAST.priming)}</pre>`;
+    <h3>PRIMING${pNote}</h3><pre>${esc(LAST.priming)}</pre>`;
   m.appendChild(tail);
 }
 function validate(content) {
@@ -258,6 +280,38 @@ function validate(content) {
 }
 function renderEditor(m, channel) {
   const blocks = DATA.blocks.tabs[channel] || (DATA.blocks.tabs[channel] = []);
+  const priming = DATA.blocks.priming || (DATA.blocks.priming = {});
+  if (typeof priming[channel] !== "string") priming[channel] = "";
+
+  // ── 開場提示句（priming）：唯一可改的地方 ──
+  const pbox = document.createElement("div"); pbox.className = "block priming";
+  pbox.innerHTML = `
+    <div class="head">
+      <span class="badge" style="background:#5865f2">PRIMING</span>
+      <b>開場提示句（${channel.toUpperCase()}）· 全系統唯一來源</b>
+      <span style="flex:1"></span>
+      <button class="mini" data-preset>還原預設</button>
+    </div>
+    <div class="body">
+      <textarea data-priming>${esc(priming[channel])}</textarea>
+      <div class="muted">接在「使用者訊息」最後引導模型直接進正文；系統尾巴會用 {{priming}} 引用同一段。
+        模型若把它複述出來，程式會自動從回覆開頭刪掉。可用 {{char_name}}。</div>
+      <div class="warn" data-pwarn></div>
+    </div>`;
+  m.appendChild(pbox);
+  const pta = pbox.querySelector("[data-priming]");
+  pta.oninput = () => {
+    priming[channel] = pta.value;
+    const bad = validate(pta.value);
+    pbox.querySelector("[data-pwarn]").textContent = bad.length
+      ? "⚠️ 未知 placeholder：{{" + bad.join("}} {{") + "}}（已知：" + PLACEHOLDERS().join(", ") + "）"
+      : (pta.value.trim() ? "" : "⚠️ 留空＝不注入開場提示句（模型可能不容易直接進正文）");
+  };
+  pbox.querySelector("[data-preset]").onclick = () => {
+    const d = (DATA.priming_defaults || {})[channel] || "";
+    pta.value = d; priming[channel] = d; setStatus("已還原預設（記得儲存）");
+  };
+
   const bar = document.createElement("div"); bar.className="toolbar";
   bar.innerHTML = `<button class="mini" id="addb">+ 新增條目</button>
     <span class="muted">動態條目唯讀；靜態條目可按「複製」做版本（複本預設停用）。標題模型看不到。</span>`;
@@ -333,7 +387,7 @@ function renderEditor(m, channel) {
   save.querySelector("#saveb").onclick = async () => {
     const note = save.querySelector("#note").value;
     const r = await fetch("/api/save", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({tabs: DATA.blocks.tabs, note})});
+      body: JSON.stringify({tabs: DATA.blocks.tabs, priming: DATA.blocks.priming, note})});
     const j = await r.json();
     setStatus("已儲存 · 快照 " + j.ts);
     DATA = await (await fetch("/api/data")).json();

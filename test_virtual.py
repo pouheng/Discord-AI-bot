@@ -73,13 +73,16 @@ print(f"[Test 8] 格式化後 supplement ({len(formatted)} chars):")
 print(formatted)
 print("PASS\n")
 
-# ── Test 9: 回覆起始引導（priming trick）存在 ──
-has_ooc_prime = "喔好，收到了，我現在會開始思考" in content
-has_ic_prime = "開始回應：" in content
+# ── Test 9: 回覆起始引導（priming trick）存在（單一來源：prompt_blocks）──
+import prompt_blocks
+has_ooc_prime = "喔好，收到了，我現在會開始思考" in prompt_blocks.get_priming("ooc")
+has_ic_prime = "開始回應：" in prompt_blocks.get_priming("ic")
+wired = "prompt_blocks.get_priming" in content
 print(f"[Test 9] 回覆起始引導")
 print(f"  OOC: {'PASS' if has_ooc_prime else 'FAIL'}")
 print(f"  IC:  {'PASS' if has_ic_prime else 'FAIL'}")
-assert has_ooc_prime and has_ic_prime, "FAIL: 回覆起始引導缺失"
+print(f"  程式綁定: {'PASS' if wired else 'FAIL'}")
+assert has_ooc_prime and has_ic_prime and wired, "FAIL: 回覆起始引導缺失"
 
 # ── Test 10: 禁止自問自答 / 避免重複結構 在動態資料之前 ──
 dyn_marker_pos = content.find("# ── 動態資料區")

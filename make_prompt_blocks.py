@@ -16,6 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main  # noqa: E402
+import prompt_blocks  # noqa: E402
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_FILE = os.path.join(SCRIPT_DIR, "prompt_blocks.json")
@@ -173,7 +174,17 @@ async def main_async():
                 "condition": CONDITIONS.get(b["id"], []),
                 "content": content,
             })
+        # tail 的第一行是 priming → 換成佔位，避免與 priming 欄位重複
+        for b in out_blocks:
+            if b["id"].endswith("_tail") and b["content"]:
+                nl = b["content"].find("\n")
+                first = b["content"][:nl] if nl >= 0 else b["content"]
+                if first.strip():
+                    b["content"] = "{{priming}}" + b["content"][len(first):]
         data["tabs"][label] = out_blocks
+
+    data["priming"] = dict(prompt_blocks.DEFAULT_PRIMING)
+    data["version"] = 2
 
     with open(OUT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

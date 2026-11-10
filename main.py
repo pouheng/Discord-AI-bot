@@ -3326,10 +3326,13 @@ async def _legacy_build_phase2_system_prompt(
             ooc_self_profile = await format_character_profile(char_name_ooc)
             if ooc_self_profile:
                 phase2_system += f"\n{ooc_self_profile}\n"
+        _priming_ooc = prompt_blocks.fill_placeholders(
+            prompt_blocks.get_priming("ooc"), {"char_name": char_name_ooc or "角色"}
+        )
         phase2_system += f"""
 {self_memories}
 
-喔好，收到了，我現在會開始思考、開始回應：
+{_priming_ooc}
 
 <planning>
 {planning_tpl}
@@ -3436,12 +3439,15 @@ async def _legacy_build_phase2_system_prompt(
 【你對自己角色的認知】"""
         if ic_self_profile:
             phase2_system += f"\n{ic_self_profile}\n"
+        _priming_ic = prompt_blocks.fill_placeholders(
+            prompt_blocks.get_priming("ic"), {"char_name": char_name or "角色"}
+        )
         phase2_system += f"""
 {self_memories}
 
 {quests_text}
 
-開始回應：
+{_priming_ic}
 
 <planning>
 {planning_tpl}
@@ -4298,7 +4304,8 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
         phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
         "role": "user",
-        "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
+        "content": f"[{current_user_name}]: {clean_input_reply}"
+                   + (f"\n\n{priming_suffix}" if priming_suffix else ""),
     })
 
     print("[LOG] [Phase 2] 生成角色回覆中...")
@@ -4420,7 +4427,8 @@ async def run_phase2_direct(
         phase2_messages.append(_divider_msg(now_divider))
     phase2_messages.append({
         "role": "user",
-        "content": f"[{current_user_name}]: {clean_input_reply}\n\n{priming_suffix}",
+        "content": f"[{current_user_name}]: {clean_input_reply}"
+                   + (f"\n\n{priming_suffix}" if priming_suffix else ""),
     })
 
     print("[LOG] [Phase 2 direct] 生成角色回覆中...")
@@ -4698,14 +4706,21 @@ def _reply_format_instruction(channel_type: str, phase2_char_name: str,
     重點：預設只回覆觸發者；真的有多人明確找 bot 時，每段 [TO:名稱] 會
     各自變成一則獨立 Discord 訊息，並回覆到那個人的訊息。
     """
+    # priming 的唯一來源是 prompt_blocks.json 的 priming 欄位（Prompt Editor
+    # 有專門的位置可改）。改一段文字，系統尾巴與使用者訊息結尾會同步更新，
+    # 模型複述時的清理也自動跟著換。
+    channel = "ooc" if channel_type == "out_of_character" else "ic"
+    priming_suffix = prompt_blocks.fill_placeholders(
+        prompt_blocks.get_priming(channel),
+        {"char_name": phase2_char_name or "角色"},
+    ).strip()
+
     if channel_type == "out_of_character":
         planning_instruction = "1. <planning>快速分析對話情境與回應方向</planning>"
         fmt_body = "2. 正文（自然對話）\n"
-        priming_suffix = "喔好，收到了，我現在會開始思考、開始回應："
     else:
         planning_instruction = "1. <planning>當前情況分析</planning>"
         fmt_body = f"2. {phase2_char_name}的台詞\n"
-        priming_suffix = f"開始回應： {phase2_char_name}的台詞"
 
     text = (
         f"【你正在回覆 {current_user_name} 的訊息】\n"

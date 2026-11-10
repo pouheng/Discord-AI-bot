@@ -19,6 +19,39 @@ BLOCKS_FILE = os.path.join(SCRIPT_DIR, "prompt_blocks.json")
 HISTORY_DIR = os.path.join(SCRIPT_DIR, "prompt_blocks_history")
 HISTORY_KEEP = 50
 
+# ── 開場提示句（priming）──
+# 存在的唯一位置：prompt_blocks.json 的 "priming"。程式用它
+#   (1) 接在使用者訊息最後，引導模型直接進正文；
+#   (2) 系統提示詞尾巴的 {{priming}} 佔位；
+#   (3) 模型若把它複述出來，自動從回覆開頭刪掉。
+DEFAULT_PRIMING = {
+    "ooc": "喔好，收到了，我現在會開始思考、開始回應：",
+    "ic": "開始回應：{{char_name}}的台詞",
+}
+
+
+def _priming_from(data, channel):
+    p = data.get("priming")
+    if isinstance(p, dict) and isinstance(p.get(channel), str):
+        return p[channel]
+    return DEFAULT_PRIMING.get(channel, "")
+
+
+def get_priming(channel):
+    """目前設定的開場提示句（'ooc' 或 'ic'）；可含 placeholder。"""
+    return _priming_from(load_blocks(), channel)
+
+
+def set_priming(data, channel, text):
+    """在要寫回的 data 上設定 priming（不直接寫檔，交給 save_blocks）。"""
+    p = data.get("priming")
+    if not isinstance(p, dict):
+        p = {}
+    p[channel] = text or ""
+    data["priming"] = p
+    return data
+
+
 # ── 已知條件旗標（給編輯器顯示與勾選；旗標值由 ctx 計算）──
 FLAG_LABELS = {
     "has_server_rules": "有本伺服器規則",
@@ -213,11 +246,14 @@ GENERATORS = {
 # ── 儲存 / 讀取 / 歷史 ──
 def load_blocks():
     if not os.path.exists(BLOCKS_FILE):
-        return {"version": 1, "tabs": {"ooc": [], "ic": []}}
+        return {"version": 1, "tabs": {"ooc": [], "ic": []},
+                "priming": dict(DEFAULT_PRIMING)}
     with open(BLOCKS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     data.setdefault("version", 1)
     data.setdefault("tabs", {"ooc": [], "ic": []})
+    if not isinstance(data.get("priming"), dict):
+        data["priming"] = dict(DEFAULT_PRIMING)
     return data
 
 
@@ -304,6 +340,10 @@ def render_system(channel, ctx):
     global LAST_SEGMENTS, LAST_CHANNEL
     data = load_blocks()
     tab = data.get("tabs", {}).get(channel, [])
+    # priming 先填好 placeholder，再讓 {{priming}} 帶進條目（單次代換，
+    # 不會回頭再掃一次，所以這裡要先自己填）。
+    ctx = dict(ctx)
+    ctx["priming"] = fill_placeholders(_priming_from(data, channel), ctx)
     parts = []
     segments = []
     for b in tab:
