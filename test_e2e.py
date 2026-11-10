@@ -112,14 +112,14 @@ async def run_tests():
     passed = 0
     total = 0
 
-    def check(name, condition):
+    def check(name, condition, detail=""):
         nonlocal passed, total
         total += 1
         if condition:
             passed += 1
             print(f"  PASS: {name}")
         else:
-            print(f"  FAIL: {name}")
+            print(f"  FAIL: {name}" + (f"  ({detail})" if detail else ""))
 
     def sent(msg):
         """有送出去就算數（可能用 reply，也可能是普通訊息）。"""
@@ -247,6 +247,148 @@ async def run_tests():
     msg_dm.guild = None
     info3 = main.get_channel_info(msg_dm)
     check("DM = IC", info3["channel_type"] == "in_character")
+
+    # ── Test 11-14: Drive Agent 使用場景（主流程整合）──
+    import drive_agent as drive_mod
+
+    _orig_phase2 = main.build_and_call_phase2
+    _orig_read_agent = drive_mod.run_read_agent
+    _orig_loop = drive_mod.run_agent_loop
+    _orig_tree = drive_mod.folder_tree_text
+    _orig_enabled = drive_mod.is_enabled
+
+    drive_mod.folder_tree_text = lambda *a, **k: "- 世界觀.md"
+
+    def phase1_with_drive(read=None, write=False, intent=""):
+        return mock.AsyncMock(return_value=(
+            [], [], [], [], [], False, False, "", False, "",
+            read or [], write, intent,
+        ))
+
+    print("\n[Test 11] Drive 唯讀：研究員結果注入 Phase 2，不發提示")
+    _default_mocks()
+    drive_mod.is_enabled = lambda: True
+    main.run_phase1 = phase1_with_drive(
+        read=[{"path": "世界觀.md", "mode": "section", "section": "國家"}],
+        intent="世界觀的國家設定",
+    )
+    drive_mod.run_read_agent = mock.AsyncMock(return_value={
+        "ok": True, "summary": "三個國家互相對立。", "tool_calls": [], "steps": 2,
+    })
+    captured = {}
+
+    async def _phase2_capture(*args, **kwargs):
+        captured.update(kwargs)
+        return "<planning>x</planning>\nMio 的回覆", "Mio", "TestUser"
+
+    main.build_and_call_phase2 = _phase2_capture
+    msg11 = _make_message("世界觀的國家有哪些？")
+    _fake_bot_user.mentioned_in = lambda m: True
+    await main.on_message(msg11)
+    check("研究員被呼叫", drive_mod.run_read_agent.called)
+    check("研究員收到 Phase 1 的意圖",
+          "國家設定" in str(drive_mod.run_read_agent.call_args), 
+          str(drive_mod.run_read_agent.call_args)[:200])
+    check("摘要注入 Phase 2",
+          "三個國家互相對立" in (captured.get("drive_context") or ""),
+          str(captured.get("drive_context"))[:120])
+    check("有回覆", sent(msg11))
+    check("沒有寫入就沒有提示",
+          not any("📁" in str(c[0][0]) for c in msg11.channel.send.call_args_list),
+          str(msg11.channel.send.call_args_list)[:150])
+
+    print("\n[Test 12] Drive 寫入：提示以獨立訊息送出")
+    _default_mocks()
+    drive_mod.is_enabled = lambda: True
+    main.run_phase1 = phase1_with_drive(
+        write=True, intent="把國家設定整理成檔案",
+    )
+    drive_mod.run_agent_loop = mock.AsyncMock(return_value={
+        "text": "已建立國家設定.md",
+        "tool_calls": [{"tool": "drive_write", "args": {}, "ok": True}],
+        "writes": [{"ok": True, "action": "created", "name": "國家設定.md", "bytes": 42}],
+        "steps": 2,
+    })
+    captured = {}
+
+    async def _phase2_capture2(*args, **kwargs):
+        captured.update(kwargs)
+        return "<planning>x</planning>\nMio 的回覆", "Mio", "TestUser"
+
+    main.build_and_call_phase2 = _phase2_capture2
+    msg12 = _make_message("把國家設定整理成檔案")
+    _fake_bot_user.mentioned_in = lambda m: True
+    await main.on_message(msg12)
+    check("Agent 被呼叫", drive_mod.run_agent_loop.called)
+    check("寫入結果注入 Phase 2",
+          "已建立國家設定.md" in (captured.get("drive_context") or ""),
+          str(captured.get("drive_context"))[:120])
+    notices = [c[0][0] for c in msg12.channel.send.call_args_list if c[0]]
+    check("有發送寫入提示",
+          any("📁" in n and "國家設定.md" in n for n in notices), str(notices))
+    check("提示是獨立訊息（角色回覆在前、提示在後）",
+          len(notices) >= 2 and "📁" not in notices[0]
+          and any("📁" in n for n in notices[1:]), str(notices))
+
+    print("\n[Test 13] Drive 關閉：即使 Phase 1 說要讀也不動作")
+    _default_mocks()
+    drive_mod.is_enabled = lambda: False
+    main.run_phase1 = phase1_with_drive(
+        read=[{"path": "世界觀.md"}], write=True, intent="整理檔案",
+    )
+    drive_mod.run_read_agent = mock.AsyncMock()
+    drive_mod.run_agent_loop = mock.AsyncMock()
+    msg13 = _make_message("看一下世界觀")
+    _fake_bot_user.mentioned_in = lambda m: True
+    main.build_and_call_phase2 = mock.AsyncMock(
+        return_value=("<planning>x</planning>\nMio 的回覆", "Mio", "TestUser")
+    )
+    await main.on_message(msg13)
+    check("關閉時不呼叫研究員", not drive_mod.run_read_agent.called)
+    check("關閉時不呼叫 Agent", not drive_mod.run_agent_loop.called)
+    check("仍然正常回覆", sent(msg13))
+
+    print("\n[Test 14] Drive 出錯：不影響正常回覆")
+    _default_mocks()
+    drive_mod.is_enabled = lambda: True
+    main.run_phase1 = phase1_with_drive(read=[{"path": "世界觀.md"}], intent="看一下")
+    drive_mod.run_read_agent = mock.AsyncMock(side_effect=RuntimeError("boom"))
+    main.build_and_call_phase2 = mock.AsyncMock(
+        return_value=("<planning>x</planning>\nMio 的回覆", "Mio", "TestUser")
+    )
+    msg14 = _make_message("看一下世界觀")
+    _fake_bot_user.mentioned_in = lambda m: True
+    await main.on_message(msg14)
+    check("Agent 爆炸仍照樣回覆", sent(msg14), str(msg14.reply.call_args_list))
+
+    print("\n[Test 15] 閒聊：Phase 1 沒標記 → 完全不碰雲端")
+    _default_mocks()
+    drive_mod.is_enabled = lambda: True
+    main.run_phase1 = phase1_with_drive()
+    drive_mod.run_read_agent = mock.AsyncMock()
+    drive_mod.run_agent_loop = mock.AsyncMock()
+    captured = {}
+
+    async def _phase2_capture3(*args, **kwargs):
+        captured.update(kwargs)
+        return "<planning>x</planning>\nMio 的回覆", "Mio", "TestUser"
+
+    main.build_and_call_phase2 = _phase2_capture3
+    msg15 = _make_message("今天好累喔")
+    _fake_bot_user.mentioned_in = lambda m: True
+    await main.on_message(msg15)
+    check("沒有呼叫研究員", not drive_mod.run_read_agent.called)
+    check("沒有呼叫 Agent", not drive_mod.run_agent_loop.called)
+    check("Phase 2 沒有雲端區塊", not captured.get("drive_context"),
+          str(captured.get("drive_context")))
+    check("正常回覆", sent(msg15))
+
+    # 還原
+    main.build_and_call_phase2 = _orig_phase2
+    drive_mod.run_read_agent = _orig_read_agent
+    drive_mod.run_agent_loop = _orig_loop
+    drive_mod.folder_tree_text = _orig_tree
+    drive_mod.is_enabled = _orig_enabled
 
     print("\n" + "=" * 60)
     print(f"Results: {passed}/{total} passed")
