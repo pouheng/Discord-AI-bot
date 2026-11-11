@@ -3272,9 +3272,10 @@ async def _legacy_build_phase2_system_prompt(
 {("【本伺服器規則】\n" + server_rules_text) if server_rules_text else ""}
 
 【⚠️ 禁止視覺幻覺】
-- 如果用戶訊息中沒有附帶圖片、截圖、檔案等媒體附件，絕對不要假裝看到圖片或描述不存在的視覺內容。
+- 如果用戶訊息中沒有附帶圖片、貼圖、連結預覽、檔案等媒體，絕對不要假裝看到或描述不存在的視覺內容。
 - 不要編造「點開圖片」「看到示意圖」「你這張圖」等回應。
-- 用戶的文字訊息就是純文字，除非訊息中明確包含附件（Discord 附件格式），否則回覆中不應提及任何視覺元素。
+- 用戶的文字訊息就是純文字，除非訊息中有附件、貼圖、連結預覽，或系統另有提供讀圖結果，否則回覆中不應提及任何視覺元素。
+- 例外：若系統提供了【系統讀圖結果】，那就是程式實際讀到的圖片內容，你看得到，請直接使用並描述，不受上面限制。
 
 {("【文風規則 - 本次啟用】\n- 對話占比：" + pcfg["dialogue_ratio"] + "\n- 稱呼規則：" + pcfg["naming_rule"] + "\n- 表達偏好：\n" + expr_str if enable_ic_style and channel_type != "out_of_character" else "")}
 
@@ -3368,9 +3369,10 @@ async def _legacy_build_phase2_system_prompt(
 {("【人際互動原則】\n" + pcfg.get("social_awareness", "")) if pcfg.get("social_awareness", "") else ""}
 
 【⚠️ 禁止視覺幻覺】
-- 如果用戶訊息中沒有附帶圖片、截圖、檔案等媒體附件，絕對不要假裝看到圖片或描述不存在的視覺內容。
+- 如果用戶訊息中沒有附帶圖片、貼圖、連結預覽、檔案等媒體，絕對不要假裝看到或描述不存在的視覺內容。
 - 不要編造「點開圖片」「看到示意圖」「你這張圖」等回應。
-- 用戶的文字訊息就是純文字，除非訊息中明確包含附件（Discord 附件格式），否則回覆中不應提及任何視覺元素。
+- 用戶的文字訊息就是純文字，除非訊息中有附件、貼圖、連結預覽，或系統另有提供讀圖結果，否則回覆中不應提及任何視覺元素。
+- 例外：若系統提供了【系統讀圖結果】，那就是程式實際讀到的圖片內容，你看得到，請直接使用並描述，不受上面限制。
 
 【⚠️ 時間感知 — 必須遵守】
 現在時間是 {_now_text()}。判斷早/午/晚、問候與作息時以此為準；回覆前若要引用歷史記憶中的事件，必須先計算「今天日期 − 記憶日期」。若間隔 ≥ 2 天，禁止在正文中使用「昨天」「剛才」「上次」等暗示近期的詞彙，應改用具體日期或「前幾天」等模糊措辭。
@@ -3736,8 +3738,9 @@ async def _auto_read_images(message, pcfg: dict,
             img = getattr(e, "image", None) or getattr(e, "thumbnail", None)
             url = getattr(img, "url", "") if img else ""
             if url:
-                title = (getattr(e, "title", "") or "embed")[:40]
-                _add(title, "url", url)
+                title = (getattr(e, "title", "") or "").strip()
+                label = title[:40] or (os.path.basename(urlparse(url).path) or "image")
+                _add(label, "url", url)
 
         content = getattr(src, "content", "") or ""
         for url in _image_urls_in(content, limit=max_images):
@@ -4184,6 +4187,28 @@ async def _write_prompt_blocks_dump(channel_type, enable_ic_style, extra_segment
     print(f"[DEBUG] 結構化提示詞區段已寫入 {PROMPT_LOG_DIR}\\last_prompt_blocks.json")
 
 
+def _image_block_text(image_description: str) -> str:
+    """把讀圖結果包成給模型看的區塊（兩個 Phase 2 路徑共用）。
+
+    系統提示詞有一條「禁止視覺幻覺」，原本會讓模型即使拿到讀圖結果
+    仍堅持「我沒眼睛、只看到連結」。這裡明講「你確實看得到」，
+    並要求直接描述，才不會把讀圖結果晾在那裡。
+    """
+    return (
+        "\n\n【系統讀圖結果 — 你確實看得到這張圖】\n"
+        f"{image_description}\n"
+        "（底下是系統剛剛從使用者貼的圖片讀到的內容。你是透過系統讀圖看到的，"
+        "所以不算「沒看到」。\n"
+        "⚠️ 回覆規則：\n"
+        "1. 你現在確實知道這張圖的內容，請照著它回答，不要憑空猜。\n"
+        "2. 不可以說「看不到圖」「我沒有眼睛」「只看到一串連結」，"
+        "也不要把「讀不到圖」當成玩笑梗——那和事實不符。\n"
+        "3. 使用者問「這是什麼／圖裡有什麼」時，直接描述畫面：角色、動作、"
+        "文字、氛圍。\n"
+        "4. 如果是 GIF／動圖，這是其中一個畫面的描述；必要時說明「我看到的是這一幕」。）"
+    )
+
+
 def phase2_slot(channel_type: str, enable_ic_style: bool) -> str:
     """Phase 2（真正生成回覆）一律用「回覆」場景。
 
@@ -4436,12 +4461,7 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
 
     img_block = ""
     if image_description:
-        img_block = (
-            "\n\n【用戶貼的圖片（你已經看到，內容如下）】\n"
-            f"{image_description}\n"
-            "（這是使用者最近貼的圖片。若對話和圖片有關，"
-            "回覆時要引用圖片裡的具體內容；不要說看不到或無法讀取。）"
-        )
+        img_block = _image_block_text(image_description)
 
     roster = _reply_roster_text(all_context, current_user_name)
     format_text, planning_instruction, fmt_body, priming_suffix = (
@@ -4575,12 +4595,7 @@ async def run_phase2_direct(
 
     img_block = ""
     if image_description:
-        img_block = (
-            "\n\n【用戶貼的圖片（你已經看到，內容如下）】\n"
-            f"{image_description}\n"
-            "（這是使用者最近貼的圖片。若對話和圖片有關，"
-            "回覆時要引用圖片裡的具體內容；不要說看不到或無法讀取。）"
-        )
+        img_block = _image_block_text(image_description)
 
     roster = _reply_roster_text(all_context, current_user_name)
     format_text, planning_instruction, fmt_body, priming_suffix = (

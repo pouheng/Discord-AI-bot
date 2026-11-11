@@ -254,7 +254,6 @@ async def run():
 
     print("[13] 網頁抓取會跳過圖片直連")
     calls = []
-
     async def _fake_fetch(url, cfg=None):
         calls.append(url)
         return {"ok": False, "url": url, "error": "不該被呼叫"}
@@ -267,6 +266,17 @@ async def run():
         main.web_reader.fetch_page = orig_fetch
     check("回空且沒去抓", out == ("", [], "") and calls == [],
           f"{out} {calls}")
+
+    print("[14] 讀圖結果要能壓過「禁止視覺幻覺」")
+    block = main._image_block_text("[描述] 黃色玩偶在跑")
+    check("標題明講看得到", "你確實看得到這張圖" in block, block[:60])
+    check("禁止說看不到", "不可以說「看不到圖」" in block)
+    check("帶入描述", "黃色玩偶在跑" in block)
+    check("GIF 有說明", "GIF" in block)
+    pb = main.prompt_blocks.load_blocks()
+    for ch, bid in (("ooc", "ooc_visual"), ("ic", "ic_visual")):
+        txt = next(b["content"] for b in pb["tabs"][ch] if b["id"] == bid)
+        check(f"{ch} 規則有讀圖例外", "系統讀圖結果" in txt, txt[:80])
 
 
 try:
