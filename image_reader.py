@@ -3,6 +3,7 @@ import asyncio
 import base64
 import datetime
 import hashlib
+import json
 import os
 import time
 import aiofiles
@@ -46,6 +47,61 @@ def cleanup_expired_cache():
     expired = [k for k, v in _image_cache.items() if now - v["timestamp"] > CACHE_TTL]
     for k in expired:
         _image_cache.pop(k, None)
+
+
+# ── 最近讀過的圖片（跨重啟保留）──────────────────────────
+# 使用者常問「我剛才發的圖是什麼？」。若原連結已失效（Discord CDN 簽章過期、
+# 圖片被刪、或貼的是別的頻道連結），至少還能用剛才讀過的描述回答。
+RECENT_FILE = os.path.join(IMAGE_LOG_DIR, "recent_reads.json")
+RECENT_MAX = 20
+
+
+def _load_recent() -> list[dict]:
+    try:
+        with open(RECENT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def record_recent_read(channel_id, filename: str, description: str):
+    """記下「這個頻道剛剛讀過什麼圖」。"""
+    if not description:
+        return
+    items = _load_recent()
+    items.append({
+        "ts": time.time(),
+        "channel_id": str(channel_id or ""),
+        "filename": filename or "",
+        "description": description,
+    })
+    items = items[-RECENT_MAX:]
+    try:
+        os.makedirs(IMAGE_LOG_DIR, exist_ok=True)
+        tmp = RECENT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.replace(tmp, RECENT_FILE)
+    except OSError:
+        pass
+
+
+def get_recent_read(channel_id, ttl: float = 3600) -> dict | None:
+    """取這個頻道最近一次讀圖描述（超過 ttl 秒視為過期）。"""
+    now = time.time()
+    cid = str(channel_id or "")
+    for item in reversed(_load_recent()):
+        try:
+            ts = float(item.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ttl and now - ts > ttl:
+            continue
+        if cid and str(item.get("channel_id") or "") != cid:
+            continue
+        return item
+    return None
 
 
 _ANALYSIS_PROMPT = (

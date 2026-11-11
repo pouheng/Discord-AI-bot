@@ -3583,8 +3583,50 @@ def _describe_empty_message(message) -> str:
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 # 追問圖片的線索（「我發的這個圖是什麼？」）；搭配「訊息很短＋有提問語氣」
 # 避免「圖書館」「地圖」「這張椅子」這類普通對話也回頭翻歷史。
-_IMAGE_ASK_WORDS = ("圖", "照片", "貼圖", "gif", "meme", "梗圖", "截圖")
+_IMAGE_ASK_WORDS = ("圖", "照片", "貼圖", "gif", "meme", "梗圖", "截圖", "貼的")
 _IMAGE_ASK_HINTS = ("什麼", "哪", "嗎", "？", "?", "看一下", "看看", "認得")
+# 自訂表情／提及不計入「訊息長度」（不然一句話加一顆表情就超過門檻）
+_MARKUP_RE = re.compile(r"<a?:[A-Za-z0-9_]+:\d+>|<[@#][!&]?\d+>")
+
+
+def _plain_text(text: str) -> str:
+    """去掉自訂表情與提及標記，只留使用者實際打的字。"""
+    return _MARKUP_RE.sub("", text or "")
+
+
+def _asks_about_image(text: str) -> bool:
+    """「我剛才發的圖是什麼？」這類追問（短句＋圖的字眼＋提問語氣）。"""
+    t = _plain_text(text).lower()
+    return (len(t.strip()) <= 40
+            and any(w in t for w in _IMAGE_ASK_WORDS)
+            and any(h in t for h in _IMAGE_ASK_HINTS))
+
+
+# Discord CDN 附件網址：/attachments/<channel_id>/<attachment_id>/<檔名>
+_CDN_ATTACH_RE = re.compile(r"/attachments/(\d+)/(\d+)/")
+
+
+async def _resolve_discord_attachment(message, url: str):
+    """用頻道歷史把 Discord CDN 網址換成「活著的附件」。
+
+    直接抓舊網址常常 404（Discord 簽章過期／連結被截斷），但同一則訊息
+    的 attachment 物件仍能拿到新的簽章網址，重新下載即可。
+    """
+    m = _CDN_ATTACH_RE.search(url or "")
+    if not m:
+        return None
+    att_id = m.group(2)
+    channel = getattr(message, "channel", None)
+    if channel is None or not hasattr(channel, "history"):
+        return None
+    try:
+        async for msg in channel.history(limit=50):
+            for a in (getattr(msg, "attachments", None) or []):
+                if str(getattr(a, "id", "")) == att_id:
+                    return a
+    except Exception as e:
+        print(f"[讀圖] 歷史查找失敗: {type(e).__name__}: {e}")
+    return None
 
 
 def _url_looks_like_image(url: str) -> bool:
@@ -3703,12 +3745,8 @@ async def _auto_read_images(message, pcfg: dict,
 
     # 訊息本身沒圖，但使用者在問「剛剛那張圖」→ 回頭找最近幾則的圖片連結
     if not jobs and all_context:
-        raw_text = getattr(message, "content", "") or ""
-        text = raw_text.lower()
-        if (len(raw_text.strip()) <= 40
-                and any(w in text for w in _IMAGE_ASK_WORDS)
-                and any(h in text for h in _IMAGE_ASK_HINTS)):
-            recent = [m for m in all_context if m.get("role") != "system"][-6:]
+        if _asks_about_image(getattr(message, "content", "") or ""):
+            recent = [m for m in all_context if m.get("role") != "system"][-10:]
             for m in reversed(recent):
                 urls = _image_urls_in(m.get("content") or "", limit=1)
                 if urls:
@@ -3717,8 +3755,7 @@ async def _auto_read_images(message, pcfg: dict,
                     print(f"[讀圖] 追問圖片 → 回頭讀 {name}")
                     break
 
-    if not jobs:
-        return "", []
+    # 沒有任何可讀來源時不直接放棄：下面還有「剛才讀過的描述」可退。
 
     ollama_cfg = pcfg.get("ollama", {})
     blocks: list[str] = []
@@ -3729,7 +3766,16 @@ async def _auto_read_images(message, pcfg: dict,
             if kind == "attachment":
                 data = await payload.read()
             else:
-                data = await _download_image(payload, max_bytes)
+                data = None
+                resolved = await _resolve_discord_attachment(message, payload)
+                if resolved is not None:
+                    try:
+                        data = await resolved.read()
+                        print(f"[讀圖] 由頻道歷史補抓 {filename}")
+                    except Exception as e:
+                        print(f"[讀圖] 歷史附件下載失敗 {filename}: {type(e).__name__}: {e}")
+                if data is None:
+                    data = await _download_image(payload, max_bytes)
         except Exception as e:
             print(f"[讀圖] 取得失敗 {filename}: {type(e).__name__}: {e}")
             continue
@@ -3755,7 +3801,25 @@ async def _auto_read_images(message, pcfg: dict,
 
         blocks.append(f"【{filename}】\n{desc}")
         logs.append({"filename": filename, "description": desc, "elapsed": elapsed})
+        image_reader.record_recent_read(
+            getattr(getattr(message, "channel", None), "id", ""), filename, desc)
         print(f"[讀圖] 完成 {filename}（{elapsed:.1f}s）")
+
+    if not blocks and _asks_about_image(getattr(message, "content", "") or ""):
+        recent = image_reader.get_recent_read(
+            getattr(getattr(message, "channel", None), "id", ""),
+            float(cfg.get("recent_ttl_seconds", 3600) or 0),
+        )
+        if recent:
+            name = recent.get("filename") or "image"
+            print(f"[讀圖] 連結失效 → 改用剛才讀過的描述（{name}）")
+            blocks.append(
+                f"【（剛才讀過的圖片）{name}】\n{recent.get('description', '')}\n"
+                "（這是你剛才真的讀到的內容；原始連結可能已失效，不需要重抓。）"
+            )
+            logs.append({"filename": name,
+                         "description": recent.get("description", ""),
+                         "elapsed": 0.0, "from_recent": True})
 
     if not blocks:
         return "", logs

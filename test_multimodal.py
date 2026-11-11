@@ -86,12 +86,13 @@ check("read_image returns error when ollama unavailable",
 
 # ── Test 10: log_image_analysis writes file ──
 import tempfile, datetime
+_orig_log_dir = image_reader.IMAGE_LOG_DIR
+image_reader.IMAGE_LOG_DIR = tempfile.mkdtemp(prefix="img_log_test_")
 async def test_log():
-    test_dir = os.path.join(os.path.dirname(__file__), "image_logs")
+    test_dir = image_reader.IMAGE_LOG_DIR
     os.makedirs(test_dir, exist_ok=True)
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     test_path = os.path.join(test_dir, f"{today}.txt")
-    existed = os.path.exists(test_path)
     await image_reader.log_image_analysis(
         "test_user", "test_channel", "test.png",
         {"description": "test desc", "thinking": "test think", "elapsed": 1.5},
@@ -100,6 +101,8 @@ async def test_log():
     return os.path.exists(test_path)
 
 log_ok = asyncio.get_event_loop().run_until_complete(test_log())
+image_reader.IMAGE_LOG_DIR = _orig_log_dir
+image_reader.RECENT_FILE = os.path.join(_orig_log_dir, "recent_reads.json")
 check("log_image_analysis writes to file", log_ok)
 
 print(f"\n{'='*40}")

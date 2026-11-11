@@ -28,10 +28,12 @@ CDN = ("https://cdn.discordapp.com/attachments/1463839150590394400/"
 
 
 class FakeAtt:
-    def __init__(self, filename="a.png", content_type="image/png", size=100):
+    def __init__(self, filename="a.png", content_type="image/png", size=100,
+                 att_id=0):
         self.filename = filename
         self.content_type = content_type
         self.size = size
+        self.id = att_id
 
     async def read(self):
         return b"bytes:" + self.filename.encode()
@@ -55,14 +57,27 @@ class FakeSticker:
         self.url = url
 
 
+class FakeChannel:
+    def __init__(self, msgs, cid=42):
+        self._msgs = msgs
+        self.id = cid
+
+    def history(self, limit=50):
+        async def gen():
+            for m in self._msgs:
+                yield m
+        return gen()
+
+
 class FakeMsg:
     def __init__(self, content="", attachments=(), stickers=(), embeds=(),
-                 reference=None):
+                 reference=None, channel=None):
         self.content = content
         self.attachments = list(attachments)
         self.stickers = list(stickers)
         self.embeds = list(embeds)
         self.reference = reference
+        self.channel = channel
 
 
 _orig_read = main.image_reader.read_image
@@ -84,6 +99,10 @@ async def _fake_download(url, max_bytes=8_000_000, timeout=20.0):
 main.image_reader.read_image = _fake_read
 main._download_image = _fake_download
 image_reader._image_cache.clear()
+
+import tempfile  # noqa: E402
+_TMP = tempfile.mkdtemp(prefix="img_src_")
+image_reader.RECENT_FILE = os.path.join(_TMP, "recent_reads.json")
 
 PCFG = {"image_reader": {"auto_read": True, "auto_max_images": 1,
                          "auto_max_bytes": 8_000_000}}
@@ -157,20 +176,83 @@ async def run():
         FakeMsg(content="這張圖好看嗎"), PCFG, ctx)
     check("真的問圖就讀", bool(logs), str(logs))
 
-    print("[7] auto_read 關閉 → 完全不動作")
+    print("[7] 自訂表情不計入長度（真實案例）")
+    _seen["downloads"].clear()
+    line = ("我們再來一次，我剛才發的動圖是什麼內容？"
+            "<:ericalaughing:1063337017984958474>")
+    text, logs = await main._auto_read_images(FakeMsg(content=line), PCFG, ctx)
+    check("有表情也讀得到", bool(logs) and _seen["downloads"] == [CDN], str(logs))
+
+    print("[8] 舊 CDN 網址 404 → 用頻道歷史補抓")
+    att_id = "1542143325044211732"
+    dead = ("https://cdn.discordapp.com/attachments/1463839150590394400/"
+            f"{att_id}/o4aq.gif")
+    hist_att = FakeAtt("o4aq.gif", att_id=att_id)
+    chan = FakeChannel([FakeMsg(attachments=[hist_att])])
+
+    async def _dead_download(url, max_bytes=8_000_000, timeout=20.0):
+        raise RuntimeError("HTTP 404")
+
+    main._download_image = _dead_download
+    try:
+        text, logs = await main._auto_read_images(
+            FakeMsg(content=dead, channel=chan), PCFG)
+        check("從歷史補抓到", bool(logs), str(logs))
+
+        _seen["downloads"].clear()
+        text, logs = await main._auto_read_images(
+            FakeMsg(content=dead), PCFG)  # 沒有 channel
+        check("沒有歷史就照原樣失敗", not logs, str(logs))
+    finally:
+        main._download_image = _fake_download
+
+    print("[9] auto_read 關閉 → 完全不動作")
     _seen["downloads"].clear()
     text, logs = await main._auto_read_images(
         FakeMsg(attachments=[FakeAtt()]), {"image_reader": {"auto_read": False}})
     check("回空", text == "" and logs == [], f"{text!r} {logs}")
 
-    print("[8] 附件與 embed 同時存在 → 受 auto_max_images 限制")
+    print("[10] 附件與 embed 同時存在 → 受 auto_max_images 限制")
     _seen["downloads"].clear(); _seen["reads"].clear()
     msg = FakeMsg(attachments=[FakeAtt("a.png")], embeds=[FakeEmbed(CDN)])
     text, logs = await main._auto_read_images(msg, PCFG)
     check("只讀 1 張", len(logs) == 1, str(logs))
     check("附件優先", logs and logs[0]["filename"] == "a.png", str(logs))
 
-    print("[9] 網頁抓取會跳過圖片直連")
+    print("[11] 連結失效 → 用剛才讀過的描述回答")
+    # 剛才在頻道 42 讀過一張圖
+    _seen["downloads"].clear()
+    await main._auto_read_images(
+        FakeMsg(attachments=[FakeAtt("earlier.gif")],
+                channel=FakeChannel([], cid=42)), PCFG)
+    got = image_reader.get_recent_read(42)
+    check("有記錄最近讀圖", bool(got) and got["filename"] == "earlier.gif", str(got))
+
+    main._download_image = _dead_download
+    try:
+        text, logs = await main._auto_read_images(
+            FakeMsg(content="我剛才發的動圖是什麼？", channel=FakeChannel([], cid=42)),
+            PCFG)
+    finally:
+        main._download_image = _fake_download
+    check("沒有連結也能回答", bool(logs) and logs[0].get("from_recent"), str(logs))
+    check("描述有帶進來", "描述:earlier.gif" in text, text[:120])
+
+    print("[12] 別頻道不亂用、過期也不用")
+    got = image_reader.get_recent_read(999)
+    check("別頻道沒有", got is None, str(got))
+    got = image_reader.get_recent_read(42, ttl=1)
+    import time as _t
+    items = image_reader._load_recent()
+    for it in items:
+        it["ts"] -= 10
+    with open(image_reader.RECENT_FILE, "w", encoding="utf-8") as f:
+        import json as _j
+        _j.dump(items, f, ensure_ascii=False)
+    check("過期就不用了", image_reader.get_recent_read(42, ttl=5) is None,
+          str(image_reader.get_recent_read(42, ttl=5)))
+
+    print("[13] 網頁抓取會跳過圖片直連")
     calls = []
 
     async def _fake_fetch(url, cfg=None):
