@@ -37,6 +37,7 @@ SUITE = [
     "test_parity.py",         # block 版 vs legacy 版一致性
     "test_model_routing.py",  # 全域備援（主線路由場景決定）
     "test_priming.py",        # 開場提示句（單一來源）
+    "test_image_sources.py",  # 讀圖來源（貼圖／預覽／直連／追問）
 ]
 
 # 保留給舊指令（--all）相容，目前無額外測試

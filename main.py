@@ -12,6 +12,7 @@ import aiosqlite
 import sqlite3
 import os
 import time
+from urllib.parse import urlparse
 import aiofiles
 import autopilot
 import tarot
@@ -3568,7 +3569,8 @@ def _describe_empty_message(message) -> str:
 
     stickers = getattr(message, "stickers", None)
     if isinstance(stickers, (list, tuple)) and stickers:
-        return "（傳送了貼圖）"
+        name = (getattr(stickers[0], "name", "") or "").strip()
+        return f"（傳送了貼圖{f'「{name}」' if name else ''}）"
 
     embeds = getattr(message, "embeds", None)
     if isinstance(embeds, (list, tuple)) and embeds:
@@ -3578,12 +3580,69 @@ def _describe_empty_message(message) -> str:
     return "（傳送了非文字內容）"
 
 
-async def _auto_read_images(message, pcfg: dict) -> tuple[str, list[dict]]:
-    """自動讀觸發訊息（或被回覆訊息）附的圖片。回傳 (注入文字, 紀錄)。
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+# 追問圖片的線索（「我發的這個圖是什麼？」）；搭配「訊息很短＋有提問語氣」
+# 避免「圖書館」「地圖」「這張椅子」這類普通對話也回頭翻歷史。
+_IMAGE_ASK_WORDS = ("圖", "照片", "貼圖", "gif", "meme", "梗圖", "截圖")
+_IMAGE_ASK_HINTS = ("什麼", "哪", "嗎", "？", "?", "看一下", "看看", "認得")
+
+
+def _url_looks_like_image(url: str) -> bool:
+    """網址路徑結尾是圖片副檔名（Discord CDN、Tenor 等都適用）。"""
+    try:
+        return urlparse(url or "").path.lower().endswith(_IMAGE_EXTS)
+    except Exception:
+        return False
+
+
+def _image_urls_in(text: str, limit: int = 3) -> list[str]:
+    """文字中的圖片直連（依出現順序、去重）。"""
+    out: list[str] = []
+    for u in web_reader.extract_urls(text or "", limit=max(limit * 2, 4)):
+        if _url_looks_like_image(u) and u not in out:
+            out.append(u)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _download_image(url: str, max_bytes: int = 8_000_000,
+                          timeout: float = 20.0) -> bytes:
+    """下載圖片（含內容類型與大小檢查）。"""
+    import httpx
+
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=timeout,
+        headers={"User-Agent": "MioBot/1.0 (+image-reader)"},
+    ) as client:
+        async with client.stream("GET", url) as r:
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            ctype = (r.headers.get("content-type") or "").lower()
+            if ctype and not ctype.startswith("image"):
+                raise RuntimeError(f"不是圖片（{ctype.split(';')[0]}）")
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf.extend(chunk)
+                if max_bytes and len(buf) > max_bytes:
+                    raise RuntimeError(f"圖片過大（>{max_bytes // 1000}KB）")
+    return bytes(buf)
+
+
+async def _auto_read_images(message, pcfg: dict,
+                            all_context: list | None = None) -> tuple[str, list[dict]]:
+    """自動讀訊息中的圖片。回傳 (注入文字, 紀錄)。
+
+    支援四種來源（以前只認附件，貼圖／連結預覽／直連網址全都漏掉）：
+      1. 附件（attachment）
+      2. 貼圖（sticker）
+      3. 連結預覽圖片（embed.image / embed.thumbnail）
+      4. 訊息文字裡的圖片直連（Discord CDN 等）
+    「我發的這個圖是什麼？」這類沒有附圖的追問，會回頭掃最近幾則
+    all_context 找圖片網址。
 
     只在 image_reader.auto_read 開啟時運作；張數與大小有上限，
-    失敗不影響回覆（只是沒有圖片描述）。讀到的描述會放進
-    Phase 2 的 image_description，角色就「看得到」圖片。
+    失敗不影響回覆（只是沒有圖片描述）。
     """
     cfg = pcfg.get("image_reader") or {}
     if not cfg.get("auto_read", True):
@@ -3600,12 +3659,20 @@ async def _auto_read_images(message, pcfg: dict) -> tuple[str, list[dict]]:
     if replied is not None:
         sources.append(replied)
 
-    imgs = []
+    jobs: list[tuple[str, str, object]] = []  # (檔名提示, 類型, 附件或網址)
+    seen_urls: set[str] = set()
+
+    def _add(label, kind, payload):
+        if kind == "url":
+            if str(payload) in seen_urls:
+                return  # 同一個連結可能同時出現在 embed 與文字裡
+            seen_urls.add(str(payload))
+        if len(jobs) < max_images:
+            jobs.append((label, kind, payload))
+
     for src in sources:
         atts = getattr(src, "attachments", None)
-        if not isinstance(atts, (list, tuple)):
-            continue
-        for a in atts:
+        for a in (atts if isinstance(atts, (list, tuple)) else []):
             ctype = (getattr(a, "content_type", "") or "").lower()
             if not ctype.startswith("image"):
                 continue
@@ -3613,24 +3680,58 @@ async def _auto_read_images(message, pcfg: dict) -> tuple[str, list[dict]]:
             if max_bytes and size and size > max_bytes:
                 print(f"[讀圖] 跳過過大附件 {getattr(a, 'filename', '')} ({size} bytes)")
                 continue
-            imgs.append(a)
-            if len(imgs) >= max_images:
-                break
-        if len(imgs) >= max_images:
-            break
+            _add(getattr(a, "filename", "") or "image", "attachment", a)
 
-    if not imgs:
+        sts = getattr(src, "stickers", None)
+        for st in (sts if isinstance(sts, (list, tuple)) else []):
+            url = getattr(st, "url", "") or ""
+            if not url or url.lower().endswith(".json"):
+                continue  # Lottie 貼圖沒有靜態圖可讀
+            _add(getattr(st, "name", "") or "sticker", "url", url)
+
+        embs = getattr(src, "embeds", None)
+        for e in (embs if isinstance(embs, (list, tuple)) else []):
+            img = getattr(e, "image", None) or getattr(e, "thumbnail", None)
+            url = getattr(img, "url", "") if img else ""
+            if url:
+                title = (getattr(e, "title", "") or "embed")[:40]
+                _add(title, "url", url)
+
+        content = getattr(src, "content", "") or ""
+        for url in _image_urls_in(content, limit=max_images):
+            _add(os.path.basename(urlparse(url).path) or "image", "url", url)
+
+    # 訊息本身沒圖，但使用者在問「剛剛那張圖」→ 回頭找最近幾則的圖片連結
+    if not jobs and all_context:
+        raw_text = getattr(message, "content", "") or ""
+        text = raw_text.lower()
+        if (len(raw_text.strip()) <= 40
+                and any(w in text for w in _IMAGE_ASK_WORDS)
+                and any(h in text for h in _IMAGE_ASK_HINTS)):
+            recent = [m for m in all_context if m.get("role") != "system"][-6:]
+            for m in reversed(recent):
+                urls = _image_urls_in(m.get("content") or "", limit=1)
+                if urls:
+                    name = os.path.basename(urlparse(urls[0]).path) or "image"
+                    _add(f"（前幾則訊息）{name}", "url", urls[0])
+                    print(f"[讀圖] 追問圖片 → 回頭讀 {name}")
+                    break
+
+    if not jobs:
         return "", []
 
     ollama_cfg = pcfg.get("ollama", {})
     blocks: list[str] = []
     logs: list[dict] = []
-    for a in imgs:
-        filename = getattr(a, "filename", "") or "image"
+    for label, kind, payload in jobs:
+        filename = label or "image"
         try:
-            data = await a.read()
+            if kind == "attachment":
+                data = await payload.read()
+            else:
+                data = await _download_image(payload, max_bytes)
         except Exception as e:
-            print(f"[讀圖] 下載失敗 {filename}: {type(e).__name__}: {e}")
+            print(f"[讀圖] 取得失敗 {filename}: {type(e).__name__}: {e}")
             continue
 
         cached = image_reader.get_cached_description(data)
@@ -4172,6 +4273,9 @@ async def _build_web_context(text: str, pcfg: dict,
     scan_text = "\n".join(p for p in scan_parts if p)
 
     urls = web_reader.extract_urls(scan_text, limit=int(wcfg.get("max_links", 2)))
+    # 圖片直連交給讀圖處理；這裡硬抓只會得到「非文字內容」，
+    # 還會害 Phase 1 之後去搜一個沒意義的檔名。
+    urls = [u for u in urls if not _url_looks_like_image(u)]
     if not urls:
         return "", [], ""
 
@@ -4269,9 +4373,9 @@ async def build_and_call_phase2(message: discord.Message, *, channel_type: str, 
     img_block = ""
     if image_description:
         img_block = (
-            "\n\n【用戶本輪傳來的圖片（你已經看到，內容如下）】\n"
+            "\n\n【用戶貼的圖片（你已經看到，內容如下）】\n"
             f"{image_description}\n"
-            "（這是剛剛收到的圖片，不是舊圖。若對話和圖片有關，"
+            "（這是使用者最近貼的圖片。若對話和圖片有關，"
             "回覆時要引用圖片裡的具體內容；不要說看不到或無法讀取。）"
         )
 
@@ -4408,9 +4512,9 @@ async def run_phase2_direct(
     img_block = ""
     if image_description:
         img_block = (
-            "\n\n【用戶本輪傳來的圖片（你已經看到，內容如下）】\n"
+            "\n\n【用戶貼的圖片（你已經看到，內容如下）】\n"
             f"{image_description}\n"
-            "（這是剛剛收到的圖片，不是舊圖。若對話和圖片有關，"
+            "（這是使用者最近貼的圖片。若對話和圖片有關，"
             "回覆時要引用圖片裡的具體內容；不要說看不到或無法讀取。）"
         )
 
@@ -5151,7 +5255,7 @@ async def on_message(message: discord.Message):
 
             pcfg = await load_prompt_config()
             # 自動讀觸發訊息（或被回覆訊息）附的圖片；與搜尋／網頁並行
-            image_task = asyncio.create_task(_auto_read_images(message, pcfg))
+            image_task = asyncio.create_task(_auto_read_images(message, pcfg, all_context))
             blocked_kw = [k.lower() for k in pcfg.get("blocked_keywords", [])]
             blocked_exceptions = [
                 e.lower() for e in pcfg.get("blocked_keyword_exceptions", [])
@@ -5163,10 +5267,23 @@ async def on_message(message: discord.Message):
 
             # Phase 1 決定要不要用 DeepSeek 原生搜尋（server-side web_search）。
             # 若使用者已貼連結且已抓到內容，就不重複搜尋。
+            # 只有圖片直連時也不搜：那交給讀圖，搜檔名只會換來一堆廢話。
             search_result = None
             search_query = ""
             dcfg = {**deepseek_search.DEFAULT_CFG, **(pcfg.get("deepseek_search") or {})}
-            if need_web_search and not web_pages and dcfg.get("enabled", True):
+            _link_urls = web_reader.extract_urls(
+                clean_input_reply + "\n" + "\n".join(
+                    (m.get("content") or "") for m in all_context[-6:]
+                    if m.get("role") != "system"
+                ),
+                limit=3,
+            )
+            _only_image_links = bool(_link_urls) and all(
+                _url_looks_like_image(u) for u in _link_urls
+            )
+            if _only_image_links:
+                print("[搜尋] 只有圖片直連 → 交給讀圖，略過網路搜尋")
+            elif need_web_search and not web_pages and dcfg.get("enabled", True):
                 search_query = web_search_query or clean_input_reply
                 search_result = await deepseek_search.search(search_query, dcfg)
                 if search_result.get("ok"):
